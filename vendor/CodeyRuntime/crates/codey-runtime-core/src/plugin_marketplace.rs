@@ -15,6 +15,7 @@ const CODEY_CURATED_MARKETPLACE_ZIP: &[u8] =
     include_bytes!("../../../assets/plugin-marketplaces/openai-curated-remote.zip");
 
 pub fn ensure_openai_curated_marketplace_config(home: &Path) -> anyhow::Result<bool> {
+    ensure_managed_remote_registration_available(home)?;
     let mut changed = cleanup_managed_reserved_marketplace_configs(home)?;
     if let Some(remote_marketplace_root) = local_openai_curated_remote_marketplace_root(home)? {
         rewrite_marketplace_name(&remote_marketplace_root)?;
@@ -28,6 +29,7 @@ pub fn ensure_openai_curated_marketplace_config(home: &Path) -> anyhow::Result<b
 }
 
 pub fn ensure_openai_curated_remote_marketplace_config(home: &Path) -> anyhow::Result<bool> {
+    ensure_managed_remote_registration_available(home)?;
     let Some(marketplace_root) = local_openai_curated_remote_marketplace_root(home)? else {
         return Ok(false);
     };
@@ -55,6 +57,7 @@ pub fn ensure_role_specific_plugins_marketplace_config(home: &Path) -> anyhow::R
 pub fn ensure_openai_curated_remote_marketplace_available(
     home: &Path,
 ) -> anyhow::Result<MarketplaceEnsureResult> {
+    ensure_managed_remote_registration_available(home)?;
     let mut initialized = false;
     if local_openai_curated_remote_marketplace_root(home)?.is_none() {
         install_openai_curated_remote_marketplace_zip(home, CODEY_CURATED_MARKETPLACE_ZIP)?;
@@ -119,31 +122,7 @@ pub struct MarketplaceEnsureResult {
 
 fn local_openai_curated_marketplace_root(home: &Path) -> anyhow::Result<Option<PathBuf>> {
     let root = home.join(".tmp").join("plugins");
-    let marketplace_path = root
-        .join(".agents")
-        .join("plugins")
-        .join("marketplace.json");
-    if !marketplace_path.is_file() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&marketplace_path)
-        .with_context(|| format!("failed to read {}", marketplace_path.display()))?;
-    let marketplace: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {}", marketplace_path.display()))?;
-    if marketplace.get("name").and_then(serde_json::Value::as_str)
-        != Some(OPENAI_CURATED_MARKETPLACE)
-    {
-        return Ok(None);
-    }
-    let has_plugins = marketplace
-        .get("plugins")
-        .and_then(serde_json::Value::as_array)
-        .map(|plugins| !plugins.is_empty())
-        .unwrap_or(false);
-    if !has_plugins || !root.join("plugins").is_dir() {
-        return Ok(None);
-    }
-    Ok(Some(root))
+    local_marketplace_root_from_root(&root, OPENAI_CURATED_MARKETPLACE)
 }
 
 fn local_role_specific_plugins_marketplace_root(home: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -165,19 +144,19 @@ fn local_marketplace_root_from_root(
     if !marketplace_path.is_file() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&marketplace_path)
+    let bytes = std::fs::read(&marketplace_path)
         .with_context(|| format!("failed to read {}", marketplace_path.display()))?;
-    let marketplace: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {}", marketplace_path.display()))?;
-    if marketplace.get("name").and_then(serde_json::Value::as_str) != Some(marketplace_name) {
+    let Ok(marketplace) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    let name = marketplace.get("name").and_then(serde_json::Value::as_str);
+    if name != Some(marketplace_name)
+        && !(marketplace_name == CODEY_CURATED_MARKETPLACE
+            && is_codey_curated_marketplace_name(name))
+    {
         return Ok(None);
     }
-    let has_plugins = marketplace
-        .get("plugins")
-        .and_then(serde_json::Value::as_array)
-        .map(|plugins| !plugins.is_empty())
-        .unwrap_or(false);
-    if !has_plugins || !root.join("plugins").is_dir() {
+    if !marketplace_plugins_available(root, &marketplace)? {
         return Ok(None);
     }
     Ok(Some(root.to_path_buf()))
@@ -216,31 +195,114 @@ fn local_marketplace_plugin_names(
 
 fn local_openai_curated_remote_marketplace_root(home: &Path) -> anyhow::Result<Option<PathBuf>> {
     let root = home.join(".tmp").join("plugins-remote");
-    let marketplace_path = root
-        .join(".agents")
-        .join("plugins")
-        .join("marketplace.json");
-    if !marketplace_path.is_file() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&marketplace_path)
-        .with_context(|| format!("failed to read {}", marketplace_path.display()))?;
-    let marketplace: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {}", marketplace_path.display()))?;
-    if !is_codey_curated_marketplace_name(
-        marketplace.get("name").and_then(serde_json::Value::as_str),
-    ) {
-        return Ok(None);
-    }
-    let has_plugins = marketplace
+    local_marketplace_root_from_root(&root, CODEY_CURATED_MARKETPLACE)
+}
+
+fn marketplace_plugins_available(
+    root: &Path,
+    marketplace: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let Some(plugins) = marketplace
         .get("plugins")
         .and_then(serde_json::Value::as_array)
-        .map(|plugins| !plugins.is_empty())
-        .unwrap_or(false);
-    if !has_plugins || !root.join("plugins").is_dir() {
-        return Ok(None);
+    else {
+        return Ok(false);
+    };
+    if plugins.is_empty() {
+        return Ok(false);
     }
-    Ok(Some(root))
+    let canonical_root = root.canonicalize()?;
+    for plugin in plugins {
+        let Some(name) = plugin
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return Ok(false);
+        };
+        let source = plugin.get("source");
+        let source_type = source
+            .and_then(|source| source.get("source"))
+            .and_then(serde_json::Value::as_str);
+        // Remote entries are downloaded by Codex and have no local manifest yet.
+        if source_type.is_some_and(|kind| kind != "local") {
+            continue;
+        }
+        let local_path = plugin
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                source
+                    .and_then(|source| source.get("path"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| source.and_then(serde_json::Value::as_str));
+        if local_path.is_none() && source.is_none() && plugin.get("remotePluginId").is_some() {
+            continue;
+        }
+        let fallback = format!("plugins/{name}");
+        let Ok(relative) = safe_zip_path(local_path.unwrap_or(&fallback)) else {
+            return Ok(false);
+        };
+        let manifest_path = root.join(relative).join(".codex-plugin/plugin.json");
+        if !manifest_path.is_file() {
+            return Ok(false);
+        }
+        if !manifest_path.canonicalize()?.starts_with(&canonical_root) {
+            return Ok(false);
+        }
+        let bytes = std::fs::read(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(false);
+        };
+        if manifest.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn ensure_managed_remote_registration_available(home: &Path) -> anyhow::Result<()> {
+    ensure_managed_remote_directory(home)?;
+    let snapshot = ConfigManager::for_home(home).load()?;
+    if let Some(entry) = snapshot
+        .document()
+        .get("marketplaces")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get(CODEY_CURATED_MARKETPLACE))
+    {
+        let root = home.join(".tmp/plugins-remote");
+        let managed = entry.as_table_like().is_some_and(|table| {
+            table.get("source_type").and_then(Item::as_str) == Some("local")
+                && table
+                    .get("source")
+                    .and_then(Item::as_str)
+                    .is_some_and(|source| managed_marketplace_path_matches(source, &root))
+        });
+        anyhow::ensure!(
+            managed,
+            "codey-curated is registered to a custom source; existing registration was preserved"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_managed_remote_directory(home: &Path) -> anyhow::Result<()> {
+    for path in [home.join(".tmp"), home.join(".tmp/plugins-remote")] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "refusing to modify non-directory or linked managed marketplace: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_codey_curated_marketplace_name(name: Option<&str>) -> bool {
@@ -273,20 +335,11 @@ fn rewrite_marketplace_name(root: &Path) -> anyhow::Result<()> {
 fn install_openai_curated_remote_marketplace_zip(home: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let destination = home.join(".tmp").join("plugins-remote");
     let staging_parent = home.join(".tmp");
+    ensure_managed_remote_directory(home)?;
     std::fs::create_dir_all(&staging_parent)
         .with_context(|| format!("failed to create {}", staging_parent.display()))?;
-    let staging = staging_parent.join(format!(
-        "plugins-remote-embedded-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)
-            .with_context(|| format!("failed to remove stale {}", staging.display()))?;
-    }
-    std::fs::create_dir_all(&staging)
+    let staging = staging_parent.join(format!("plugins-remote-embedded-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&staging)
         .with_context(|| format!("failed to create {}", staging.display()))?;
 
     let result = extract_zip_exact(bytes, &staging)
@@ -349,7 +402,7 @@ fn safe_zip_path(name: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn validate_openai_curated_remote_marketplace_root(root: &Path) -> anyhow::Result<()> {
-    let marketplace = local_openai_curated_remote_marketplace_root_from_root(root)?
+    let marketplace = local_marketplace_root_from_root(root, CODEY_CURATED_MARKETPLACE)?
         .ok_or_else(|| anyhow::anyhow!("embedded official remote plugin marketplace is invalid"))?;
     if marketplace != root {
         anyhow::bail!("embedded official remote plugin marketplace root mismatch");
@@ -357,46 +410,12 @@ fn validate_openai_curated_remote_marketplace_root(root: &Path) -> anyhow::Resul
     Ok(())
 }
 
-fn local_openai_curated_remote_marketplace_root_from_root(
-    root: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
-    let marketplace_path = root
-        .join(".agents")
-        .join("plugins")
-        .join("marketplace.json");
-    if !marketplace_path.is_file() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&marketplace_path)
-        .with_context(|| format!("failed to read {}", marketplace_path.display()))?;
-    let marketplace: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {}", marketplace_path.display()))?;
-    if !is_codey_curated_marketplace_name(
-        marketplace.get("name").and_then(serde_json::Value::as_str),
-    ) {
-        return Ok(None);
-    }
-    let has_plugins = marketplace
-        .get("plugins")
-        .and_then(serde_json::Value::as_array)
-        .map(|plugins| !plugins.is_empty())
-        .unwrap_or(false);
-    if !has_plugins || !root.join("plugins").is_dir() {
-        return Ok(None);
-    }
-    Ok(Some(root.to_path_buf()))
-}
-
 fn replace_directory_with_backup_name(
     source: &Path,
     destination: &Path,
     backup_name: &str,
 ) -> anyhow::Result<()> {
-    let backup = destination.with_file_name(backup_name);
-    if backup.exists() {
-        std::fs::remove_dir_all(&backup)
-            .with_context(|| format!("failed to remove {}", backup.display()))?;
-    }
+    let backup = destination.with_file_name(format!("{backup_name}-{}", uuid::Uuid::new_v4()));
     if destination.exists() {
         std::fs::rename(destination, &backup).with_context(|| {
             format!(
@@ -407,10 +426,8 @@ fn replace_directory_with_backup_name(
         })?;
     }
     match std::fs::rename(source, destination) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir_all(&backup);
-            Ok(())
-        }
+        // Keep the old directory: it may contain user-added files worth recovering.
+        Ok(()) => Ok(()),
         Err(error) => {
             if backup.exists() {
                 let _ = std::fs::rename(&backup, destination);
@@ -558,6 +575,22 @@ fn merge_marketplace_configs_and_plugins_into_text(
     let mut doc = parse_toml_document(config_text)?;
     let marketplaces = table_mut_or_insert(&mut doc, "marketplaces")?;
     for marketplace_name in marketplace_names {
+        if *marketplace_name == CODEY_CURATED_MARKETPLACE {
+            if let Some(entry) = marketplaces.get(marketplace_name) {
+                anyhow::ensure!(
+                    entry.as_table_like().is_some_and(|table| {
+                        table.get("source_type").and_then(Item::as_str) == Some("local")
+                            && table
+                                .get("source")
+                                .and_then(Item::as_str)
+                                .is_some_and(|source| {
+                                    managed_marketplace_path_matches(source, marketplace_root)
+                                })
+                    }),
+                    "codey-curated is registered to a custom source; existing registration was preserved"
+                );
+            }
+        }
         if marketplaces
             .get(marketplace_name)
             .and_then(Item::as_table)
@@ -699,10 +732,20 @@ mod tests {
         marketplace_config_path(path)
     }
 
+    fn write_plugin_manifest(root: &Path, name: &str) {
+        let directory = root.join("plugins").join(name).join(".codex-plugin");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("plugin.json"),
+            serde_json::json!({"name": name}).to_string(),
+        )
+        .unwrap();
+    }
+
     fn write_marketplace(home: &Path) {
         let root = home.join(".tmp").join("plugins");
         std::fs::create_dir_all(root.join(".agents").join("plugins")).unwrap();
-        std::fs::create_dir_all(root.join("plugins").join("gmail")).unwrap();
+        write_plugin_manifest(&root, "gmail");
         std::fs::write(
             root.join(".agents")
                 .join("plugins")
@@ -715,7 +758,7 @@ mod tests {
     fn write_remote_marketplace(home: &Path) {
         let root = home.join(".tmp").join("plugins-remote");
         std::fs::create_dir_all(root.join(".agents").join("plugins")).unwrap();
-        std::fs::create_dir_all(root.join("plugins").join("product-design")).unwrap();
+        write_plugin_manifest(&root, "product-design");
         std::fs::write(
             root.join(".agents")
                 .join("plugins")
@@ -738,7 +781,7 @@ mod tests {
             "financial-markets",
             "customer-support",
         ] {
-            std::fs::create_dir_all(root.join("plugins").join(plugin)).unwrap();
+            write_plugin_manifest(&root, plugin);
         }
         std::fs::write(
             root.join(".agents")
@@ -747,6 +790,161 @@ mod tests {
             r#"{"name":"role-specific-plugins","plugins":[{"name":"sales"},{"name":"data-analytics"},{"name":"product-design"},{"name":"financial-markets"},{"name":"customer-support"}]}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn damaged_managed_snapshots_are_replaced_and_preserved() {
+        for damage in [
+            "index",
+            "non-utf8-index",
+            "missing-index",
+            "missing-manifest",
+            "invalid-manifest",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            ensure_openai_curated_remote_marketplace_available(home).unwrap();
+            let root = home.join(".tmp/plugins-remote");
+            let index = root.join(".agents/plugins/marketplace.json");
+            let manifest = root.join("plugins/product-design/.codex-plugin/plugin.json");
+            std::fs::write(root.join("user-notes.txt"), "keep me").unwrap();
+            match damage {
+                "index" => std::fs::write(index, "{broken").unwrap(),
+                "non-utf8-index" => std::fs::write(index, [0xff]).unwrap(),
+                "missing-index" => std::fs::remove_file(index).unwrap(),
+                "missing-manifest" => std::fs::remove_file(manifest).unwrap(),
+                _ => std::fs::write(manifest, "{}").unwrap(),
+            }
+            assert!(openai_curated_remote_marketplace_status(home).needs_repair());
+            assert!(
+                ensure_openai_curated_remote_marketplace_available(home)
+                    .unwrap()
+                    .initialized
+            );
+            assert!(!openai_curated_remote_marketplace_status(home).needs_repair());
+            let backups: Vec<_> = std::fs::read_dir(home.join(".tmp"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("plugins-remote.previous-codey-")
+                })
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(backups[0].join("user-notes.txt")).unwrap(),
+                "keep me"
+            );
+            assert!(
+                !ensure_openai_curated_remote_marketplace_available(home)
+                    .unwrap()
+                    .initialized
+            );
+        }
+    }
+
+    #[test]
+    fn local_source_manifests_are_required_but_remote_entries_need_no_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_remote_marketplace(home);
+        let root = home.join(".tmp/plugins-remote");
+        let index = root.join(".agents/plugins/marketplace.json");
+        let marketplace = serde_json::json!({
+            "name": CODEY_CURATED_MARKETPLACE,
+            "plugins": [
+                {"name": "product-design", "remotePluginId": "Plugin_example", "source": {"source": "local", "path": "./plugins/product-design"}},
+                {"name": "remote", "source": {"source": "github", "repo": "example/plugin"}},
+                {"name": "remote-id", "remotePluginId": "Plugin_remote"}
+            ]
+        });
+        std::fs::write(&index, marketplace.to_string()).unwrap();
+        assert!(
+            local_openai_curated_remote_marketplace_root(home)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_file(root.join("plugins/product-design/.codex-plugin/plugin.json"))
+            .unwrap();
+        assert!(
+            local_openai_curated_remote_marketplace_root(home)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repair_preserves_custom_registration_even_when_its_source_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let config = "[marketplaces.codey-curated]\nsource_type = \"local\"\nsource = \"/missing/custom-marketplace\"\n";
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        assert!(ensure_openai_curated_remote_marketplace_available(home).is_err());
+        assert!(ensure_openai_curated_marketplace_config(home).is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            config
+        );
+        assert!(!home.join(".tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_does_not_replace_a_link_to_a_custom_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let custom = temp.path().join("custom");
+        std::fs::create_dir_all(home.join(".tmp")).unwrap();
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join("keep.txt"), "custom").unwrap();
+        std::os::unix::fs::symlink(&custom, home.join(".tmp/plugins-remote")).unwrap();
+        assert!(ensure_openai_curated_remote_marketplace_available(&home).is_err());
+        assert_eq!(
+            std::fs::read_to_string(custom.join("keep.txt")).unwrap(),
+            "custom"
+        );
+        assert!(home.join(".tmp/plugins-remote").is_symlink());
+        // A complete marketplace behind the link must not be renamed either.
+        write_remote_marketplace(&home);
+        let index = custom.join(".agents/plugins/marketplace.json");
+        let original = std::fs::read(&index).unwrap();
+        assert!(ensure_openai_curated_remote_marketplace_available(&home).is_err());
+        assert!(ensure_openai_curated_remote_marketplace_config(&home).is_err());
+        assert_eq!(std::fs::read(index).unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_replacement_archive_preserves_existing_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        write_remote_marketplace(temp.path());
+        let root = temp.path().join(".tmp/plugins-remote");
+        let index = root.join(".agents/plugins/marketplace.json");
+        let original = std::fs::read(&index).unwrap();
+        assert!(
+            install_openai_curated_remote_marketplace_zip(temp.path(), b"invalid zip").is_err()
+        );
+        assert_eq!(std::fs::read(index).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(".tmp")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn registration_merge_does_not_overwrite_custom_sources() {
+        let config =
+            "[marketplaces.codey-curated]\nsource_type = \"local\"\nsource = \"/missing/custom\"\n";
+        assert!(
+            merge_marketplace_configs_and_plugins_into_text(
+                config,
+                &[CODEY_CURATED_MARKETPLACE],
+                Path::new("/managed/plugins-remote"),
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ import { pluginHtmlDocument, pluginJsonObject, validPluginReady } from "./plugin
 export function PluginHtmlConfig({ html, value, schema, disabled, onSave, onFailure, onDraftChange }: {
   html: string; value: Record<string, unknown>; schema: PluginSchema; disabled: boolean;
   onSave: (config: Record<string, unknown>) => void; onFailure: (message: string) => void;
-  onDraftChange: (config: Record<string, unknown>) => void;
+  onDraftChange: (config: Record<string, unknown>, invalidDraft?: boolean) => void;
 }) {
   const iframe = useRef<HTMLIFrameElement>(null);
   const [document] = useState(() => { const token = crypto.randomUUID(); return { token, html: pluginHtmlDocument(html, token) }; });
@@ -15,6 +15,7 @@ export function PluginHtmlConfig({ html, value, schema, disabled, onSave, onFail
   const [validity, setValidity] = useState({ valid: true, message: "" });
   const [payloadError, setPayloadError] = useState("");
   const initialValue = useRef(value);
+  const currentDraft = useRef(value);
   const loads = useRef(0), invalidated = useRef(false);
   const portRef = useRef<MessagePort | null>(null);
   const latest = useRef({ disabled, onFailure, onDraftChange }); latest.current = { disabled, onFailure, onDraftChange };
@@ -43,8 +44,8 @@ export function PluginHtmlConfig({ html, value, schema, disabled, onSave, onFail
         if (latest.current.disabled) return;
         if (data?.type === "config") {
           const next = pluginJsonObject(data.config);
-          if (next) { setDraft(next); latest.current.onDraftChange(next); setPayloadError(""); }
-          else setPayloadError("插件返回的配置必须为不超过 1 MiB 的 JSON 对象。");
+          if (next) { currentDraft.current = next; setDraft(next); latest.current.onDraftChange(next); setPayloadError(""); }
+          else { latest.current.onDraftChange(currentDraft.current, true); setPayloadError("插件返回的配置必须为不超过 1 MiB 的 JSON 对象。"); }
         } else if (data?.type === "validity" && typeof data.valid === "boolean") {
           setValidity({ valid: data.valid, message: typeof data.message === "string" ? data.message.slice(0, 2000) : "" });
         }

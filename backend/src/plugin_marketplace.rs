@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -150,7 +150,11 @@ pub fn list_plugins(home: &Path) -> Result<Value> {
                 "localPath".into(),
                 Value::String(plugin_root.to_string_lossy().to_string()),
             );
-            object.insert("installed".into(), Value::Bool(installed.contains(&id)));
+            object.insert("installed".into(), Value::Bool(installed.contains_key(&id)));
+            object.insert(
+                "enabled".into(),
+                Value::Bool(installed.get(&id).copied().unwrap_or(false)),
+            );
             merge_manifest(&mut object, &plugin_root);
             plugins.push(Value::Object(object));
         }
@@ -195,27 +199,27 @@ fn merge_manifest(plugin: &mut Map<String, Value>, plugin_root: &Path) {
     }
 }
 
-fn installed_plugins(home: &Path) -> Result<HashSet<String>> {
-    let Ok(snapshot) = codey_runtime_core::config_manager::ConfigManager::for_home(home).load()
-    else {
-        return Ok(HashSet::new());
-    };
+fn installed_plugins(home: &Path) -> Result<HashMap<String, bool>> {
+    let snapshot = codey_runtime_core::config_manager::ConfigManager::for_home(home)
+        .load()
+        .context("读取插件安装配置失败")?;
     let Some(table) = snapshot
         .document()
         .get("plugins")
         .and_then(|item| item.as_table_like())
     else {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     };
     Ok(table
         .iter()
-        .filter(|(_, item)| {
-            item.as_table_like()
+        .map(|(key, item)| {
+            let enabled = item
+                .as_table_like()
                 .and_then(|table| table.get("enabled"))
                 .and_then(|value| value.as_bool())
-                .unwrap_or(true)
+                .unwrap_or(true);
+            (key.to_string(), enabled)
         })
-        .map(|(key, _)| key.to_string())
         .collect())
 }
 
@@ -226,7 +230,13 @@ mod tests {
     fn write_marketplace(home: &Path, directory: &str, name: &str, plugin: &str) {
         let root = home.join(".tmp").join(directory);
         fs::create_dir_all(root.join(".agents").join("plugins")).unwrap();
-        fs::create_dir_all(root.join("plugins").join(plugin)).unwrap();
+        let manifest_dir = root.join("plugins").join(plugin).join(".codex-plugin");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            json!({"name": plugin}).to_string(),
+        )
+        .unwrap();
         fs::write(
             root.join(".agents")
                 .join("plugins")
@@ -238,6 +248,40 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn plugin_list_distinguishes_installed_and_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_marketplace(home, "plugins-remote", "codey-curated", "sales");
+        for (config, installed, enabled) in [
+            ("", false, false),
+            (
+                "[plugins.\"sales@codey-curated\"]\nenabled = false\n",
+                true,
+                false,
+            ),
+            (
+                "[plugins.\"sales@codey-curated\"]\nenabled = true\n",
+                true,
+                true,
+            ),
+            ("[plugins.\"sales@codey-curated\"]\n", true, true),
+        ] {
+            fs::write(home.join("config.toml"), config).unwrap();
+            let listing = list_plugins(home).unwrap();
+            assert_eq!(listing["plugins"][0]["installed"], installed);
+            assert_eq!(listing["plugins"][0]["enabled"], enabled);
+        }
+    }
+
+    #[test]
+    fn plugin_list_reports_invalid_config_instead_of_uninstalled_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        write_marketplace(temp.path(), "plugins-remote", "codey-curated", "sales");
+        fs::write(temp.path().join("config.toml"), "[plugins\n").unwrap();
+        assert!(list_plugins(temp.path()).is_err());
     }
 
     #[test]

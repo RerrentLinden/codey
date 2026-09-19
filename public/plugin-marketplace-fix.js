@@ -135,45 +135,53 @@
     try { return JSON.stringify(normalizeRequest(JSON.parse(value))); } catch { return value; }
   };
 
-  const pluginRequestPattern = /plugin|marketplace|list-plugins|install-plugin|uninstall-plugin/i;
-  const pluginMutationPattern = /install-plugin|uninstall-plugin/i;
   const directRequestKeys = ["channel", "command", "method", "action", "type", "path", "topic", "url"];
-  // requestValueMatchesMethod only ever matches a string that ends with the
-  // method name, so the raw text must contain it literally. Scanning for the
-  // substring is orders of magnitude cheaper than parsing a large body just to
-  // discover it was irrelevant.
-  const mayContainMethod = (text, method) => (
-    typeof text === "string" && text.toLowerCase().includes(method.toLowerCase())
-  );
+  const envelopeKeys = ["payload", "request", "body"];
+  const envelopeCommands = new Set(["invoke", "request", "rpc", "mcp-request"]);
+  const requestPath = (value) => value.trim().toLowerCase()
+    .split(/[?#]/, 1)[0].replace(/^(?:[a-z][a-z\d+.-]*:)?\/\/[^/]+/, "");
+  const pluginRoute = (value) => typeof value === "string"
+    && /(?:^|\/)(?:plugins?|marketplace)(?:\/|$)/.test(requestPath(value));
+  const pluginCommand = (value, route = false) => {
+    if (typeof value !== "string") return null;
+    const name = requestPath(value);
+    const legacy = /^(?:\/?[a-z\d_-]+[/:.])*(?:list-plugins|install-plugin|uninstall-plugin)$/.test(name.replace(/^\//, ""));
+    const namespaced = route ? pluginRoute(value)
+      : /^[a-z\d_-]+(?:[/:.][a-z\d_-]+)*$/.test(name.replace(/^\//, ""))
+        && /(?:^|[/:.])(?:plugins?|marketplace)(?:[/:.]|$)/.test(name);
+    if (!legacy && !namespaced) return null;
+    return {
+      list: /(?:^|[/:.])list-plugins$/.test(name) || /(?:^|[/:.])(?:plugins?|marketplace)[/:.]list$/.test(name),
+      mutation: /(?:^|[/:.])(?:install-plugin|uninstall-plugin)$/.test(name)
+        || /(?:^|[/:.])(?:plugins?|marketplace)[/:.](?:install|uninstall)$/.test(name),
+    };
+  };
   const isStructuredRequestBody = (value) => {
     if (!value || typeof value !== "object") return false;
-    if (Array.isArray(value)) return true;
+    if (Array.isArray(value)) return false;
     try {
       return Object.prototype.toString.call(value) === "[object Object]";
     } catch {
       return true;
     }
   };
-  const requestValueMatchesMethod = (value, method) => {
-    if (typeof value !== "string") return false;
-    const normalized = value.trim().toLowerCase().split(/[?#]/, 1)[0];
-    const expected = method.toLowerCase();
-    return normalized === expected
-      || normalized.endsWith(`/${expected}`)
-      || normalized.endsWith(`:${expected}`)
-      || normalized.endsWith(`.${expected}`);
-  };
-  const requestHasMethod = (
+  const pluginRequest = (
     value,
-    method,
     depth = 0,
     seen = new WeakSet(),
     budget = { remaining: 24 },
   ) => {
-    if (!value || typeof value !== "object" || depth >= 4 || seen.has(value) || budget.remaining <= 0) {
-      return false;
+    if (typeof value === "string") {
+      if (!/plugin|marketplace/i.test(value)) return null;
+      try { value = JSON.parse(value); } catch { return null; }
+    }
+    if (!isStructuredRequestBody(value) || depth >= 4 || seen.has(value) || budget.remaining <= 0) {
+      return null;
     }
     seen.add(value);
+    let hasCommand = false;
+    let isEnvelope = false;
+    let hasApplicationMethod = false;
     for (const key of directRequestKeys) {
       let marker;
       try {
@@ -181,70 +189,34 @@
       } catch {
         continue;
       }
-      if (requestValueMatchesMethod(marker, method)) return true;
-    }
-    let entries;
-    try {
-      entries = Object.entries(value);
-    } catch {
-      return false;
-    }
-    for (const [key, child] of entries) {
-      budget.remaining -= 1;
-      if (child && typeof child === "object" && requestHasMethod(child, method, depth + 1, seen, budget)) {
-        return true;
+      const command = pluginCommand(marker, key === "path" || key === "url");
+      if (command) return command;
+      if (typeof marker === "string") {
+        hasCommand = true;
+        if (envelopeCommands.has(marker.toLowerCase())) isEnvelope = true;
+        else if (key === "method" || key === "command" || key === "action") hasApplicationMethod = true;
       }
-      if (key === "body" && typeof child === "string" && mayContainMethod(child, method)) {
-        try {
-          if (requestHasMethod(JSON.parse(child), method, depth + 1, seen, budget)) return true;
-        } catch {}
-      }
-      if (budget.remaining <= 0) break;
     }
-    return false;
-  };
-  const argsHaveRequestMethod = (args, method) => args.some((value) => requestHasMethod(value, method));
-  const requestHasMarker = (value, pattern, depth = 0, seen = new WeakSet(), budget = { remaining: 24 }) => {
-    if (typeof value === "string") return pattern.test(value);
-    if (!value || typeof value !== "object" || depth >= 3 || seen.has(value) || budget.remaining <= 0) {
-      return false;
-    }
-    seen.add(value);
-    let entries;
-    try {
-      entries = Object.entries(value);
-    } catch {
-      return false;
-    }
-    for (const [key, child] of entries) {
-      budget.remaining -= 1;
-      if (pattern.test(key) || requestHasMarker(child, pattern, depth + 1, seen, budget)) {
-        return true;
-      }
-      if (budget.remaining <= 0) break;
-    }
-    return false;
-  };
-  const requestMatches = (value, pattern) => {
-    if (typeof value === "string") return pattern.test(value);
-    if (!value || typeof value !== "object") return false;
-    for (const key of directRequestKeys) {
-      let marker;
+    // Only transport envelopes contain another command. Application payloads
+    // such as chat prompts, tool parameters and descriptions are opaque here.
+    if (hasApplicationMethod || (hasCommand && !isEnvelope)) return null;
+    for (const key of envelopeKeys) {
+      if (budget.remaining-- <= 0) break;
       try {
-        marker = value[key];
-      } catch {
-        continue;
-      }
-      if (typeof marker !== "string") continue;
-      if (pattern.test(marker)) return true;
+        const command = pluginRequest(value[key], depth + 1, seen, budget);
+        if (command) return command;
+      } catch {}
     }
-    try {
-      return requestHasMarker(value, pattern);
-    } catch {
-      return false;
-    }
+    return null;
   };
-  const argsMatch = (args, pattern) => args.some((value) => requestMatches(value, pattern));
+  const pluginRequestArgs = (args) => {
+    const first = args[0];
+    if (typeof first !== "string") return pluginRequest(first);
+    const command = pluginCommand(first);
+    if (command) return command;
+    if (envelopeCommands.has(first.toLowerCase())) return pluginRequest(args[1]);
+    return pluginRequest(first);
+  };
 
   let bridgeRetryTimer = 0;
   let bridgeRetryDelay = 50;
@@ -276,26 +248,23 @@
     }
     const original = electronBridge.sendMessageFromView;
     const wrapped = function (...args) {
-      let isPluginRequest = false;
-      let isPluginListRequest = false;
+      let request = null;
       try {
-        isPluginRequest = argsMatch(args, pluginRequestPattern);
-        isPluginListRequest = argsHaveRequestMethod(args, "list-plugins");
+        request = pluginRequestArgs(args);
       } catch {}
       // Every IPC message passes through here; unrelated requests must not
       // pay for an extra promise hop or a second argument walk.
-      if (!isPluginRequest && !isPluginListRequest) return original.apply(this, args);
-      const normalizedArgs = isPluginRequest ? args.map(normalizeRequestArg) : args;
+      if (!request) return original.apply(this, args);
+      const normalizedArgs = args.map(normalizeRequestArg);
       const result = original.apply(this, normalizedArgs);
       if (!result || typeof result.then !== "function") return result;
-      const localRefresh = isPluginListRequest ? waitForLocalPlugins() : Promise.resolve();
+      const localRefresh = request.list ? waitForLocalPlugins() : Promise.resolve();
       return Promise.all([result, localRefresh]).then(([response]) => {
-        if (!isPluginRequest) return response;
         let patched = response;
         try {
           patched = patchResponse(response);
         } catch {}
-        if (argsMatch(args, pluginMutationPattern)) {
+        if (request.mutation) {
           refreshLocalPlugins(true);
         }
         return patched;
@@ -333,30 +302,13 @@
     registerFetchInterceptor("plugin-marketplace", (next, ...args) => {
       const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
       const body = args[1]?.body;
-      const patchesPluginResponse = /plugin|marketplace/i.test(url);
-      const urlRequestsPluginList = requestValueMatchesMethod(url, "list-plugins");
-      const bodyIsStructuredRequest = isStructuredRequestBody(body);
-      const bodyMayRequestPluginList =
-        bodyIsStructuredRequest || mayContainMethod(body, "list-plugins");
-      if (
-        !patchesPluginResponse &&
-        !urlRequestsPluginList &&
-        !bodyMayRequestPluginList
-      ) {
-        return next(...args);
-      }
-
-      let isPluginListRequest = urlRequestsPluginList;
-      if (!isPluginListRequest && bodyIsStructuredRequest) {
-        isPluginListRequest = requestHasMethod(body, "list-plugins");
-      } else if (!isPluginListRequest && mayContainMethod(body, "list-plugins")) {
-        try {
-          isPluginListRequest = requestHasMethod(JSON.parse(body), "list-plugins");
-        } catch {}
-      }
+      const routeRequest = pluginCommand(url, true);
+      const request = routeRequest || pluginRequest(body);
+      if (!request) return next(...args);
+      const patchesPluginResponse = Boolean(routeRequest);
 
       const responsePromise = next(...args);
-      const ready = isPluginListRequest
+      const ready = request.list
         ? Promise.all([responsePromise, waitForLocalPlugins()]).then(([response]) => response)
         : responsePromise;
       return ready.then(async (response) => {

@@ -40,7 +40,7 @@ pub(crate) fn responses_to_chat_completions_request(
     append_chat_messages_from_responses_input(
         normalized_input.as_ref(),
         &mut messages,
-        &tool_bridge,
+        &mut tool_bridge,
     )?;
     if messages.is_empty() {
         anyhow::bail!("缺少可转换为 Chat Completions messages 的 input");
@@ -137,7 +137,7 @@ pub(crate) fn responses_to_chat_completions_request(
     {
         chat.insert(
             "tool_choice".to_string(),
-            responses_tool_choice_to_chat_tool_choice(tool_choice, &tool_bridge)?,
+            responses_tool_choice_to_chat_tool_choice(tool_choice, &mut tool_bridge)?,
         );
     }
     if let Some(parallel_tool_calls) = object.get("parallel_tool_calls") {
@@ -152,7 +152,7 @@ pub(crate) fn responses_to_chat_completions_request(
     if let Some(function_call) = object.get("function_call") {
         chat.insert(
             "function_call".to_string(),
-            responses_function_call_choice_to_chat(function_call, &tool_bridge)?,
+            responses_function_call_choice_to_chat(function_call, &mut tool_bridge)?,
         );
     }
     Ok(ConvertedResponsesRequest {

@@ -541,13 +541,16 @@ impl ResponsesToolName {
 }
 
 impl ResponsesToolBridge {
-    pub(crate) fn upstream_name_for_call(&self, tool_name: &ResponsesToolName) -> Result<String> {
+    pub(crate) fn upstream_name_for_call(
+        &mut self,
+        tool_name: &ResponsesToolName,
+    ) -> Result<String> {
         if let Some(upstream_name) = self.response_to_upstream.get(tool_name) {
             return Ok(upstream_name.clone());
         }
         // 压缩请求和后续轮次可能不再携带工具声明，历史 function_call 仍会
         // 引用当时声明过的 namespace 或 custom 工具。展开名称只由 namespace
-        // 和叶子名决定，这里按同一规则重建，保持与已声明时完全一致。
+        // 和叶子名决定，这里按同一规则重建，并登记双向映射供响应还原。
         let upstream_name = if tool_name.is_function() && tool_name.namespace.is_empty() {
             tool_name.name.clone()
         } else if tool_name.is_function() {
@@ -560,8 +563,14 @@ impl ResponsesToolBridge {
         if let Some(existing) = self.upstream_to_response.get(&upstream_name)
             && existing != tool_name
         {
-            anyhow::bail!("历史调用重建的桥接名称 {upstream_name} 与当前请求声明的工具冲突");
+            anyhow::bail!("重建的桥接名称 {upstream_name} 与当前请求中的其他工具冲突");
         }
+        self.has_namespace_tools |= tool_name.is_function() && !tool_name.namespace.is_empty();
+        self.has_custom_tools |= tool_name.is_custom();
+        self.upstream_to_response
+            .insert(upstream_name.clone(), tool_name.clone());
+        self.response_to_upstream
+            .insert(tool_name.clone(), upstream_name.clone());
         Ok(upstream_name)
     }
 

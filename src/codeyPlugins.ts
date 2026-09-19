@@ -13,6 +13,18 @@ export type CodeyPlugin = {
   configUi?: { type: "html"; entry: string; sha256: string } | null;
 };
 export type CodeyPluginsResult = { plugins: CodeyPlugin[]; platform: string; arch: string };
+export function parseCodeyPluginsResult(value: unknown): CodeyPluginsResult {
+  const object = (item: unknown): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item);
+  if (!object(value) || !Array.isArray(value.plugins) || typeof value.platform !== "string" || typeof value.arch !== "string") throw new Error("插件列表响应无效，请刷新后重试。");
+  const ids = new Set<string>();
+  for (const plugin of value.plugins) {
+    if (!object(plugin) || ![plugin.id, plugin.name, plugin.version, plugin.status].every(item => typeof item === "string" && item.length > 0)
+      || typeof plugin.enabled !== "boolean" || !object(plugin.config) || !object(plugin.configSchema)
+      || !Array.isArray(plugin.capabilities) || !plugin.capabilities.every(item => typeof item === "string") || ids.has(plugin.id as string)) throw new Error("插件列表响应无效，请刷新后重试。");
+    ids.add(plugin.id as string);
+  }
+  return value as CodeyPluginsResult;
+}
 export type CodeyPluginPreview = {
   path: string; sha256: string; configSchema: PluginSchema;
   manifest: { id: string; name: string; version: string; description?: string;

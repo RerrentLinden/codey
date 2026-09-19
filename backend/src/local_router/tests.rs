@@ -4752,6 +4752,19 @@ fn undeclared_namespace_history_calls_rebuild_flat_function_names() {
     assert_eq!(converted.body["messages"][2]["tool_call_id"], "call-glob");
     assert_eq!(converted.body["messages"][4]["tool_call_id"], "call-js");
     assert!(converted.body.get("tools").is_none());
+    assert_eq!(
+        converted
+            .tool_bridge
+            .restore_upstream_name(
+                converted.body["messages"][1]["tool_calls"][0]["function"]["name"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()
+            .namespace_string()
+            .as_deref(),
+        Some("mcp__codey_fastctx")
+    );
 }
 
 #[test]
@@ -4773,6 +4786,13 @@ fn undeclared_custom_and_tool_search_history_calls_rebuild_flat_names() {
     assert_eq!(
         custom.body["messages"][1]["tool_calls"][0]["function"]["name"],
         Value::String(custom_upstream_tool_name(&[], "apply_patch"))
+    );
+    assert_eq!(
+        custom
+            .tool_bridge
+            .restore_upstream_name(&custom_upstream_tool_name(&[], "apply_patch"))
+            .unwrap(),
+        ResponsesToolName::custom_in_namespace(&[], "apply_patch")
     );
 
     let tool_search = responses_to_chat_completions_request(&json!({
@@ -4798,6 +4818,131 @@ fn undeclared_custom_and_tool_search_history_calls_rebuild_flat_names() {
         tool_search.body["messages"][1]["tool_calls"][0]["function"]["name"],
         TOOL_SEARCH_UPSTREAM_TOOL_NAME
     );
+    assert_eq!(
+        tool_search
+            .tool_bridge
+            .restore_upstream_name(TOOL_SEARCH_UPSTREAM_TOOL_NAME)
+            .unwrap(),
+        ResponsesToolName::tool_search()
+    );
+}
+
+#[test]
+fn undeclared_custom_history_restores_streaming_and_final_response_names() {
+    let upstream_name = "codey_custom__functions_exec__8fabda7ea015da84";
+    let raw_input = "text(1 + 1)";
+    let arguments = wrap_custom_tool_input(raw_input).unwrap();
+    for tools in [json!([{"type":"custom","name":"apply_patch"}]), json!([])] {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "tools":tools,
+            "input":[
+                {"type":"custom_tool_call","call_id":"call-history",
+                 "namespace":"functions","name":"exec","input":"text(1)"},
+                {"type":"custom_tool_call_output","call_id":"call-history","output":"1"},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            converted.body["messages"][0]["tool_calls"][0]["function"]["name"],
+            upstream_name
+        );
+        assert_eq!(
+            converted
+                .body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            tools.as_array().unwrap().len()
+        );
+
+        let mut accumulator = ChatSseAccumulator::for_streaming("provider-model");
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+        let split = 18;
+        for (name, args) in [
+            (&upstream_name[..split], ""),
+            (&upstream_name[split..], arguments.as_str()),
+        ] {
+            accumulator
+                .ingest(&json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call-next","type":"function",
+                    "function":{"name":name,"arguments":args}
+                }]}}]}))
+                .unwrap();
+            stream
+                .tool_delta(0, Some("call-next"), Some(name), Some(args), None)
+                .unwrap();
+        }
+        accumulator
+            .ingest(&json!({
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+            }))
+            .unwrap();
+        let chat = chat_completion_to_responses_body_with_tool_bridge(
+            accumulator.into_chat_completion(true).unwrap(),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        let streamed = stream_tool_item(stream.tools.get(&0).unwrap()).unwrap();
+        let anthropic = anthropic_message_to_responses_body_with_tool_bridge(
+            &json!({"type":"message","content":[{
+                "type":"tool_use","id":"call-next","name":upstream_name,
+                "input":{"input":raw_input}
+            }]}),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        for item in [&chat["output"][0], &streamed, &anthropic["output"][0]] {
+            assert_eq!(item["type"], "custom_tool_call");
+            assert_eq!(item["namespace"], "functions");
+            assert_eq!(item["name"], "exec");
+        }
+        assert_eq!(chat["output"][0]["input"], raw_input);
+        assert_eq!(anthropic["output"][0]["input"], raw_input);
+        assert_eq!(stream.tools.get(&0).unwrap().arguments, arguments);
+        let unknown_name = custom_upstream_tool_name(&["functions".to_string()], "missing");
+        assert!(
+            converted
+                .tool_bridge
+                .restore_upstream_name(&unknown_name)
+                .is_err()
+        );
+        assert!(
+            converted
+                .tool_bridge
+                .restore_stream_upstream_name(&unknown_name, true)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn undeclared_history_rejects_bridge_name_collisions() {
+    let upstream_name = custom_upstream_tool_name(&["functions".to_string()], "exec");
+    let custom_call = json!({
+        "type":"custom_tool_call","call_id":"call-custom",
+        "namespace":"functions","name":"exec","input":"text(1)"
+    });
+    let plain_call = json!({
+        "type":"function_call","call_id":"call-plain","name":upstream_name,"arguments":"{}"
+    });
+    for (tools, input) in [
+        (
+            json!([{"type":"function","name":upstream_name,"parameters":{"type":"object"}}]),
+            json!([custom_call]),
+        ),
+        (json!([]), json!([custom_call, plain_call])),
+        (json!([]), json!([plain_call, custom_call])),
+    ] {
+        let error = responses_to_chat_completions_request(&json!({
+            "model":"provider-model","tools":tools,"input":input
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("冲突"));
+    }
 }
 
 #[test]

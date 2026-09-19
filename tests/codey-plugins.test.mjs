@@ -2,9 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
-const { validatePluginConfig, pluginStatusLabel, applyPluginDefaults, initialPluginValue, setPluginProperty } = await loadTypeScriptModule(
+const { parseCodeyPluginsResult, validatePluginConfig, pluginStatusLabel, applyPluginDefaults, initialPluginValue, setPluginProperty } = await loadTypeScriptModule(
   new URL("../src/codeyPlugins.ts", import.meta.url),
 );
+
+test("plugin list validation distinguishes valid empty lists from malformed state", () => {
+  const empty = { plugins: [], platform: "linux", arch: "x86_64" };
+  assert.equal(parseCodeyPluginsResult(empty), empty);
+  const plugin = { id: "demo", name: "Demo", version: "1", status: "stopped", enabled: false, config: {}, configSchema: {}, capabilities: [] };
+  assert.equal(parseCodeyPluginsResult({ ...empty, plugins: [plugin] }).plugins[0], plugin);
+  for (const value of [null, {}, { plugins: [] }, { ...empty, plugins: [null] }, { ...empty, plugins: [{ ...plugin, enabled: "false" }] }, { ...empty, plugins: [{ ...plugin, capabilities: null }] }, { ...empty, plugins: [plugin, plugin] }]) assert.throws(() => parseCodeyPluginsResult(value));
+});
 
 test("plugin configuration rejects invalid values before saving", () => {
   const schema = {

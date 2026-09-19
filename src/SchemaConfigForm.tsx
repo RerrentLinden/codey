@@ -69,11 +69,14 @@ function Field(props: FieldProps) {
     {visibleErrors.length > 0 && <p role="alert" className="m-0 break-words text-xs text-red-600">{visibleErrors.join("；")}</p>}
   </div>;
 }
-export function SchemaConfigForm({ schema, value, disabled = false, onSave }: { schema: PluginSchema; value: Record<string, unknown>; disabled?: boolean; onSave: (value: Record<string, unknown>) => void }) {
+export function SchemaConfigForm({ schema, value, disabled = false, onSave, onDraftChange }: { schema: PluginSchema; value: Record<string, unknown>; disabled?: boolean; onSave: (value: Record<string, unknown>) => void; onDraftChange?: (value: Record<string, unknown>, invalidDraft: boolean, changed: boolean) => void }) {
   const [config, setConfig] = useState(() => applyPluginDefaults(value, schema));
+  const initial = useRef(config);
   const [draftErrors, setDraftErrors] = useState<Record<string, boolean>>({});
   const [onDraftError] = useState(() => (path: string, invalid: boolean) => setDraftErrors(previous => previous[path] === invalid ? previous : { ...previous, [path]: invalid }));
   const rootSchema = { ...schema, type: "object" };
   const invalid = Object.values(draftErrors).some(Boolean) || validatePluginConfig(config, rootSchema).length > 0;
+  const latestDraftChange = useRef(onDraftChange); latestDraftChange.current = onDraftChange;
+  useEffect(() => { latestDraftChange.current?.(config as Record<string, unknown>, Object.values(draftErrors).some(Boolean), !samePluginValue(config, initial.current)); }, [config, draftErrors]);
   return <div className="grid gap-4"><Field schema={rootSchema} name="配置" path="config" required value={config} onChange={setConfig} disabled={disabled} onDraftError={onDraftError} /><div><Button size="sm" disabled={disabled || invalid} onClick={() => onSave(config as Record<string, unknown>)}>保存配置</Button></div></div>;
 }

@@ -65,6 +65,8 @@ struct Record {
     config: Value,
     enabled: bool,
     directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    load_error: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -153,19 +155,7 @@ pub fn initialize(root: PathBuf) -> Result<(), String> {
         };
     }
     let mut manager = Manager::open(root)?;
-    let ids: Vec<_> = manager
-        .state
-        .plugins
-        .iter()
-        .filter(|(_, r)| r.enabled)
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in ids {
-        if let Err(e) = manager.load(&id) {
-            manager.log_event(&id, "load_failed");
-            manager.errors.insert(id, e);
-        }
-    }
+    manager.load_enabled()?;
     manager.update_fast_path();
     MANAGER
         .set(Mutex::new(manager))
@@ -238,6 +228,7 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<PluginList, String> {
         }
         let mut state = manager.state.clone();
         state.plugins.get_mut(id).unwrap().enabled = true;
+        state.plugins.get_mut(id).unwrap().load_error = None;
         if let Err(e) = manager.commit(state) {
             if !was_loaded {
                 manager.live.remove(id);
@@ -249,6 +240,7 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<PluginList, String> {
     } else {
         let mut state = manager.state.clone();
         state.plugins.get_mut(id).unwrap().enabled = false;
+        state.plugins.get_mut(id).unwrap().load_error = None;
         manager.commit(state)?;
         let old = manager.live.remove(id);
         manager.errors.remove(id);
@@ -479,7 +471,7 @@ impl Manager {
                 .map_err(|e| e.to_string())?;
         }
         let state_path = root.join("state.json");
-        let state = if state_path.exists() {
+        let state: State = if state_path.exists() {
             let bytes = fs::read(&state_path).map_err(|e| e.to_string())?;
             if bytes.len() > 16 * 1024 * 1024 {
                 return Err("插件状态文件过大".into());
@@ -488,14 +480,48 @@ impl Manager {
         } else {
             State::default()
         };
+        let errors = state
+            .plugins
+            .iter()
+            .filter_map(|(id, record)| {
+                record
+                    .load_error
+                    .as_ref()
+                    .map(|error| (id.clone(), error.clone()))
+            })
+            .collect();
         Ok(Self {
             root: canonical_root,
             state,
             live: BTreeMap::new(),
-            errors: BTreeMap::new(),
+            errors,
             stopping: false,
             generations: BTreeMap::new(),
         })
+    }
+
+    fn load_enabled(&mut self) -> Result<(), String> {
+        let ids: Vec<_> = self
+            .state
+            .plugins
+            .iter()
+            .filter(|(_, record)| record.enabled)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Err(error) = self.load(&id) {
+                let message = format!("启动加载失败，插件已自动停用，请检查后重新启用：{error}");
+                let mut state = self.state.clone();
+                let record = state.plugins.get_mut(&id).unwrap();
+                record.enabled = false;
+                record.load_error = Some(message.clone());
+                self.commit(state)
+                    .map_err(|cause| format!("无法保存插件 {id} 的自动停用状态：{cause}"))?;
+                self.log_event(&id, "load_failed");
+                self.errors.insert(id, message);
+            }
+        }
+        Ok(())
     }
 
     fn commit(&mut self, state: State) -> Result<(), String> {
@@ -676,6 +702,7 @@ impl Manager {
                 config,
                 enabled: old.is_some_and(|r| r.enabled),
                 directory,
+                load_error: None,
             },
         );
         state.retained_config.remove(&id);
@@ -929,6 +956,37 @@ mod tests {
             },
             files: BTreeMap::from([("file.txt".into(), b"fixture".to_vec())]),
         }
+    }
+
+    #[test]
+    fn failed_startup_load_stays_disabled_across_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let mut state = manager.state.clone();
+        state.plugins.get_mut("test.boundary").unwrap().enabled = true;
+        manager.commit(state).unwrap();
+
+        manager.load_enabled().unwrap();
+        let plugin = manager.list().plugins.remove(0);
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.status, "error");
+        assert!(plugin.last_error.as_ref().unwrap().contains("已自动停用"));
+        let persisted = fs::read(root.path().join("state.json")).unwrap();
+
+        let mut reopened = Manager::open(root.path().into()).unwrap();
+        reopened.load_enabled().unwrap();
+        assert_eq!(fs::read(root.path().join("state.json")).unwrap(), persisted);
+        assert_eq!(reopened.list().plugins[0].last_error, plugin.last_error);
+        assert!(!reopened.list().plugins[0].enabled);
+
+        // 升级包会清除旧版本的加载错误，但不会自动启用。
+        let mut upgrade = fixture_package();
+        upgrade.inspection.manifest.version = "1.0.1".into();
+        reopened.install(upgrade).unwrap();
+        let repaired = Manager::open(root.path().into()).unwrap().list();
+        assert!(!repaired.plugins[0].enabled);
+        assert!(repaired.plugins[0].last_error.is_none());
     }
 
     fn html_fixture_package(html: &[u8], ui: Option<Value>) -> Result<package::Package, String> {

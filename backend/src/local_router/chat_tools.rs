@@ -3,7 +3,7 @@ use super::*;
 pub(crate) fn append_chat_messages_from_responses_input(
     input: Option<&Value>,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     let Some(input) = input else {
         return Ok(());
@@ -72,7 +72,7 @@ pub(crate) fn is_tool_image_message(message: &Value) -> bool {
 pub(crate) fn append_chat_message_item(
     item: &Value,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     match item {
         Value::String(text) => push_chat_text_message(messages, "user", text),
@@ -155,7 +155,7 @@ pub(crate) fn looks_like_message_object(object: &serde_json::Map<String, Value>)
 pub(crate) fn append_responses_agent_message_object(
     object: &serde_json::Map<String, Value>,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     let mut message = object.clone();
     message.insert("role".to_string(), Value::String("assistant".to_string()));
@@ -170,7 +170,7 @@ pub(crate) fn append_responses_agent_message_object(
 pub(crate) fn append_responses_message_object(
     object: &serde_json::Map<String, Value>,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     let role = object
         .get("role")
@@ -419,7 +419,7 @@ pub(crate) fn append_single_content_part_as_user_message(
 pub(crate) fn append_responses_function_call_item(
     object: &serde_json::Map<String, Value>,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     let call_id = object
         .get("call_id")
@@ -437,7 +437,7 @@ pub(crate) fn append_responses_function_call_item(
 pub(crate) fn append_responses_custom_tool_call_item(
     object: &serde_json::Map<String, Value>,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     let call_id = object
         .get("call_id")
@@ -465,7 +465,7 @@ pub(crate) fn append_responses_custom_tool_call_item(
 pub(crate) fn append_responses_tool_search_call_item(
     object: &serde_json::Map<String, Value>,
     messages: &mut Vec<Value>,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     if object.get("execution").and_then(Value::as_str) != Some("client") {
         anyhow::bail!("tool_search_call 只允许 execution=client 的历史调用");
@@ -657,7 +657,7 @@ pub(crate) fn responses_tool_output_content(
 
 pub(crate) fn normalize_chat_tool_calls(
     tool_calls: &Value,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<Value> {
     let tool_calls = tool_calls
         .as_array()
@@ -706,7 +706,7 @@ pub(crate) fn normalize_chat_tool_calls(
 
 pub(crate) fn normalize_chat_legacy_function_call(
     function_call: &Value,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<Value> {
     match function_call {
         Value::String(choice) if matches!(choice.as_str(), "auto" | "none") => {
@@ -1544,7 +1544,7 @@ pub(crate) fn responses_tool_name_from_call_object(
 
 pub(crate) fn responses_tool_choice_to_chat_tool_choice(
     tool_choice: &Value,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<Value> {
     match tool_choice {
         Value::String(choice) if matches!(choice.as_str(), "auto" | "none" | "required") => {
@@ -1581,7 +1581,7 @@ pub(crate) fn responses_tool_choice_to_chat_tool_choice(
 
 pub(crate) fn responses_function_call_choice_to_chat(
     function_call: &Value,
-    tool_bridge: &ResponsesToolBridge,
+    tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<Value> {
     match function_call {
         Value::String(choice) if matches!(choice.as_str(), "auto" | "none") => {
