@@ -849,6 +849,22 @@ function ModelSectionComponent({
                         </div>
                         <div className="provider-heading-text">
                           <div className="provider-heading-title-row">
+                            {!routeConfigReadOnly && (
+                              <span
+                                title={disabled ? `点击启用线路「${profile.name}」` : `点击停用线路「${profile.name}」`}
+                                className="provider-route-toggle-wrap"
+                              >
+                                <Switch
+                                  size="xs"
+                                  checked={!disabled}
+                                  disabled={isBusy || dirty || pendingRouteToggle !== null}
+                                  aria-busy={pendingRouteToggle?.id === profile.id}
+                                  onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
+                                  aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
+                                  className="route-status-switch"
+                                />
+                              </span>
+                            )}
                             <strong id={`provider-model-${profile.id}`} title={profile.name}>{profile.name || "未命名线路"}</strong>
                             <div className="route-item-badges">
                               {pendingRouteToggle?.id === profile.id && <Badge variant="secondary">保存中…</Badge>}
@@ -877,22 +893,6 @@ function ModelSectionComponent({
                       </div>
 
                       <div className="provider-card-toolbar">
-                        {!routeConfigReadOnly && (
-                          <span
-                            title={disabled ? `点击启用线路「${profile.name}」` : `点击停用线路「${profile.name}」`}
-                            className="provider-route-toggle-wrap"
-                          >
-                            <Switch
-                              size="xs"
-                              checked={!disabled}
-                              disabled={isBusy || dirty || pendingRouteToggle !== null}
-                              aria-busy={pendingRouteToggle?.id === profile.id}
-                              onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
-                              aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
-                              className="route-status-switch"
-                            />
-                          </span>
-                        )}
                         {!disabled && (
                           <Button
                             color="primary"
