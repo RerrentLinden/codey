@@ -123,26 +123,33 @@ function UsageLine({ snapshot }: { snapshot: AccountUsageSnapshot | null }) {
         const fullTimeTitle = window.resetsAt
           ? `重置时间：${new Date(window.resetsAt * 1000).toLocaleString("zh-CN")}（已消耗 ${Math.round(window.usedPercent)}%，剩余 ${remainingPercent}%）`
           : `已消耗 ${Math.round(window.usedPercent)}%，剩余 ${remainingPercent}%`;
+        const resetLabel = resetInfo
+          ? resetInfo.relative
+            ? resetInfo.relative.endsWith("重置")
+              ? resetInfo.relative
+              : `${resetInfo.relative}重置`
+            : resetInfo.short
+          : null;
         return (
           <div
             key={`${window.windowMinutes}-${index}`}
             className="official-account-usage-item"
             title={fullTimeTitle}
           >
-            <div className="official-account-usage-header">
-              <span className="official-account-usage-window">{windowLabel(window.windowMinutes)}</span>
-              <span className={`official-account-usage-percent ${toneClass}`}>剩余 {remainingPercent}%</span>
-            </div>
+            <span className="official-account-usage-window">{windowLabel(window.windowMinutes)}</span>
             <div className="official-account-progress-track" aria-hidden="true">
               <div
                 className={`official-account-progress-fill ${toneClass}`}
                 style={{ width: `${remainingPercent}%` }}
               />
             </div>
-            {resetInfo && (
+            <span className={`official-account-usage-percent ${toneClass}`}>剩余 {remainingPercent}%</span>
+            {resetLabel && (
               <span className="official-account-usage-reset">
-                {resetInfo.relative ? `${resetInfo.relative} 重置` : resetInfo.short}
-                <span className="official-account-usage-reset-time">（{resetInfo.exact}）</span>
+                · {resetLabel}
+                {resetInfo?.exact && (
+                  <span className="official-account-usage-reset-time">（{resetInfo.exact}）</span>
+                )}
               </span>
             )}
           </div>

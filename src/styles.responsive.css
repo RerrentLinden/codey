@@ -3,21 +3,15 @@
    ========================================================================== */
 
 @container settings-content (max-width: 680px) {
-  .settings-page .official-account-item {
-    display: grid;
-    grid-template-columns: 20px minmax(0, 1fr);
-    align-items: start;
-  }
-
-  .settings-page .official-account-controls {
-    grid-column: 2;
-    justify-self: end;
+  .settings-page .official-account-usage-container {
+    padding-left: 0;
   }
 
   .settings-page .official-account-usage-item {
     min-width: 0;
     flex-wrap: wrap;
     row-gap: 3px;
+    white-space: normal;
   }
 
   .settings-page .official-account-usage-reset {
