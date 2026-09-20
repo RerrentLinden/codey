@@ -709,7 +709,7 @@ function ModelSectionComponent({
                 <span className="route-header-divider" aria-hidden="true" />
                 <div className="route-header-log-col">
                   <div className="route-header-switch-item">
-                    <span className="route-header-switch-label">开启日志记录</span>
+                    <span className="route-header-switch-label">日志记录</span>
                     <Switch
                       size="sm"
                       checked={config.routeRequestLog.enabled}
