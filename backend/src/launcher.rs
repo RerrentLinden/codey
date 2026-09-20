@@ -69,7 +69,6 @@ pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
 const DISABLE_GPU_RASTERIZATION_ARGUMENT: &str = "--disable-gpu-rasterization";
 const DISABLE_BACKGROUND_ECOQOS_ARGUMENT: &str = "--disable-features=UseEcoQoSForBackgroundProcess";
-const DEFAULT_CHINESE_LOCALE_ARGUMENT: &str = "--lang=zh-CN";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1451,6 +1450,14 @@ async fn prepare_startup_storage(
         // runtime first also gives SQLite and rollout buffers a chance to flush
         // before any permanent maintenance is applied.
         prepare_codex_for_launch(&app_dir).await?;
+
+        let locale_home = home.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::codex_config::migrate_legacy_default_locale(&locale_home)
+        })
+        .await
+        .context("Codex 语言迁移任务异常退出")?
+        .context("迁移旧版 Codex 中文语言设置失败")?;
 
         // Keep each task's saved provider. The catalog touches separate files,
         // so prepare it alongside session maintenance after Codex has stopped.
