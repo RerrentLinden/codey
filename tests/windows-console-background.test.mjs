@@ -100,7 +100,9 @@ test("Windows source contract: packaged Codex exit uses an OS process wait", asy
     coreLauncher,
     /pub async fn wait_for_windows_process_id\(process_id: u32\)/,
   );
-  assert.match(coreLauncher, /WaitForSingleObject\(handle, INFINITE\)/);
+  assert.match(coreLauncher, /WaitForSingleObject\(HANDLE\(handle\.as_raw_handle\(\)\), 0\)/);
+  assert.match(coreLauncher, /OwnedHandle/);
+  assert.doesNotMatch(coreLauncher, /WaitForSingleObject\([^\n]*INFINITE\)/);
 });
 
 test("Windows source contract: updates use the detached native helper", async () => {

@@ -112,17 +112,20 @@ pub fn build_macos_open_command(
 
 #[cfg(windows)]
 pub async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || wait_for_windows_process_id_blocking(process_id))
-        .await
-        .context("Windows process wait task failed")?
+    let Some(handle) = open_windows_process_for_wait(process_id)? else {
+        return Ok(());
+    };
+    wait_for_windows_process_handle(handle, process_id).await
 }
 
 #[cfg(windows)]
-fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED};
+fn open_windows_process_for_wait(
+    process_id: u32,
+) -> anyhow::Result<Option<std::os::windows::io::OwnedHandle>> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
     unsafe {
@@ -136,20 +139,46 @@ fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
         ) {
             Ok(handle) => handle,
             Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
-                return Ok(());
+                return Ok(None);
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("failed to open Windows process id {process_id}"));
             }
         };
-        let wait_result = WaitForSingleObject(handle, INFINITE);
-        let _ = CloseHandle(handle);
-        if wait_result == WAIT_FAILED {
-            anyhow::bail!("failed to wait for Windows process id {process_id}");
+        // Retain this process identity even if its PID is later reused. The
+        // owning handle is also released when the waiting future is cancelled.
+        Ok(Some(OwnedHandle::from_raw_handle(handle.0)))
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_process_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    process_id: u32,
+) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    loop {
+        // A blocking INFINITE wait outlives cancellation and can prevent Tokio
+        // from shutting down. Poll the original handle without blocking a worker.
+        let wait_result = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) };
+        match wait_result {
+            WAIT_OBJECT_0 => return Ok(()),
+            WAIT_TIMEOUT => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            WAIT_FAILED => {
+                return Err(windows::core::Error::from_win32()).with_context(|| {
+                    format!("failed to wait for Windows process id {process_id}")
+                });
+            }
+            _ => anyhow::bail!(
+                "unexpected wait result {} for Windows process id {process_id}",
+                wait_result.0
+            ),
         }
     }
-    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -274,5 +303,86 @@ mod tests {
             command_line_arguments(&["plain".into(), "has space".into(), "q\"uote".into()]),
             "plain \"has space\" \"q\\\"uote\""
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_process_wait_releases_handle_and_blocking_worker() {
+        use std::os::windows::io::AsRawHandle;
+        use std::time::Duration;
+        use windows::Win32::Foundation::{GetHandleInformation, HANDLE};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (handle_closed, blocking_worker_available) = runtime.block_on(async {
+            let process_id = std::process::id();
+            let handle = open_windows_process_for_wait(process_id).unwrap().unwrap();
+            let raw_handle = handle.as_raw_handle();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    wait_for_windows_process_handle(handle, process_id),
+                )
+                .await
+                .is_err()
+            );
+            let mut flags = 0;
+            let handle_closed =
+                unsafe { GetHandleInformation(HANDLE(raw_handle), &mut flags) }.is_err();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    wait_for_windows_process_id(process_id),
+                )
+                .await
+                .is_err()
+            );
+            let blocking_worker_available =
+                tokio::time::timeout(Duration::from_secs(1), tokio::task::spawn_blocking(|| ()))
+                    .await
+                    .is_ok();
+            (handle_closed, blocking_worker_available)
+        });
+        // Bound shutdown even if a regression leaves a blocking wait behind.
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        assert!(handle_closed);
+        assert!(blocking_worker_available);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn process_exit_completes_wait_and_releases_handle() {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        use windows::Win32::Foundation::{GetHandleInformation, HANDLE};
+
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let handle = child.as_handle().try_clone_to_owned().unwrap();
+        let raw_handle = handle.as_raw_handle();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_windows_process_handle(handle, child.id()),
+        )
+        .await;
+        let mut flags = 0;
+        let handle_closed =
+            unsafe { GetHandleInformation(HANDLE(raw_handle), &mut flags) }.is_err();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        child.wait().unwrap();
+        result.unwrap().unwrap();
+        assert!(handle_closed);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_windows_process_is_already_exited() {
+        wait_for_windows_process_id(u32::MAX).await.unwrap();
     }
 }
