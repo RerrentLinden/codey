@@ -58,7 +58,13 @@ export interface SkillCacheInventory {
 }
 export interface MutationResult {
   inventory: Inventory;
-  applyStatus: "restart-required" | "unchanged";
+  applyStatus:
+    | "restart-required"
+    | "reload-required"
+    | "applied"
+    | "pending-runtime"
+    | "reload-failed"
+    | "unchanged";
   message: string;
 }
 export interface CheckResult {

@@ -417,6 +417,53 @@ test("usage-only manager remains available when deletion and reconciliation are 
   assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "unavailable");
 });
 
+test("MCP reload awaits the native request without restarting or resuming a task", async () => {
+  const requests = [];
+  let finish;
+  const runtime = loadInjection({
+    initialSessionId: "",
+    discoveredAppServerManager: {
+      sendRequest(...args) {
+        requests.push(args);
+        return new Promise((resolve) => { finish = resolve; });
+      },
+    },
+  });
+  let completed = false;
+  const reload = runtime.window.__codeyReloadMcpServers().then((value) => {
+    completed = true;
+    return value;
+  });
+  await flushMicrotasks();
+  assert.deepEqual(requests, [["config/mcpServer/reload"]]);
+  assert.equal(completed, false);
+  finish({});
+  assert.equal((await reload).ok, true);
+  assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "available");
+});
+
+test("MCP reload propagates protocol errors and can be retried", async () => {
+  let fail = true;
+  const runtime = loadInjection({
+    initialSessionId: "",
+    discoveredAppServerManager: {
+      sendRequest() {
+        return fail ? Promise.reject(new Error("Unknown method")) : Promise.resolve({});
+      },
+    },
+  });
+  await assert.rejects(runtime.window.__codeyReloadMcpServers(), /Unknown method/);
+  fail = false;
+  assert.equal((await runtime.window.__codeyReloadMcpServers()).ok, true);
+});
+
+test("MCP reload reports an unavailable manager instead of using legacy session signals", async () => {
+  const runtime = loadInjection({ initialSessionId: "" });
+  runtime.window.__codeyCodexSignalDispatcher = () => { throw new Error("unexpected signal"); };
+  await assert.rejects(runtime.window.__codeyReloadMcpServers(), { code: "codey_capability_unavailable" });
+  assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "unavailable");
+});
+
 test("message deletion preflights resume and refresh before releasing or persisting", async () => {
   for (const missing of ["resumeConversation", "refreshRecentConversations", "discardConversationFromCache"]) {
     let releases = 0;

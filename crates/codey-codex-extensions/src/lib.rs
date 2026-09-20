@@ -217,7 +217,7 @@ impl ExtensionService {
             }
         }
         Ok(
-            json!({"scope":scope,"configPath":config_path,"skillConfigPath":self.codex_home.join("config.toml"),"revision":revision,"mcps":mcps,"skills":entries,"warnings":warnings,"applyNotice":"变更保存到 Codex 配置；请重新打开会话，必要时重启 Codex。当前 Codey 启动覆盖可能优先生效。"}),
+            json!({"scope":scope,"configPath":config_path,"skillConfigPath":self.codex_home.join("config.toml"),"revision":revision,"mcps":mcps,"skills":entries,"warnings":warnings,"applyNotice":"MCP 保存后自动刷新 Codex 配置；Skill 变更请在新会话中确认。当前 Codey 启动覆盖可能优先生效。"}),
         )
     }
 
@@ -686,7 +686,7 @@ impl ExtensionService {
             .inspect_err(|_| self.clean_empty_skill_dirs(&scope, &created))?;
         self.clean_empty_skill_dirs(&scope, &removed);
         Ok(
-            json!({"inventory":self.inventory(&scope)?,"applyStatus":"restart-required","message":"配置已保存。"}),
+            json!({"inventory":self.inventory(&scope)?,"applyStatus":if matches!(action, "save_mcp" | "set_mcp_enabled" | "set_mcps_enabled" | "remove_mcp") {"reload-required"} else {"restart-required"},"message":"配置已保存。"}),
         )
     }
 

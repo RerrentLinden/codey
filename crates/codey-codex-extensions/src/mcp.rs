@@ -420,7 +420,7 @@ pub fn save(doc: &mut DocumentMut, id: &str, mut incoming: Table) -> Result<()> 
         ensure!(enabled.as_bool().is_some(), "enabled 必须为布尔值");
     }
     if old.is_none() {
-        merged["enabled"] = toml_edit::value(false);
+        merged["enabled"] = toml_edit::value(true);
     }
     let mut json = object(&Item::Table(merged.clone()))?;
     if json.to_string().contains(MASK) {

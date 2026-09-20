@@ -177,15 +177,17 @@ fn creation_does_not_overwrite_and_enabling_requires_confirmation() {
         .contains("确认")
     );
     assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), original);
-    f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true,"confirmed":false})).unwrap();
+    assert!(f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true,"confirmed":false})).is_err());
+    assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), original);
+    f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true})).unwrap();
     assert_eq!(
         f.service.mcp_configuration(&Scope::User, "new").unwrap()["enabled"],
-        false
+        true
     );
 }
 
 #[test]
-fn json_stdio_import_preserves_strings_and_starts_disabled() {
+fn json_stdio_import_preserves_strings_and_starts_enabled() {
     let f = Fixture::new("# keep\nmodel='existing'\n");
     let config = json!({
         "type": "stdio",
@@ -193,16 +195,17 @@ fn json_stdio_import_preserves_strings_and_starts_disabled() {
         "args": ["quoted \"argument\"", "line\nnext", "中文", "[mcp_servers.injected]"],
         "env": {"TOKEN": "private-\"quoted\"\\token\nnext"},
         "cwd": "C:\\MCP tools",
-        "enabled": true,
+        "enabled": false,
         "required": true,
         "tool_timeout_sec": 45,
         "custom": {"nested": ["future", "value"]}
     });
-    let result = f.mutate(json!({"action":"save_mcp","id":"local","configJson":config,"createOnly":true,"confirmed":false})).unwrap();
+    let result = f.mutate(json!({"action":"save_mcp","id":"local","configJson":config,"createOnly":true})).unwrap();
+    assert_eq!(result["applyStatus"], "reload-required");
     let stored = f.service.mcp_configuration(&Scope::User, "local").unwrap();
     let mut expected = config;
     expected.as_object_mut().unwrap().remove("type");
-    expected["enabled"] = json!(false);
+    expected["enabled"] = json!(true);
     assert_eq!(stored, expected);
     assert_eq!(f.list()["mcps"].as_array().unwrap().len(), 1);
     let displayed = f
@@ -235,7 +238,7 @@ fn json_http_import_normalizes_transport_and_headers() {
         );
         assert_eq!(stored["http_headers"]["X-Custom"], "quoted \"value\"");
         assert_eq!(stored["bearer_token_env_var"], "MCP_TOKEN");
-        assert_eq!(stored["enabled"], false);
+        assert_eq!(stored["enabled"], true);
         assert!(
             !f.service
                 .dispatch(json!({"action":"get_mcp","id":"remote"}))
@@ -752,7 +755,7 @@ fn unchanged_updates_have_no_history_and_concurrent_writes_require_fresh_revisio
             let revision = &revision;
             scope.spawn(move || {
                 barrier.wait();
-                service.dispatch(json!({"action":"save_mcp","id":id,"configJson":{"command":"node"},"createOnly":true,"revision":revision}))
+                service.dispatch(json!({"action":"save_mcp","id":id,"configJson":{"command":"node"},"createOnly":true,"revision":revision,"confirmed":true}))
             })
         }).collect();
         handles
@@ -1193,7 +1196,7 @@ fn comments_opaque_fields_and_command_credentials_are_not_exposed() {
 }
 
 #[test]
-fn new_mcp_is_disabled_and_existing_legacy_credentials_allow_toggle() {
+fn new_mcp_is_enabled_and_existing_legacy_credentials_allow_toggle() {
     let f = Fixture::new(
         "[mcp_servers.legacy]\nurl='https://example.invalid'\nbearer_token='private-token'\nenabled=false\n",
     );
@@ -1209,7 +1212,7 @@ fn new_mcp_is_disabled_and_existing_legacy_credentials_allow_toggle() {
             .iter()
             .find(|m| m["id"] == "new")
             .unwrap()["enabled"],
-        false
+        true
     );
     f.mutate(json!({"action":"set_mcp_enabled","id":"legacy","enabled":true}))
         .unwrap();

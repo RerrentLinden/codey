@@ -2101,7 +2101,7 @@
 
   const sessionControllerLooksUsable = (controller, feature = "session") => {
     if (!controller) return false;
-    if (feature === "usage") return typeof controller.manager?.sendRequest === "function";
+    if (feature === "usage" || feature === "mcpReload") return typeof controller.manager?.sendRequest === "function";
     if (feature === "reconcile") return sessionControllerCanReconcileCompletedConversation(controller);
     const methods = feature === "deleteMessages"
       ? ["discardConversation", "resumeConversation", "refreshRecentConversations"]
@@ -2111,7 +2111,7 @@
   };
 
   const capabilityProbes = new Map();
-  const capabilityLabels = { usage: "官方额度读取", reconcile: "完成状态同步", deleteMessages: "消息删除", refresh: "会话列表刷新", session: "会话管理" };
+  const capabilityLabels = { usage: "官方额度读取", mcpReload: "MCP 配置刷新", reconcile: "完成状态同步", deleteMessages: "消息删除", refresh: "会话列表刷新", session: "会话管理" };
   const capabilityMessage = (feature) => `当前 Codex 暂不支持${capabilityLabels[feature] || "此功能"}，请稍后重试`;
   const pageCapabilities = Object.create(null);
   window.__codeyPageCapabilities = pageCapabilities;
@@ -2180,7 +2180,7 @@
         continue;
       }
     }
-    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage") {
+    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload") {
       window.__codeyCodexSignalDispatcher = fallbackDispatcher;
       const controller = legacySessionController(fallbackDispatcher);
       window.__codeyCodexSessionController = controller;
@@ -2242,6 +2242,15 @@
     return controller.manager.sendRequest("account/rateLimits/read");
   };
   window.__codeyReadAccountRateLimits = readAccountRateLimits;
+
+  const reloadMcpServers = async () => {
+    const controller = await getCodexSessionController("mcpReload");
+    if (disposed) throw unavailableCapability("mcpReload");
+    // Codex 的原生刷新接口不接收参数，并负责更新已有会话的 MCP 配置。
+    await controller.manager.sendRequest("config/mcpServer/reload");
+    return { ok: true };
+  };
+  window.__codeyReloadMcpServers = reloadMcpServers;
 
   const reconcileStaleCompletedTask = async () => {
     if (disposed || document.visibilityState === "hidden") return false;
@@ -3588,6 +3597,7 @@
     // Resource cleanup timers (toast, file input, object URL) also finish.
     if (window.__codeyShowRuntimeToast === showRuntimeToast) delete window.__codeyShowRuntimeToast;
     if (window.__codeyReadAccountRateLimits === readAccountRateLimits) delete window.__codeyReadAccountRateLimits;
+    if (window.__codeyReloadMcpServers === reloadMcpServers) delete window.__codeyReloadMcpServers;
     window.__codeySessionToolsInjectLoaded = false;
   };
   window.__codeySessionToolsInstall = {

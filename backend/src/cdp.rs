@@ -691,6 +691,28 @@ pub struct ModelWhitelistRefresh {
     pub deferred: bool,
 }
 
+pub async fn reload_mcp_servers(websocket_url: &str) -> Result<()> {
+    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
+        websocket_url,
+        r#"(async () => {
+  if (typeof window.__codeyReloadMcpServers !== "function") {
+    await window.__codeyLoadSessionTools?.();
+  }
+  if (typeof window.__codeyReloadMcpServers !== "function") return false;
+  const result = await window.__codeyReloadMcpServers();
+  return result?.ok === true;
+})()"#,
+        true,
+    )
+    .await
+    .context("请求 Codex 刷新 MCP 配置失败")?;
+    anyhow::ensure!(
+        runtime_value(&response).and_then(serde_json::Value::as_bool) == Some(true),
+        "Codex 未确认 MCP 配置刷新"
+    );
+    Ok(())
+}
+
 pub async fn refresh_model_whitelist(
     websocket_url: &str,
     expected_catalog: &serde_json::Value,
@@ -1202,6 +1224,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_reload_requires_a_confirmed_renderer_response() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+
+        for (payload, succeeds) in [
+            (json!({"result":{"type":"boolean","value":true}}), true),
+            (json!({"result":{"type":"boolean","value":false}}), false),
+            (json!({"exceptionDetails":{"text":"Unknown method"}}), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(message) = socket.next().await {
+                    let message = message.unwrap();
+                    let Ok(text) = message.to_text() else { continue };
+                    let request: serde_json::Value = serde_json::from_str(text).unwrap();
+                    let evaluate = request["method"] == "Runtime.evaluate";
+                    let result = if evaluate {
+                        assert_eq!(request["params"]["awaitPromise"], true);
+                        assert!(request["params"]["expression"].as_str().unwrap().contains("__codeyReloadMcpServers"));
+                        payload.clone()
+                    } else {
+                        json!({})
+                    };
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string().into(),
+                    )).await.unwrap();
+                    if evaluate { break; }
+                }
+            });
+            assert_eq!(reload_mcp_servers(&format!("ws://{address}")).await.is_ok(), succeeds);
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn user_scripts_run_once_per_document_and_retry_after_failure() {

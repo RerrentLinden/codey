@@ -215,7 +215,9 @@ export function CodexExtensionsPage({
         setConfirmation({
           title: `启用 ${entry.name}`,
           description:
-            "启用后 Codex 可能在新会话中加载该资源。请确认信任其内容和来源。",
+            kind === "mcp"
+              ? "启用后将自动刷新 Codex 的 MCP 配置。请确认信任其内容和来源。"
+              : "启用后 Codex 可能在新会话中加载该资源。请确认信任其内容和来源。",
           action: toggle,
         });
       else void controller.mutate(toggle);
@@ -225,7 +227,7 @@ export function CodexExtensionsPage({
       title: `${kind === "mcp" ? "移除" : "卸载"} ${entry.name}`,
       description:
         kind === "mcp"
-          ? "将移除该服务的配置注册，不删除外部程序。移除后如需再次使用，请重新导入配置。重启 Codex 后确认生效。"
+          ? "将移除该服务的配置注册并自动刷新 Codex，不删除外部程序。移除后如需再次使用，请重新导入配置。"
           : "将删除这份 Codey 托管安装及其本地文件，保留原始来源。卸载后如需再次使用，请重新安装。若文件已被外部修改，后端可能拒绝卸载。",
       destructive: true,
       action: {
@@ -253,6 +255,7 @@ export function CodexExtensionsPage({
               id: draft.id,
               configJson: selectedMcpJson(draft).config,
               createOnly: draft.isNew === true,
+              confirmed: draft.isNew === true,
             }
           : {
               action: draft.isNew ? "create_skill" : "save_skill",
@@ -356,7 +359,7 @@ export function CodexExtensionsPage({
     if (!ids.length) return;
     setConfirmation({
       title: `${enabled ? "启用" : "禁用"} ${ids.length} 项`,
-      description: `选中 ${selected.length} 项，其中 ${ids.length} 项需要变更。${enabled ? "请确认信任这些资源的内容与来源。" : ""}新会话的实际加载状态需在 Codex 中确认。`,
+      description: `选中 ${selected.length} 项，其中 ${ids.length} 项需要变更。${enabled ? "请确认信任这些资源的内容与来源。" : ""}${kind === "mcp" ? "保存后自动刷新 Codex 的 MCP 配置。" : "新会话的实际加载状态需在 Codex 中确认。"}`,
       action: {
         action: kind === "mcp" ? "set_mcps_enabled" : "set_skills_enabled",
         ids,

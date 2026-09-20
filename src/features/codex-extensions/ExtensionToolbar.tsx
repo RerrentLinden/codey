@@ -130,7 +130,7 @@ export function ExtensionScope({
           </p>
           <p className="mb-0 mt-1">
             {inventory.applyNotice ||
-              "配置变更保存后需重启 Codex，再确认当前会话的有效状态。"}
+              "MCP 保存后自动刷新 Codex 配置；Skill 变更请在新会话中确认。"}
           </p>
         </div>
       )}
