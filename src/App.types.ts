@@ -268,6 +268,8 @@ export type Confirmation = {
   description: string;
   confirmLabel: string;
   run: () => void;
+  /// 用户点"稍后"/关闭对话框时触发，用于记录"本次不再提示"。
+  onDismiss?: () => void;
 };
 
 export type TraceLogCleanup = {
@@ -320,6 +322,15 @@ export type UpdateDownload = {
   size: number;
   sha256: string;
   asset: UpdateAsset;
+};
+
+/// 上一次更新安装留给本次启动的结果。助手在退出前写下，控制台读取后删除，
+/// 保证同一次结果只提示一次。
+export type UpdateInstallReport = {
+  version: string;
+  status: "started" | "installed" | "unverified" | "failed";
+  message: string;
+  writtenAt: number;
 };
 
 export type AppProps = {

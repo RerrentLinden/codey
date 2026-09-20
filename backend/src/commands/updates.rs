@@ -98,6 +98,19 @@ pub async fn download_update(state: &Arc<AppState>) -> Result<Value, String> {
     serde_json::to_value(download).map_err(|error| error.to_string())
 }
 
+/// 读取上一次更新安装留给本次启动的结果，读完即清除，保证只提示一次。
+pub async fn update_install_report(state: &Arc<AppState>) -> Result<Value, String> {
+    let config_path = state.store.path().to_path_buf();
+    let Some(report) = crate::update_helper::read_update_install_report(&config_path) else {
+        return Ok(Value::Null);
+    };
+    crate::update_helper::clear_update_install_report(&config_path);
+    if report.is_stale(crate::update_helper::current_unix_timestamp()) {
+        return Ok(Value::Null);
+    }
+    serde_json::to_value(report).map_err(|error| error.to_string())
+}
+
 pub(crate) async fn check_for_update_candidate(
     state: &Arc<AppState>,
 ) -> Result<UpdateCandidate, String> {
@@ -177,7 +190,27 @@ pub async fn install_downloaded_update(
     state: &Arc<AppState>,
     file_path: String,
 ) -> Result<Value, String> {
+    // 旧一轮的报告先清掉，否则下面的启动握手会把残留文件误认为助手已接手。
+    crate::update_helper::clear_update_install_report(state.store.path());
     start_downloaded_update(state, &file_path).await?;
+
+    #[cfg(target_os = "windows")]
+    {
+        // 助手自己也要能被创建出来。若它在真正开始前就夭折（被安全软件拦下、
+        // 更新缓存被清理等），这里保持主进程存活并把错误交给前端，用户就不会
+        // 看到"Codey 消失、版本没变、也没有任何提示"。
+        let config_path = state.store.path().to_path_buf();
+        let started = tokio::task::spawn_blocking(move || {
+            crate::update_helper::wait_for_helper_start(&config_path, HELPER_START_TIMEOUT)
+        })
+        .await
+        .unwrap_or(false);
+        if !started {
+            crate::update_helper::clear_update_install_report(state.store.path());
+            return Err("更新助手未能启动，请重新打开 Codey 后重试".to_string());
+        }
+    }
+
     let shutdown_state = Arc::clone(state);
     tokio::spawn(async move {
         // Let the bridge deliver the response before Codex/Codey starts
@@ -188,18 +221,37 @@ pub async fn install_downloaded_update(
     Ok(json!({"status":"installing"}))
 }
 
+/// 等待助手写下启动记录的窗口。助手要做的是复制一份自身并落一份 JSON，正常
+/// 情况瞬间完成；慢磁盘和首次的杀毒扫描可能拖慢，给到 20 秒仍然留有余量。
+#[cfg(target_os = "windows")]
+const HELPER_START_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub(crate) async fn start_downloaded_update(
     state: &AppState,
     file_path: &str,
 ) -> Result<(), String> {
-    let expected_update = state
-        .available_update
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| "无法确认更新包来源，请重新检查并下载更新".to_string())?;
+    let expected_update = resolve_expected_update(state).await?;
     let verified = verify_downloaded_update(&state.store, file_path, &expected_update).await?;
     spawn_update_installer(&verified.path, &verified.asset)
+}
+
+/// 取用于安装前比对的更新信息。优先用后台检查留下的结果；那份结果可能因为
+/// 进程重启或缓存过期而缺失，此时重新取一次清单，而不是直接拒绝安装——用户
+/// 明明已经下载好了安装包。
+async fn resolve_expected_update(state: &AppState) -> Result<UpdateCheck, String> {
+    if let Some(check) = state.available_update.read().await.clone()
+        && check.update_available
+        && check.selected_asset.is_some()
+    {
+        return Ok(check);
+    }
+    let manifest_url = configured_update_manifest_url(state).await?;
+    let manifest = fetch_configured_update_manifest(state, &manifest_url).await?;
+    let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
+    if !check.update_available {
+        return Err("当前已是最新版本，无需安装更新".to_string());
+    }
+    Ok(check)
 }
 
 async fn configured_update_manifest_url(state: &AppState) -> Result<String, String> {

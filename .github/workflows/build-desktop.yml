@@ -244,6 +244,20 @@ jobs:
           if (-not $makensis) {
             throw "makensis.exe was not found. The NSIS install step must expose it before packaging."
           }
+
+          # 安装包内嵌的版本必须与清单版本一致：更新助手按清单版本校验安装结果，
+          # 两者错位会被判成"安装没有生效"，用户就会在更新提示里原地循环。
+          $cargoMatch = Select-String -Path "Cargo.toml" -Pattern '^\s*version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1
+          if (-not $cargoMatch) {
+            throw "Unable to read the workspace version from Cargo.toml."
+          }
+          $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+          $manifestVersion = $version -replace '-\d+$', ''
+          if ($cargoVersion -ne $manifestVersion) {
+            throw "Cargo.toml version $cargoVersion does not match packaged version $manifestVersion. Bump the workspace version before releasing."
+          }
+
           $installerScript = (Resolve-Path "scripts\installer\windows\Codey.nsi").Path
           & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" $installerScript
           if ($LASTEXITCODE -ne 0) {

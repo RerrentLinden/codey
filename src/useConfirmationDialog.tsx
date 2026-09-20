@@ -32,7 +32,10 @@ export const ConfirmationDialogHost = memo(function ConfirmationDialogHost({
     <ConfirmationDialog
       confirmation={confirmation}
       container={container}
-      onClose={() => controller.set(null)}
+      onClose={() => {
+        confirmation?.onDismiss?.();
+        controller.set(null);
+      }}
       onConfirm={(pending) => {
         controller.set(null);
         pending.run();

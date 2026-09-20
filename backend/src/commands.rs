@@ -80,7 +80,9 @@ pub(crate) use updates::{
 };
 #[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
-pub use updates::{check_for_updates, download_update, install_downloaded_update};
+pub use updates::{
+    check_for_updates, download_update, install_downloaded_update, update_install_report,
+};
 use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
     sync_waiting_webhook_watcher, test_notification_channel,
@@ -1331,6 +1333,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         }
         "check_for_updates" => check_for_updates(state).await,
         "download_update" => download_update(state).await,
+        "update_install_report" => update_install_report(state).await,
         "install_downloaded_update" => match string_argument(&args, "filePath") {
             Ok(file_path) => install_downloaded_update(state, file_path).await,
             Err(error) => Err(error),

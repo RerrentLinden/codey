@@ -60,6 +60,13 @@ Section "Codey" SEC_CODEY
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
+
+  ; 更新助手在安装结束后读回这个标记，确认文件真的落到了目标目录：
+  ; 静默安装失败时 NSIS 往往仍以 0 退出，只看退出码会把"装到别处/没换文件"
+  ; 误判为成功。
+  FileOpen $0 "$INSTDIR\version.txt" w
+  FileWrite $0 "${VERSION}$\r$\n"
+  FileClose $0
 SectionEnd
 
 Section "Desktop shortcut" SEC_DESKTOP
@@ -77,6 +84,7 @@ Section "Uninstall"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
+  Delete "$INSTDIR\version.txt"
   Delete "$INSTDIR\licenses\FastCtx\LICENSE-APACHE"
   Delete "$INSTDIR\licenses\FastCtx\NOTICE"
   RMDir "$INSTDIR\licenses\FastCtx"

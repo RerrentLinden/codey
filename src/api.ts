@@ -37,6 +37,7 @@ export const CODEY_API_COMMANDS = [
   "check_for_updates",
   "download_update",
   "install_downloaded_update",
+  "update_install_report",
   "plugin_marketplace_status",
   "repair_plugin_marketplace",
   "repair_main_process_injection",

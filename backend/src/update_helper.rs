@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[cfg(target_os = "windows")]
 use sha2::{Digest, Sha256};
@@ -11,6 +12,15 @@ const UPDATE_HELPER_FILE_PREFIX: &str = "install-codey-update-helper-";
 const UPDATE_LOG_FILE: &str = "install-codey-update.log";
 #[cfg(target_os = "windows")]
 const INSTALLED_EXECUTABLE_NAME: &str = "Codey.exe";
+/// NSIS 安装器写入安装目录的版本标记。助手据此确认安装真的落到了目标目录，
+/// 避免"安装器退出码为 0 但文件没有替换"被当成成功。
+#[cfg(target_os = "windows")]
+const INSTALLED_VERSION_FILE: &str = "version.txt";
+
+/// 更新助手把安装结果写给下一次启动的 Codey。文件位于配置目录，跨重启存活，
+/// 由控制台读取一次后删除。
+pub(crate) const UPDATE_INSTALL_REPORT_FILE: &str = "update-install-report.json";
+const UPDATE_INSTALL_REPORT_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UpdateHelperInvocation {
@@ -19,6 +29,264 @@ struct UpdateHelperInvocation {
     install_dir: PathBuf,
     expected_size: u64,
     expected_sha256: String,
+    /// 主进程显式给出的结果报告路径。助手自己按 `canonicalize` 后的安装包路径
+    /// 反推配置目录会受 `\\?\` 前缀影响，落在错误的目录里，因此这条路必须由
+    /// 调用方指定。
+    report_path: Option<PathBuf>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpdateInstallOutcome {
+    Updated,
+    Failed,
+    /// 安装结果无法判定：既没有版本标记，也没有观察到文件被替换。旧版本安装
+    /// 目录没有版本标记时可能出现，此时不能声称更新成功。
+    Unverified,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateInstallReport {
+    pub(crate) version: String,
+    /// 助手启动后立即写入；真正结束后改写。控制台据此区分"助手已接手"和
+    /// "助手在中途消失"。
+    pub(crate) status: String,
+    pub(crate) message: String,
+    pub(crate) written_at: u64,
+}
+
+impl UpdateInstallReport {
+    pub(crate) fn is_stale(&self, now: u64) -> bool {
+        now.saturating_sub(self.written_at) > UPDATE_INSTALL_REPORT_STALE_AFTER.as_secs()
+    }
+}
+
+pub(crate) fn update_install_report_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(|parent| parent.join(UPDATE_INSTALL_REPORT_FILE))
+        .unwrap_or_else(|| PathBuf::from(UPDATE_INSTALL_REPORT_FILE))
+}
+
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn write_update_install_report(config_path: &Path, report: &UpdateInstallReport) {
+    write_update_install_report_at(&update_install_report_path(config_path), report);
+}
+
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn write_update_install_report_at(path: &Path, report: &UpdateInstallReport) {
+    let Ok(encoded) = serde_json::to_vec(report) else {
+        return;
+    };
+    let temporary = path.with_extension("json.writing");
+    if std::fs::write(&temporary, encoded).is_ok() {
+        let _ = std::fs::rename(&temporary, path);
+    }
+}
+
+pub(crate) fn read_update_install_report(config_path: &Path) -> Option<UpdateInstallReport> {
+    read_update_install_report_at(&update_install_report_path(config_path))
+}
+
+pub(crate) fn read_update_install_report_at(path: &Path) -> Option<UpdateInstallReport> {
+    let body = std::fs::read(path).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn update_install_report_exists(config_path: &Path) -> bool {
+    update_install_report_path(config_path).is_file()
+}
+
+pub(crate) fn clear_update_install_report(config_path: &Path) {
+    clear_update_install_report_at(&update_install_report_path(config_path));
+}
+
+pub(crate) fn clear_update_install_report_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("json.writing"));
+}
+
+fn unix_timestamp(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn current_unix_timestamp() -> u64 {
+    unix_timestamp(SystemTime::now())
+}
+
+/// 解析安装目录里的版本标记。文件内容可能是纯版本号，也可能带说明前缀，
+/// 因此只取第一个像版本号的候选。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn parse_installed_version_marker(contents: &str) -> Option<String> {
+    contents
+        .split_whitespace()
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| {
+            let mut parts = token.split('.');
+            let segments = parts.by_ref().take(3).collect::<Vec<_>>();
+            segments.len() == 3
+                && segments
+                    .iter()
+                    .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(ToString::to_string)
+}
+
+#[cfg(target_os = "windows")]
+fn read_installed_version_marker(install_dir: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(install_dir.join(INSTALLED_VERSION_FILE)).ok()?;
+    parse_installed_version_marker(&contents)
+}
+
+/// 安装前记录目标可执行文件的指纹，用于判断安装器是否真的替换了文件。
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+struct ExecutableFingerprint {
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+#[cfg(target_os = "windows")]
+fn executable_fingerprint(path: &Path) -> Option<ExecutableFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(ExecutableFingerprint {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn executable_was_replaced(path: &Path, before: Option<ExecutableFingerprint>) -> bool {
+    let Some(before) = before else {
+        return path.is_file();
+    };
+    let Some(after) = executable_fingerprint(path) else {
+        return false;
+    };
+    if after.size != before.size {
+        return true;
+    }
+    match (before.modified, after.modified) {
+        (Some(before), Some(after)) => after > before,
+        // 文件系统不提供修改时间时只能按大小判断，无法证明替换过。
+        _ => false,
+    }
+}
+
+/// 从安装包文件名解析版本号：`Codey-<version>-windows-x64-setup.exe`、
+/// 旧版的 `Codey setup <version>.exe`、以及带 v 前缀的写法都接受。只接受
+/// 恰好三段数字，避免把 `x64` 之类的标记当成版本。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn version_from_installer_name(file_name: &str) -> Option<String> {
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    let bytes = stem.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let starts_version = bytes[index].is_ascii_digit()
+            && (index == 0
+                || !bytes[index - 1].is_ascii_digit()
+                || bytes[index - 1] == b'.');
+        if !starts_version {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut segments: Vec<&str> = Vec::new();
+        let mut cursor = index;
+        loop {
+            let digits_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor == digits_start {
+                break;
+            }
+            segments.push(&stem[digits_start..cursor]);
+            if cursor < bytes.len() && bytes[cursor] == b'.' {
+                cursor += 1;
+                continue;
+            }
+            break;
+        }
+        let ends_cleanly = cursor >= bytes.len() || !bytes[cursor].is_ascii_digit();
+        if segments.len() == 3 && ends_cleanly {
+            return Some(segments.join("."));
+        }
+        index = start + 1;
+    }
+    None
+}
+
+/// 安装结果判定策略（与平台无关，便于直接测试）：
+/// - 期望版本已知时，安装目录的版本标记必须一致，且可执行文件必须真的换过；
+/// - 期望版本未知（文件名解析不出，例如预发布号）时只能依赖文件指纹；
+/// - 没有版本标记（旧版本装出来的目录）时不能谎报成功，无法证明的结果按
+///   未验证处理，让重启后的新版自行确认。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn decide_install_outcome(
+    installed_marker: Option<&str>,
+    expected_version: Option<&str>,
+    executable_replaced: bool,
+    executable_exists: bool,
+) -> UpdateInstallOutcome {
+    match (installed_marker, expected_version) {
+        (Some(installed), Some(expected)) => {
+            if installed != expected || (executable_replaced && !executable_exists) {
+                UpdateInstallOutcome::Failed
+            } else if executable_replaced {
+                UpdateInstallOutcome::Updated
+            } else {
+                // 标记写对了但没看到文件被换过，不能断言成功，也不必判死。
+                UpdateInstallOutcome::Unverified
+            }
+        }
+        _ => {
+            // 文件在且换了，或文件从来不存在而这次被装出来，都算成功。
+            if executable_replaced || (!executable_exists && installed_marker.is_some()) {
+                UpdateInstallOutcome::Updated
+            } else {
+                UpdateInstallOutcome::Unverified
+            }
+        }
+    }
+}
+
+/// 安装结果判定：以安装目录的版本标记为准，辅以可执行文件指纹。
+#[cfg(target_os = "windows")]
+fn verify_installed_update(
+    invocation: &UpdateHelperInvocation,
+    expected_version: Option<&str>,
+    before: Option<ExecutableFingerprint>,
+) -> UpdateInstallOutcome {
+    let installed_executable = invocation.install_dir.join(INSTALLED_EXECUTABLE_NAME);
+    let marker = read_installed_version_marker(&invocation.install_dir);
+    decide_install_outcome(
+        marker.as_deref(),
+        expected_version,
+        executable_was_replaced(&installed_executable, before),
+        installed_executable.is_file(),
+    )
+}
+
+/// 报告路径优先取主进程显式给出的参数；旧版本主进程没有这个参数时，退回按
+/// 更新缓存位置推导：`<配置目录>/updates/v<版本>/` 的祖父目录就是配置目录。
+#[cfg(target_os = "windows")]
+fn report_path_for_invocation(invocation: &UpdateHelperInvocation) -> Option<PathBuf> {
+    if let Some(report_path) = &invocation.report_path {
+        return Some(report_path.clone());
+    }
+    let version_dir = invocation.installer.parent()?;
+    let update_root = version_dir.parent()?;
+    let config_dir = update_root.parent()?;
+    Some(config_dir.join(UPDATE_INSTALL_REPORT_FILE))
 }
 
 pub(crate) fn run_if_requested() -> Result<bool, String> {
@@ -36,6 +304,23 @@ pub(crate) fn run_if_requested() -> Result<bool, String> {
     {
         let _ = invocation;
         Err("Codey 更新助手仅支持 Windows".to_string())
+    }
+}
+
+/// 主进程在退出前等待助手写下的启动记录，确认"安装流程已经被接手"再退出。
+/// 助手可能在真正开始前就失败（例如自身被安全软件拦下），此时主进程保持
+/// 运行并把错误交给前端展示，而不是让用户面对一个没有后续的空窗。
+#[cfg(target_os = "windows")]
+pub(crate) fn wait_for_helper_start(config_path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if update_install_report_exists(config_path) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -83,6 +368,9 @@ where
     {
         return Err("更新助手收到无效的安装包 SHA-256".to_string());
     }
+    // 报告路径是可选的第 6 个参数；旧版本主进程启动的助手没有它，退回按更新
+    // 缓存位置推导。
+    let report_path = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
         return Err("更新助手收到多余参数".to_string());
     }
@@ -93,6 +381,7 @@ where
         install_dir,
         expected_size,
         expected_sha256,
+        report_path,
     }))
 }
 
@@ -129,7 +418,7 @@ pub(crate) fn spawn_update_installer(
         .parent()
         .ok_or_else(|| "更新安装包路径无父目录".to_string())?;
 
-    remove_stale_update_helpers(update_dir);
+    cleanup_previous_update_helpers(update_dir);
     let helper_path = update_dir.join(format!(
         "{UPDATE_HELPER_FILE_PREFIX}{}.exe",
         uuid::Uuid::new_v4().simple()
@@ -142,13 +431,22 @@ pub(crate) fn spawn_update_installer(
     // PowerShell execution policy after the main process has already exited.
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    let spawn_result = std::process::Command::new(&helper_path)
+    // 结果报告的落点由主进程决定：它知道自己真正的配置目录，助手只负责写。
+    let report_path = update_dir
+        .parent()
+        .map(|config_dir| config_dir.join(UPDATE_INSTALL_REPORT_FILE));
+    let mut command = std::process::Command::new(&helper_path);
+    command
         .arg(UPDATE_HELPER_FLAG)
         .arg(update_path)
         .arg(&executable)
         .arg(install_dir)
         .arg(expected_size.to_string())
-        .arg(expected_sha256)
+        .arg(expected_sha256);
+    if let Some(report_path) = &report_path {
+        command.arg(report_path);
+    }
+    let spawn_result = command
         .current_dir(update_dir)
         .creation_flags(
             codey_runtime_core::windows_create_no_window()
@@ -167,38 +465,15 @@ pub(crate) fn spawn_update_installer(
 }
 
 #[cfg(target_os = "windows")]
-fn remove_stale_update_helpers(update_dir: &Path) {
-    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-    let Ok(entries) = std::fs::read_dir(update_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_helper = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| {
-                name.starts_with(UPDATE_HELPER_FILE_PREFIX)
-                    && name.to_ascii_lowercase().ends_with(".exe")
-            });
-        let is_stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-            .is_ok_and(|age| age >= STALE_AFTER);
-        if is_helper && is_stale {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn run_windows_update_helper(invocation: &UpdateHelperInvocation) -> Result<(), String> {
     let log_path = invocation
         .installer
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(UPDATE_LOG_FILE);
+    if let Some(update_dir) = invocation.installer.parent() {
+        cleanup_previous_update_helpers(update_dir);
+    }
     append_update_log(
         &log_path,
         &format!(
@@ -208,39 +483,106 @@ fn run_windows_update_helper(invocation: &UpdateHelperInvocation) -> Result<(), 
             invocation.install_dir.display()
         ),
     );
-    validate_windows_update_helper_invocation(invocation).inspect_err(|error| {
+
+    let expected_version = invocation
+        .installer
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(version_from_installer_name);
+    let report_version = expected_version.clone().unwrap_or_default();
+    let report_path = report_path_for_invocation(invocation);
+
+    // 先落一份"已接手"记录：主进程据此确认可以安全退出，用户也可能在安装
+    // 失败后重新打开 Codey 看到这条状态。
+    if let Some(path) = &report_path {
+        write_update_install_report_at(
+            path,
+            &UpdateInstallReport {
+                version: report_version.clone(),
+                status: "started".to_string(),
+                message: "正在安装更新".to_string(),
+                written_at: current_unix_timestamp(),
+            },
+        );
+    }
+
+    if let Err(error) = validate_windows_update_helper_invocation(invocation) {
         append_update_log(
             &log_path,
             &format!("Update helper validation failed: {error}"),
         );
-    })?;
-
-    let install_result = install_windows_update(invocation, &log_path);
-    if let Err(error) = &install_result {
-        append_update_log(&log_path, &format!("Update failed: {error}"));
+        finish_update_report(&report_path, &report_version, "failed", &error);
+        return Err(error);
     }
 
-    // Restart is deliberately attempted even after an install failure. The
-    // previous implementation exited on any error and left the user with no
-    // Codex window at all.
-    let restart_result = restart_codey(invocation, &log_path);
-    if let Err(error) = &restart_result {
-        append_update_log(&log_path, &format!("Restart failed: {error}"));
-    }
+    let outcome = install_windows_update(invocation, &log_path);
 
-    match (install_result, restart_result) {
-        (Ok(()), Ok(())) => {
-            append_update_log(&log_path, "Update finished");
-            Ok(())
+    match outcome {
+        Ok(UpdateInstallOutcome::Updated) => match restart_codey(invocation, &log_path) {
+            Ok(()) => {
+                append_update_log(&log_path, "Update finished");
+                finish_update_report(&report_path, &report_version, "installed", "");
+                Ok(())
+            }
+            Err(restart_error) => {
+                append_update_log(&log_path, &format!("Restart failed: {restart_error}"));
+                let message = format!("更新已安装，但重新启动失败：{restart_error}");
+                finish_update_report(&report_path, &report_version, "failed", &message);
+                Err(message)
+            }
+        },
+        // 安装结果无法证实（通常是从没有版本标记的老目录升级）。此时文件已经
+        // 换过，交给重启后的新版自行确认，不向用户报错。
+        Ok(UpdateInstallOutcome::Unverified) => {
+            append_update_log(&log_path, "Install result unverified; restarting to confirm");
+            match restart_codey(invocation, &log_path) {
+                Ok(()) => {
+                    finish_update_report(
+                        &report_path,
+                        &report_version,
+                        "unverified",
+                        "无法完全确认更新结果，请核对版本号",
+                    );
+                    Ok(())
+                }
+                Err(restart_error) => {
+                    let message = format!("更新结果无法确认，且重新启动失败：{restart_error}");
+                    append_update_log(&log_path, &format!("Restart failed: {restart_error}"));
+                    finish_update_report(&report_path, &report_version, "failed", &message);
+                    Err(message)
+                }
+            }
         }
-        (Err(install_error), Ok(())) => {
-            Err(format!("更新安装失败，但已重新启动原版本：{install_error}"))
+        // 安装明确没有落地时不再重启：旧版本会再次检测到同一个更新，用户会
+        // 陷入"重启还是旧版本"的循环。把失败原因留给下一次启动的 Codey 展示，
+        // 让用户看到结果并自行重试。
+        Err(install_error) => {
+            append_update_log(&log_path, &format!("Update failed: {install_error}"));
+            finish_update_report(&report_path, &report_version, "failed", &install_error);
+            Err(install_error)
         }
-        (Ok(()), Err(restart_error)) => Err(format!("更新已安装，但重新启动失败：{restart_error}")),
-        (Err(install_error), Err(restart_error)) => Err(format!(
-            "更新安装失败：{install_error}；重新启动也失败：{restart_error}"
-        )),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn finish_update_report(
+    report_path: &Option<PathBuf>,
+    version: &str,
+    status: &str,
+    message: &str,
+) {
+    let Some(path) = report_path else {
+        return;
+    };
+    write_update_install_report_at(
+        path,
+        &UpdateInstallReport {
+            version: version.to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+            written_at: current_unix_timestamp(),
+        },
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -296,11 +638,21 @@ fn validate_windows_update_helper_invocation(
 fn install_windows_update(
     invocation: &UpdateHelperInvocation,
     log_path: &Path,
-) -> Result<(), String> {
+) -> Result<UpdateInstallOutcome, String> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
-    wait_for_executable_unlock(&invocation.executable, std::time::Duration::from_secs(180))?;
+    let installed_executable = invocation.install_dir.join(INSTALLED_EXECUTABLE_NAME);
+    let expected_version = invocation
+        .installer
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(version_from_installer_name);
+    let before = executable_fingerprint(&installed_executable);
+
+    // `wait_for_executable_unlock` 只表示旧进程交出了文件，不等于安装器会成功
+    // 替换它；安装结果一律以安装后的实测为准。
+    wait_for_executable_unlock(&invocation.executable, Duration::from_secs(180), log_path)?;
     append_update_log(log_path, "Installed executable lock released");
     let _verified_installer_lock = open_verified_windows_installer(invocation)?;
     append_update_log(log_path, "Installer integrity verified");
@@ -328,7 +680,25 @@ fn install_windows_update(
     if !status.success() {
         return Err(format!("安装包返回失败状态：{status}"));
     }
-    Ok(())
+
+    let outcome = verify_installed_update(invocation, expected_version.as_deref(), before);
+    append_update_log(
+        log_path,
+        &format!(
+            "Post-install verification: {outcome:?} (installDir={})",
+            invocation.install_dir.display()
+        ),
+    );
+    match outcome {
+        UpdateInstallOutcome::Updated => Ok(UpdateInstallOutcome::Updated),
+        UpdateInstallOutcome::Unverified => Ok(UpdateInstallOutcome::Unverified),
+        UpdateInstallOutcome::Failed => Err(format!(
+            "安装没有生效：{} 未更新到 v{}，请确认安装目录 {} 可写后重试",
+            installed_executable.display(),
+            expected_version.unwrap_or_default(),
+            invocation.install_dir.display()
+        )),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -387,14 +757,22 @@ fn open_verified_windows_installer(
     Ok(file)
 }
 
+/// 等待旧实例交出 `Codey.exe`。安装器需要一个无人占用的目标文件，这里等的是
+/// "可以独占打开"；超时不直接失败，交给安装后的实测结论决定成败，避免把
+/// "杀毒软件偶尔占着不放"当成本次更新彻底失败。
 #[cfg(target_os = "windows")]
-fn wait_for_executable_unlock(path: &Path, timeout: std::time::Duration) -> Result<(), String> {
+fn wait_for_executable_unlock(
+    path: &Path,
+    timeout: Duration,
+    log_path: &Path,
+) -> Result<(), String> {
     use std::os::windows::fs::OpenOptionsExt;
 
     if !path.exists() {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + timeout;
+    let mut reported = false;
     loop {
         let error = match std::fs::OpenOptions::new()
             .read(true)
@@ -409,12 +787,53 @@ fn wait_for_executable_unlock(path: &Path, timeout: std::time::Duration) -> Resu
             Err(error) => error,
         };
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "等待 Codey 可执行文件释放超时（{}）：{error}",
-                path.display(),
-            ));
+            append_update_log(
+                log_path,
+                &format!(
+                    "Executable still locked after {}s, attempting install anyway: {error}",
+                    timeout.as_secs()
+                ),
+            );
+            return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !reported {
+            reported = true;
+            append_update_log(log_path, &format!("Waiting for executable lock: {error}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// 助手开始真正干活后，旧助手副本已经没有必要保留；顺手清掉本次之前留下的
+/// 副本，避免更新缓存里越积越多整份应用。
+#[cfg(target_os = "windows")]
+fn cleanup_previous_update_helpers(update_dir: &Path) {
+    const KEEP_CURRENT: Duration = Duration::from_secs(5 * 60);
+    let Ok(entries) = std::fs::read_dir(update_dir) else {
+        return;
+    };
+    let Some(cutoff) = SystemTime::now().checked_sub(KEEP_CURRENT) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_helper = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| {
+                name.starts_with(UPDATE_HELPER_FILE_PREFIX)
+                    && name.to_ascii_lowercase().ends_with(".exe")
+            });
+        if !is_helper {
+            continue;
+        }
+        let older_than_current = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if older_than_current {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -537,11 +956,36 @@ mod tests {
                 install_dir: PathBuf::from(r"C:\Users\Test User\Programs\Codey"),
                 expected_size: 123456,
                 expected_sha256,
+                report_path: None,
             }
         );
         assert_eq!(
             nsis_install_directory_argument(&parsed.install_dir),
             OsString::from(r"/D=C:\Users\Test User\Programs\Codey")
+        );
+    }
+
+    #[test]
+    fn update_helper_accepts_an_explicit_report_path() {
+        let expected_sha256 = "b".repeat(64);
+        let parsed = parse_update_helper_invocation([
+            OsString::from("helper.exe"),
+            OsString::from(UPDATE_HELPER_FLAG),
+            OsString::from(r"C:\Users\Test User\config\updates\v1.2.3\Codey-1.2.3-windows-x64-setup.exe"),
+            OsString::from(r"C:\Users\Test User\Programs\Codey\Codey.exe"),
+            OsString::from(r"C:\Users\Test User\Programs\Codey"),
+            OsString::from("123456"),
+            OsString::from(expected_sha256.as_str()),
+            OsString::from(r"C:\Users\Test User\config\update-install-report.json"),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            parsed.report_path,
+            Some(PathBuf::from(
+                r"C:\Users\Test User\config\update-install-report.json"
+            ))
         );
     }
 
@@ -582,5 +1026,140 @@ mod tests {
         ])
         .unwrap_err();
         assert!(digest_error.contains("SHA-256"));
+    }
+
+    #[test]
+    fn install_directory_argument_stays_unquoted_for_nsis() {
+        let argument = nsis_install_directory_argument(Path::new(r"C:\Users\Test User\Programs\Codey"));
+
+        assert_eq!(
+            argument,
+            OsString::from(r"/D=C:\Users\Test User\Programs\Codey")
+        );
+        assert!(!argument.to_string_lossy().contains('"'));
+    }
+
+    #[test]
+    fn installed_version_marker_accepts_plain_and_decorated_contents() {
+        assert_eq!(
+            parse_installed_version_marker("1.2.3"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            parse_installed_version_marker("v1.2.3\n"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            parse_installed_version_marker("Codey 1.2.3 windows-x64\n"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(parse_installed_version_marker(""), None);
+        assert_eq!(parse_installed_version_marker("Codey"), None);
+        assert_eq!(parse_installed_version_marker("1.2"), None);
+    }
+
+    #[test]
+    fn installer_name_versions_are_parsed_without_arch_false_positives() {
+        assert_eq!(
+            version_from_installer_name("Codey-1.2.3-windows-x64-setup.exe"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            version_from_installer_name("Codey setup 1.2.3.exe"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            version_from_installer_name("Codey-v1.2.3-windows-x64-setup.EXE"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(version_from_installer_name("Codey setup.exe"), None);
+        assert_eq!(version_from_installer_name("Codey-windows-x64-setup.exe"), None);
+    }
+
+    #[test]
+    fn install_report_round_trips_through_the_config_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+        let report = UpdateInstallReport {
+            version: "1.2.3".to_string(),
+            status: "failed".to_string(),
+            message: "安装没有生效".to_string(),
+            written_at: 42,
+        };
+
+        write_update_install_report(&config_path, &report);
+
+        let path = update_install_report_path(&config_path);
+        assert_eq!(path.parent(), Some(directory.path()));
+        assert!(path.is_file());
+        let loaded = read_update_install_report(&config_path).unwrap();
+        assert_eq!(loaded.version, "1.2.3");
+        assert_eq!(loaded.status, "failed");
+        assert_eq!(loaded.message, "安装没有生效");
+
+        clear_update_install_report(&config_path);
+        assert!(!path.is_file());
+        assert!(read_update_install_report(&config_path).is_none());
+    }
+
+    #[test]
+    fn install_outcome_requires_a_matching_marker_and_a_replaced_binary() {
+        // 版本标记一致且文件确实被换过，才算安装成功。
+        assert_eq!(
+            decide_install_outcome(Some("1.2.3"), Some("1.2.3"), true, true),
+            UpdateInstallOutcome::Updated
+        );
+        // 目标目录里根本没有可执行文件：安装没落地。
+        assert_eq!(
+            decide_install_outcome(Some("1.2.3"), Some("1.2.3"), true, false),
+            UpdateInstallOutcome::Failed
+        );
+        // 装到了别处：目标目录还是旧版本标记。
+        assert_eq!(
+            decide_install_outcome(Some("1.2.2"), Some("1.2.3"), true, true),
+            UpdateInstallOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn install_outcome_without_a_marker_never_claims_certainty() {
+        // 旧版本目录没有版本标记，只换过文件时按成功处理。
+        assert_eq!(
+            decide_install_outcome(None, Some("1.2.3"), true, true),
+            UpdateInstallOutcome::Updated
+        );
+        // 没有任何证据时不谎报成功，也不硬判失败。
+        assert_eq!(
+            decide_install_outcome(None, Some("1.2.3"), false, true),
+            UpdateInstallOutcome::Unverified
+        );
+        // 标记一致但目标文件既没换过、当前也不在：无法证明装成功。
+        assert_eq!(
+            decide_install_outcome(Some("1.2.3"), Some("1.2.3"), false, false),
+            UpdateInstallOutcome::Unverified
+        );
+        // 文件名解析不出期望版本时退化为指纹判断。
+        assert_eq!(
+            decide_install_outcome(Some("1.2.3"), None, true, true),
+            UpdateInstallOutcome::Updated
+        );
+        assert_eq!(
+            decide_install_outcome(Some("1.2.3"), None, false, true),
+            UpdateInstallOutcome::Unverified
+        );
+    }
+
+    #[test]
+    fn stale_install_reports_are_recognised() {
+        let fresh = UpdateInstallReport {
+            version: "1.2.3".to_string(),
+            status: "failed".to_string(),
+            message: String::new(),
+            written_at: 1_000,
+        };
+        let now = 1_000 + UPDATE_INSTALL_REPORT_STALE_AFTER.as_secs();
+
+        assert!(!fresh.is_stale(now));
+        assert!(fresh.is_stale(now + 1));
     }
 }

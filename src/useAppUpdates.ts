@@ -14,6 +14,7 @@ import type {
   Notice,
   UpdateCheck,
   UpdateDownload,
+  UpdateInstallReport,
 } from "./App.types";
 import { errorText, withTimeout } from "./appUtils";
 import { formatBytes } from "./formatters";
@@ -21,11 +22,36 @@ import { formatBytes } from "./formatters";
 const UPDATE_AVAILABLE_EVENT = "codey-update-availability-changed";
 const AUTO_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const UPDATE_CHECK_TIMEOUT_MS = 12_000;
+const DEFERRED_UPDATE_STORAGE_KEY = "codey.deferredUpdateVersion";
 
 declare global {
   interface Window {
     __codeyUpdateAvailability?: UpdateCheck | null;
   }
+}
+
+/// 用户点过"稍后"的版本，记在会话里。自动检查因此不会在同一个版本上反复
+/// 弹窗，用户重新打开 Codey 后仍会收到提醒。
+function readDeferredVersion(): string | null {
+  try {
+    return window.sessionStorage.getItem(DEFERRED_UPDATE_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeDeferredVersion(version: string) {
+  try {
+    window.sessionStorage.setItem(DEFERRED_UPDATE_STORAGE_KEY, version);
+  } catch {
+    // 存储不可用时退回到"每次检查都会提示"的旧行为，不影响功能。
+  }
+}
+
+function updateInstallReportText(report: UpdateInstallReport): string {
+  return report.message
+    ? `v${report.version} 更新未完成：${report.message}`
+    : `v${report.version} 更新未完成，请重试`;
 }
 
 type UseAppUpdatesOptions = {
@@ -108,6 +134,33 @@ export function useAppUpdates({
     updateCheckRef.current = updateCheck;
   }, [updateCheck]);
 
+  // 上一次"安装并重启"的真实结果。助手把结论写在配置目录里，这里读一次并
+  // 展示，避免用户只看到版本号没变却没有任何解释。
+  useEffect(() => {
+    if (!configLoaded) return;
+    let cancelled = false;
+    void (async () => {
+      let report: UpdateInstallReport | null = null;
+      try {
+        report = await invoke<UpdateInstallReport | null>("update_install_report");
+      } catch {
+        return;
+      }
+      if (cancelled || !report || report.status === "installed") return;
+      if (report.status === "started") {
+        setNotice({
+          tone: "info",
+          text: `v${report.version} 更新未完成，请重新打开 Codey 或再次点击更新`,
+        });
+        return;
+      }
+      setNotice({ tone: "error", text: updateInstallReportText(report) });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [configLoaded, setNotice]);
+
   useEffect(() => {
     const applyDetectedUpdate = (
       result: UpdateCheck | null | undefined,
@@ -171,9 +224,11 @@ export function useAppUpdates({
             text: updateCheckText(result),
           });
           publishUpdateAvailability(result);
+          const deferredVersion = readDeferredVersion();
           if (
             result.selectedAsset &&
-            promptedVersionRef.current !== result.latestVersion
+            promptedVersionRef.current !== result.latestVersion &&
+            deferredVersion !== result.latestVersion
           ) {
             promptedVersionRef.current = result.latestVersion;
             askDownloadUpdate(result);
@@ -252,6 +307,8 @@ export function useAppUpdates({
       description: `当前版本为 v${target.currentVersion}，检测到新版本 v${target.latestVersion}。是否立即下载更新？`,
       confirmLabel: "立即更新",
       run: () => void downloadUpdate(target),
+      // 用户已经在这次运行里明确推迟过这个版本，自动检查就不再反复弹窗。
+      onDismiss: () => writeDeferredVersion(target.latestVersion),
     });
   }
 
@@ -296,6 +353,8 @@ export function useAppUpdates({
       description: `Codey 会先保存未保存的设置，再退出当前实例，安装 ${target.fileName}，然后尝试启动新版。`,
       confirmLabel: "安装并重启",
       run: () => void installDownloadedUpdate(target),
+      // 安装包已经下载好，"稍后"只影响自动提示，不影响用户从版本入口手动安装。
+      onDismiss: () => writeDeferredVersion(target.latestVersion),
     });
   }
 

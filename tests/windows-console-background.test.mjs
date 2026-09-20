@@ -125,11 +125,30 @@ test("Windows source contract: updates use the detached native helper", async ()
     updateHelper,
     /std::fs::copy\(&executable, &helper_path\)[\s\S]*Command::new\(&helper_path\)/,
   );
+  // 安装结果必须先复核，再决定是否重启：静默 NSIS 失败时盲目重启只会让用户
+  // 反复回到旧版本。
   assert.match(
     updateHelper,
-    /let install_result = install_windows_update[\s\S]*let restart_result = restart_codey/,
+    /match outcome \{[\s\S]*?Ok\(UpdateInstallOutcome::Updated\)[\s\S]*?restart_codey\(invocation, &log_path\)/,
+  );
+  assert.match(
+    updateHelper,
+    /Ok\(UpdateInstallOutcome::Unverified\) => \{[\s\S]*?restart_codey\(invocation, &log_path\)/,
+  );
+  assert.match(
+    updateHelper,
+    /Err\(install_error\) => \{[\s\S]*?finish_update_report\(&report_path, &report_version, "failed", &install_error\)[\s\S]*?Err\(install_error\)/,
+  );
+  assert.doesNotMatch(
+    updateHelper,
+    /let install_result = install_windows_update/,
+    "安装失败后不得再无条件重启旧版本",
   );
   assert.match(updateHelper, /raw_arg\(nsis_install_directory_argument/);
+  assert.match(
+    updateHelper,
+    /let outcome = verify_installed_update\(invocation, expected_version\.as_deref\(\), before\)/,
+  );
 });
 
 test("Windows source contract: missing Codex paths recover before startup", async () => {
