@@ -8,6 +8,7 @@ import {
   Input as HeroInput,
   InputGroup,
   Label,
+  Link as HeroLink,
   ListBox,
   Modal,
   NumberField as HeroNumberField,
@@ -127,6 +128,19 @@ export function Button({
     </HeroButton>
   );
   return title ? <Tooltip content={title}>{button}</Tooltip> : button;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Link（基于 HeroUI Link）
+ * -----------------------------------------------------------------------------------------------*/
+export interface LinkProps extends React.ComponentProps<typeof HeroLink> {}
+export function Link({ className, ...props }: LinkProps) {
+  return (
+    <HeroLink
+      {...props}
+      className={cn("text-xs text-accent hover:underline cursor-pointer select-none", className)}
+    />
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------

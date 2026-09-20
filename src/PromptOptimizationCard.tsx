@@ -1,6 +1,8 @@
 import { memo, useEffect, useId, useRef, useState } from "react";
 
 import {
+  IconRoute,
+  IconSettings,
   IconSparkles,
 } from "@tabler/icons-react";
 
@@ -9,10 +11,10 @@ import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
 import { ManualModelCombobox } from "./components/ManualModelCombobox";
 import { ModelCombobox } from "./components/ModelCombobox";
-import { Card, toast } from "@heroui/react";
+import { Tabs, toast } from "@heroui/react";
 import { Button, Input, PasswordInput, Select, Switch } from "./components/ui";
 import type { SubagentModelOption } from "./subagentModels";
-import { flushCardClass } from "./uiClasses";
+import { SettingsPageHeader } from "./SettingsPageHeader";
 import { validateOutboundApiUrl } from "./urlValidation";
 
 const TEST_TIMEOUT_MS = 65_000;
@@ -208,93 +210,84 @@ function PromptOptimizationCardComponent({
 
   return (
     <section
-      className="secondary-section prompt-optimization-section prompt-column-inner"
+      className="secondary-section prompt-optimization-section"
       aria-labelledby="prompt-optimization-title"
     >
-      <Card className={`secondary-card prompt-optimization-card ${flushCardClass}`}>
-        <div className="module-card-header">
-          <div className="module-card-heading">
-            <span className="module-card-icon" aria-hidden="true">
-              <IconSparkles size={15} />
-            </span>
-            <div className="module-card-titles">
-              <h2 id="prompt-optimization-title">提示词优化</h2>
-              <p>在 Codex 输入框旁一键重写与优化提示词。</p>
-            </div>
-          </div>
-          <div className="module-card-action">
+      <div className="prompt-optimization-settings">
+        <SettingsPageHeader
+          id="prompt-optimization-title"
+          title="提示词优化"
+          icon={<IconSparkles size={15} />}
+          description="在 Codex 输入框旁一键重写与优化提示词。"
+          actions={
             <Switch
               checked={optimization.enabled}
               disabled={isBusy}
               aria-label="启用提示词优化"
-              onCheckedChange={(checked) =>
-                updateOptimization({ enabled: checked })
-              }
+              onCheckedChange={(checked) => updateOptimization({ enabled: checked })}
             />
-          </div>
-        </div>
+          }
+        />
         <div className="module-card-body prompt-optimization-body">
           {optimization.enabled ? (
             <div className="prompt-optimization-content">
-              <div className="prompt-optimization-toolbar">
-                <div className="prompt-optimization-mode-tabs" role="tablist" aria-label="提示词优化配置方式">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={usesCodeyRoute}
-                    className={
-                      "prompt-optimization-mode-tab" +
-                      (usesCodeyRoute ? " active" : "")
-                    }
-                    disabled={isBusy || !codeyRouteAvailable}
-                    title={
-                      codeyRouteAvailable
-                        ? undefined
-                        : "本地路由已关闭"
-                    }
-                    onClick={() => changeMode("codeyRoute")}
-                  >
-                    使用 Codey 路由
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={!usesCodeyRoute}
-                    className={
-                      "prompt-optimization-mode-tab" +
-                      (!usesCodeyRoute ? " active" : "")
-                    }
-                    disabled={isBusy}
-                    onClick={() => changeMode("manual")}
-                  >
-                    手动配置
-                  </button>
+              <Tabs
+                selectedKey={optimization.mode}
+                onSelectionChange={(key) => changeMode(String(key) as "codeyRoute" | "manual")}
+                className="w-full flex flex-col gap-5"
+              >
+                <div className="prompt-optimization-toolbar">
+                  <Tabs.ListContainer className="prompt-optimization-tabs-container">
+                    <Tabs.List aria-label="提示词优化配置方式" className="prompt-optimization-tabs-list">
+                      <Tabs.Tab
+                        id="codeyRoute"
+                        isDisabled={isBusy || !codeyRouteAvailable}
+                        className="prompt-optimization-tab"
+                      >
+                        <IconRoute size={14} className="prompt-tab-icon" />
+                        <span
+                          className="prompt-tab-text"
+                          title={codeyRouteAvailable ? undefined : "本地路由已关闭"}
+                        >
+                          使用 Codey 路由
+                        </span>
+                        <Tabs.Indicator />
+                      </Tabs.Tab>
+                      <Tabs.Tab
+                        id="manual"
+                        isDisabled={isBusy}
+                        className="prompt-optimization-tab"
+                      >
+                        <IconSettings size={14} className="prompt-tab-icon" />
+                        <span className="prompt-tab-text">手动配置</span>
+                        <Tabs.Indicator />
+                      </Tabs.Tab>
+                    </Tabs.List>
+                  </Tabs.ListContainer>
+
+                  <div className="prompt-optimization-toolbar-actions">
+                    <Button
+                      variant="light"
+                      size="sm"
+                      className="prompt-test-btn"
+                      loading={testing}
+                      disabled={isBusy || fetchingModels || !testDraftValid}
+                      onClick={() => void runTest()}
+                    >
+                      <span>
+                        {usesCodeyRoute
+                          ? "测试路由连通性"
+                          : "测试 API 连通性"}
+                      </span>
+                    </Button>
+                  </div>
                 </div>
 
-                <div className="prompt-optimization-toolbar-actions">
-                  <Button
-                    variant="light"
-                    size="xs"
-                    className="prompt-test-btn"
-                    loading={testing}
-                    disabled={isBusy || fetchingModels || !testDraftValid}
-                    onClick={() => void runTest()}
-                  >
-                    <span>
-                      {usesCodeyRoute
-                        ? "测试路由连通性"
-                        : "测试 API 连通性"}
-                    </span>
-                  </Button>
-                </div>
-              </div>
-
-              <div className="prompt-optimization-form-fields">
-                {usesCodeyRoute ? (
+                <Tabs.Panel id="codeyRoute" className="prompt-tabs-panel">
                   <div className="prompt-form-group">
-                    <div className="field prompt-optimization-model-field">
-                      <label htmlFor={modelInputId} className="field-label">模型</label>
-                      <div className="field-control">
+                    <div className="prompt-field">
+                      <label htmlFor={modelInputId} className="prompt-field-label">模型</label>
+                      <div className="prompt-field-control">
                         <ModelCombobox
                           aria-label="提示词优化 Codey 路由模型"
                           value={optimization.model}
@@ -329,9 +322,9 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
 
-                    <div className="field prompt-optimization-instruction-field">
-                      <div className="field-label-wrap">
-                        <label htmlFor={controlId + "-instruction"} className="field-label">优化指令</label>
+                    <div className="prompt-field">
+                      <div className="prompt-field-label-row">
+                        <label htmlFor={controlId + "-instruction"} className="prompt-field-label">优化指令</label>
                         {optimization.instruction && optimization.instruction !== DEFAULT_OPTIMIZER_INSTRUCTION ? (
                           <button
                             type="button"
@@ -342,7 +335,7 @@ function PromptOptimizationCardComponent({
                           </button>
                         ) : null}
                       </div>
-                      <div className="field-control">
+                      <div className="prompt-field-control">
                         <textarea
                           id={controlId + "-instruction"}
                           className="prompt-optimization-instruction"
@@ -357,11 +350,13 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
                   </div>
-                ) : (
+                </Tabs.Panel>
+
+                <Tabs.Panel id="manual" className="prompt-tabs-panel">
                   <div className="prompt-form-group">
-                    <div className="field prompt-optimization-protocol-field">
-                      <label htmlFor={controlId + "-protocol"} className="field-label">上游协议</label>
-                      <div className="field-control">
+                    <div className="prompt-field">
+                      <label htmlFor={controlId + "-protocol"} className="prompt-field-label">上游协议</label>
+                      <div className="prompt-field-control">
                         <Select
                           id={controlId + "-protocol"}
                           className="w-full min-w-0"
@@ -380,9 +375,9 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
 
-                    <div className="field prompt-optimization-address-field">
-                      <label htmlFor={baseUrlInputId} className="field-label">API 地址</label>
-                      <div className="field-control">
+                    <div className="prompt-field">
+                      <label htmlFor={baseUrlInputId} className="prompt-field-label">API 地址</label>
+                      <div className="prompt-field-control">
                         <Input
                           id={baseUrlInputId}
                           value={optimization.baseUrl}
@@ -404,9 +399,9 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
 
-                    <div className="field prompt-optimization-key-field">
-                      <label htmlFor={apiKeyInputId} className="field-label">API Key</label>
-                      <div className="field-control">
+                    <div className="prompt-field">
+                      <label htmlFor={apiKeyInputId} className="prompt-field-label">API Key</label>
+                      <div className="prompt-field-control">
                         <PasswordInput
                           id={apiKeyInputId}
                           className="w-full"
@@ -443,9 +438,9 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
 
-                    <div className="field prompt-optimization-model-field">
-                      <label htmlFor={modelInputId} className="field-label">模型</label>
-                      <div className="field-control">
+                    <div className="prompt-field">
+                      <label htmlFor={modelInputId} className="prompt-field-label">模型</label>
+                      <div className="prompt-field-control">
                         <div className="flex min-w-0 items-center gap-2 max-[680px]:flex-col max-[680px]:items-stretch">
                           <div className="relative min-w-0 flex-1 max-[680px]:w-full">
                             <ManualModelCombobox
@@ -483,9 +478,9 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
 
-                    <div className="field prompt-optimization-instruction-field">
-                      <div className="field-label-wrap">
-                        <label htmlFor={controlId + "-instruction"} className="field-label">优化指令</label>
+                    <div className="prompt-field">
+                      <div className="prompt-field-label-row">
+                        <label htmlFor={controlId + "-instruction"} className="prompt-field-label">优化指令</label>
                         {optimization.instruction && optimization.instruction !== DEFAULT_OPTIMIZER_INSTRUCTION ? (
                           <button
                             type="button"
@@ -496,7 +491,7 @@ function PromptOptimizationCardComponent({
                           </button>
                         ) : null}
                       </div>
-                      <div className="field-control">
+                      <div className="prompt-field-control">
                         <textarea
                           id={controlId + "-instruction"}
                           className="prompt-optimization-instruction"
@@ -511,8 +506,8 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
                   </div>
-                )}
-              </div>
+                </Tabs.Panel>
+              </Tabs>
             </div>
           ) : (
             <div className="module-disabled-placeholder">
@@ -526,7 +521,7 @@ function PromptOptimizationCardComponent({
             </div>
           )}
         </div>
-      </Card>
+      </div>
     </section>
   );
 }

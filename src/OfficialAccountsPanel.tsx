@@ -129,16 +129,21 @@ function UsageLine({ snapshot }: { snapshot: AccountUsageSnapshot | null }) {
             className="official-account-usage-item"
             title={fullTimeTitle}
           >
-            <span className="official-account-usage-window">{windowLabel(window.windowMinutes)}</span>
+            <div className="official-account-usage-header">
+              <span className="official-account-usage-window">{windowLabel(window.windowMinutes)}</span>
+              <span className={`official-account-usage-percent ${toneClass}`}>剩余 {remainingPercent}%</span>
+            </div>
             <div className="official-account-progress-track" aria-hidden="true">
               <div
                 className={`official-account-progress-fill ${toneClass}`}
                 style={{ width: `${remainingPercent}%` }}
               />
             </div>
-            <span className="official-account-usage-percent">剩余 {remainingPercent}%</span>
             {resetInfo && (
-              <span className="official-account-usage-reset">{resetInfo.full}</span>
+              <span className="official-account-usage-reset">
+                {resetInfo.relative ? `${resetInfo.relative} 重置` : resetInfo.short}
+                <span className="official-account-usage-reset-time">（{resetInfo.exact}）</span>
+              </span>
             )}
           </div>
         );
@@ -153,6 +158,7 @@ export type OfficialAccountsPanelProps = {
   isBusy: boolean;
   maskSensitive?: boolean;
   popupContainer: HTMLElement | null;
+  onAccountsLoaded?: (accounts: OfficialAccount[] | null) => void;
   onAccountsChanged: (result: OfficialAccountsResult) => void;
   onNotice: (notice: { tone: "success" | "info" | "error"; text: string }) => void;
   onRequestConfirmation?: (confirmation: Confirmation) => void;
@@ -163,6 +169,7 @@ export function OfficialAccountsPanel({
   isBusy,
   maskSensitive = false,
   popupContainer,
+  onAccountsLoaded,
   onAccountsChanged,
   onNotice,
   onRequestConfirmation,
@@ -189,12 +196,16 @@ export function OfficialAccountsPanel({
   const refresh = useCallback(async () => {
     try {
       const result = await invoke<OfficialAccountsResult>("list_official_accounts");
-      setAccounts(result.accounts ?? []);
+      const loaded = result.accounts ?? [];
+      if (!Array.isArray(loaded)) throw new Error("官方账号列表格式无效，请重新加载");
+      setAccounts(loaded);
+      onAccountsLoaded?.(loaded);
       setLoadError("");
     } catch (error) {
       setLoadError(errorText(error));
+      onAccountsLoaded?.(null);
     }
-  }, []);
+  }, [onAccountsLoaded]);
 
   useEffect(() => {
     void refresh();
@@ -422,7 +433,22 @@ export function OfficialAccountsPanel({
   return (
     <div className="official-accounts-panel" aria-label="官方账号">
       <div className="official-accounts-header">
-        <span className="official-accounts-title">官方账号</span>
+        <div className="official-accounts-title-group">
+          <div className="official-accounts-avatar-pill" aria-hidden="true">
+            <IconBrandOpenai size={15} />
+          </div>
+          <div className="official-accounts-heading-text">
+            <div className="official-accounts-title-row">
+              <span className="official-accounts-title">官方账号</span>
+              {accounts && accounts.length > 0 && (
+                <Badge variant="secondary">{accounts.length} 个账号</Badge>
+              )}
+            </div>
+            <small className="official-accounts-subtitle">
+              管理 ChatGPT 官方账号身份与使用额度
+            </small>
+          </div>
+        </div>
         <div className="official-accounts-actions">
           <Tooltip content="把 Codex 里已登录的 ChatGPT 账号加入列表">
             <Button variant="link" color="primary" size="xs" disabled={disabled} loading={pending === "import"} onClick={() => void importCurrent()}>
@@ -452,53 +478,67 @@ export function OfficialAccountsPanel({
                 key={account.id}
                 className={`official-account-item${account.isDefault ? " is-default" : ""}${account.invalid ? " is-invalid" : ""}`}
               >
-                <IconBrandOpenai size={18} className="official-account-avatar" aria-hidden="true" />
-                <div className="official-account-main">
-                  <div className="official-account-line">
-                    <strong title={label}>{label}</strong>
-                    {plan && <span className={planTagClass(account.planType)}>{plan}</span>}
-                    {account.invalid ? (
-                      <Badge variant="destructive" title={account.invalidReason}>
-                        {account.isDefault ? "默认 · 已失效" : "账号已失效"}
-                      </Badge>
-                    ) : account.isDefault ? (
-                      <Badge variant={officialAccountAvailable ? "success" : "warning"}>
-                        {officialAccountAvailable ? "默认 · 已启用" : "默认 · 待重启"}
-                      </Badge>
-                    ) : null}
+                <div className="official-account-item-top">
+                  <div className="official-account-item-left">
+                    <div className="official-account-item-icon-pill" aria-hidden="true">
+                      <IconBrandOpenai size={16} className="official-account-avatar" />
+                    </div>
+                    <div className="official-account-main">
+                      <div className="official-account-line">
+                        <strong title={label}>{label}</strong>
+                        {plan && <span className={planTagClass(account.planType)}>{plan}</span>}
+                        {account.invalid ? (
+                          <Badge variant="destructive" title={account.invalidReason}>
+                            {account.isDefault ? "默认 · 已失效" : "账号已失效"}
+                          </Badge>
+                        ) : account.isDefault ? (
+                          <Badge variant={officialAccountAvailable ? "success" : "warning"}>
+                            {officialAccountAvailable ? "默认 · 已启用" : "默认 · 待重启"}
+                          </Badge>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
-                  <div className="official-account-line">
-                    <UsageLine snapshot={usages[account.id] ?? null} />
-                    <Button variant="link" color="primary" size="icon-sm" disabled={disabled} onClick={() => void refreshUsage(account.id, true)} aria-label="刷新额度" title="刷新额度">
+                  <div className="official-account-controls">
+                    <Button
+                      variant="link"
+                      color="primary"
+                      size="icon-sm"
+                      disabled={disabled}
+                      onClick={() => void refreshUsage(account.id, true)}
+                      aria-label="刷新额度"
+                      title="刷新额度"
+                    >
                       <IconRefresh size={13} aria-hidden="true" />
+                    </Button>
+                    {!account.isDefault && !account.invalid && (
+                      <Button
+                        variant="filled"
+                        size="xs"
+                        disabled={disabled}
+                        loading={pending === `default:${account.id}`}
+                        onClick={() => void setDefault(account)}
+                      >
+                        <IconCheck size={13} aria-hidden="true" />
+                        <span>设为默认</span>
+                      </Button>
+                    )}
+                    <Button
+                      variant="link"
+                      color="danger"
+                      size="icon-sm"
+                      disabled={disabled}
+                      loading={pending === `remove:${account.id}`}
+                      onClick={() => void handleRemove(account)}
+                      aria-label={`移除官方账号 ${label}`}
+                      title="移除账号"
+                    >
+                      <IconTrash size={13} aria-hidden="true" />
                     </Button>
                   </div>
                 </div>
-                <div className="official-account-controls">
-                  {!account.isDefault && !account.invalid && (
-                    <Button
-                      variant="filled"
-                      size="xs"
-                      disabled={disabled}
-                      loading={pending === `default:${account.id}`}
-                      onClick={() => void setDefault(account)}
-                    >
-                      <IconCheck size={13} aria-hidden="true" />
-                      <span>设为默认</span>
-                    </Button>
-                  )}
-                  <Button
-                    variant="link"
-                    color="danger"
-                    size="icon-sm"
-                    disabled={disabled}
-                    loading={pending === `remove:${account.id}`}
-                    onClick={() => void handleRemove(account)}
-                    aria-label={`移除官方账号 ${label}`}
-                    title="移除账号"
-                  >
-                    <IconTrash size={13} aria-hidden="true" />
-                  </Button>
+                <div className="official-account-usage-container">
+                  <UsageLine snapshot={usages[account.id] ?? null} />
                 </div>
               </li>
             );

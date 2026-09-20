@@ -77,7 +77,7 @@ export function buildEnabledOptimizationFeatures(
       id: "subagent-optimization",
       icon: "subagent",
       name: "子代理优化",
-      detail: "子代理角色与调度增强已随当前运行实例加载",
+      detail: "子代理优化已随当前运行实例加载",
       sourceLabel: "Codey",
     });
   }
