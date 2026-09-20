@@ -113,7 +113,8 @@ for (const invalid of [null, [], { secret: "private-value" }, 1, false]) {
 
 test("plugin package reports deeply nested parse errors without a traceback", options, t => {
   const f = fixture(t);
-  writeFileSync(f.config, '{"rules":' + '['.repeat(15000) + '{}' + ']'.repeat(15000) + '}');
+  // 缺少闭合符，确保各 Python 版本都会拒绝，不依赖 JSON 解析器的递归限制。
+  writeFileSync(f.config, '{"rules":' + '['.repeat(15000) + '{}');
   const result = f.run(["--config", f.config]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /配置模板必须是有效的 UTF-8 JSON/);
