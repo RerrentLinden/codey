@@ -1286,7 +1286,7 @@ export function App({
         <div className="config-header-feedback justify-self-center">
           <Button
             aria-describedby="codey-feedback-qr-description"
-            aria-label="问题反馈群，悬浮或聚焦查看二维码"
+            aria-label="问题反馈群，鼠标悬停或键盘聚焦查看二维码"
             className="h-8! whitespace-nowrap px-3.5 text-xs max-[760px]:w-8! max-[760px]:px-0!"
             variant="brand-outline"
           >
