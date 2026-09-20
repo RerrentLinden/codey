@@ -2,6 +2,9 @@ use super::*;
 
 const NATIVE_HISTORY_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const NATIVE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+// Entries hold whole session snapshots, so this bound counts conversations
+// rather than history items inside one request.
+const NATIVE_HISTORY_CACHE_ENTRIES: usize = 64;
 
 struct NativeHistoryEntry {
     scope: [u8; 32],
@@ -40,7 +43,8 @@ impl NativeHistoryCache {
         id: &str,
     ) -> Option<Arc<AdaptedResponsesHistory>> {
         self.prune(Instant::now());
-        // ponytail: scan at most 64 snapshots; use a map if this bound grows.
+        // Linear scan of at most NATIVE_HISTORY_CACHE_ENTRIES snapshots; use a
+        // map if this bound grows.
         self.entries
             .iter()
             .rev()
@@ -63,7 +67,7 @@ impl NativeHistoryCache {
         if bytes > NATIVE_HISTORY_CACHE_BYTES {
             return;
         }
-        while self.entries.len() >= MAX_CONCURRENT_CONNECTIONS
+        while self.entries.len() >= NATIVE_HISTORY_CACHE_ENTRIES
             || self.bytes.saturating_add(bytes) > NATIVE_HISTORY_CACHE_BYTES
         {
             self.remove_oldest();
@@ -242,6 +246,14 @@ impl NativeResponsesHistory {
     }
 }
 
+fn tool_name_label(item: &Value) -> String {
+    item.get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(|name| format!(" name={}", name.chars().take(64).collect::<String>()))
+        .unwrap_or_default()
+}
+
 fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> {
     let mut calls = HashSet::new();
     for item in input {
@@ -265,9 +277,16 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
                     .get("call_id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                    .context("工具调用缺少 call_id，请重新发送完整上下文")?;
+                    .with_context(|| {
+                        format!(
+                            "工具调用缺少 call_id（{kind}{}），请重新发送完整上下文",
+                            tool_name_label(item)
+                        )
+                    })?;
                 if !calls.insert((kind, id)) {
-                    anyhow::bail!("历史中工具调用 ID 重复，请重新发送完整上下文");
+                    anyhow::bail!(
+                        "历史中工具调用 ID 重复（{kind} call_id={id}），请重新发送完整上下文"
+                    );
                 }
             }
             "function_call_output" | "custom_tool_call_output" => {
@@ -276,12 +295,22 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
                 } else {
                     "custom_tool_call"
                 };
-                let id = item
+                // Client-side tools (Codex app thread messaging, for example) emit
+                // results that carry no call id because no model call exists for
+                // them. Such an item cannot identify a dangling result, and
+                // upstream accepts it, so it must not fail the whole request.
+                let Some(id) = item
                     .get("call_id")
                     .and_then(Value::as_str)
-                    .unwrap_or_default();
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
                 if !calls.remove(&(call_kind, id)) {
-                    anyhow::bail!("工具结果缺少对应的完整调用历史，请重新发送完整上下文");
+                    anyhow::bail!(
+                        "工具结果缺少对应的完整调用历史（{kind} call_id={id}{}），请重新发送完整上下文",
+                        tool_name_label(item)
+                    );
                 }
             }
             _ => {}
@@ -660,7 +689,44 @@ mod tests {
             assert!(history.restore(key, &mut next).is_err());
             let mut orphan = json!({"input":[result(custom, "missing-call")]});
             history.prepare(key, &mut orphan);
-            assert!(history.restore(key, &mut orphan).is_err());
+            let error = history.restore(key, &mut orphan).unwrap_err().to_string();
+            assert!(error.contains("工具结果缺少对应的完整调用历史"), "{error}");
+            assert!(error.contains("call_id=missing-call"), "{error}");
+        }
+    }
+
+    #[test]
+    fn native_history_tolerates_results_without_call_id() {
+        for custom in [false, true] {
+            let mut history = NativeResponsesHistory::default();
+            let key = [1; 32];
+            // Client-side tools emit results that carry no call id at all.
+            let mut sideless = result(custom, "unused");
+            assert!(
+                sideless
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("call_id")
+                    .is_some()
+            );
+            sideless["name"] = json!("send_message_to_thread");
+            // A complete array request must pass, matching the HTTP/SSE path.
+            let mut complete = json!({
+                "input":[sideless.clone(), call(custom, "call-1"), result(custom, "call-1")]
+            });
+            history.prepare(key, &mut complete);
+            assert!(history.restore(key, &mut complete).is_ok());
+            assert_eq!(complete["input"].as_array().unwrap().len(), 3);
+            // The same holds when history is restored onto a native continuation.
+            history.prepare(key, &mut json!({"input":"task"}));
+            history.observe(&completed("resp-known", vec![call(custom, "call-2")]));
+            let mut next = json!({
+                "previous_response_id":"resp-known",
+                "input":[sideless, result(custom, "call-2")]
+            });
+            history.prepare(key, &mut next);
+            assert!(history.restore(key, &mut next).unwrap());
+            assert_eq!(next["input"].as_array().unwrap().len(), 4);
         }
     }
 
@@ -724,14 +790,14 @@ mod tests {
             Arc::clone(&cache),
             &[("session-id".into(), "task".into())],
         );
-        for index in 0..=MAX_CONCURRENT_CONNECTIONS {
+        for index in 0..=NATIVE_HISTORY_CACHE_ENTRIES {
             history.prepare([1; 32], &mut json!({"input":"task"}));
             history.observe(&completed(&format!("resp-{index}"), vec![]));
         }
         let scope = history.scope.unwrap();
         assert_eq!(
             cache.lock().unwrap().entries.len(),
-            MAX_CONCURRENT_CONNECTIONS
+            NATIVE_HISTORY_CACHE_ENTRIES
         );
         assert!(
             cache
