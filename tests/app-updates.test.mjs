@@ -92,3 +92,22 @@ test("disabling cancels the next automatic check and enabling starts again", asy
   h.render();
   assert.equal(h.requests.length, 2);
 });
+
+test("detecting an update with an asset prompts the confirmation dialog", async () => {
+  const h = harness(false);
+  let confirmation = null;
+  h.options.setConfirmation = (c) => {
+    confirmation = c;
+  };
+  const updateWithAsset = {
+    ...available,
+    selectedAsset: { fileName: "Codey-1.2.0.dmg", size: 1048576, url: "https://example.com" },
+  };
+  const checking = h.render().checkForUpdates();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].resolve(updateWithAsset);
+  await checking;
+  assert.ok(confirmation);
+  assert.equal(confirmation.action, "download-update");
+  assert.match(confirmation.title, /1\.2\.0/);
+});

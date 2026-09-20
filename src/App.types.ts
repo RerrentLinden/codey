@@ -259,6 +259,7 @@ export type Confirmation = {
     | "restart"
     | "repair-codex-config"
     | "install-update"
+    | "download-update"
     | "disable-auto-update-check"
     | "delete-notification-channel"
     | "delete-route"

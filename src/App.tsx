@@ -9,11 +9,13 @@ import {
   IconLoader2 as LoaderCircle,
   IconMessageCircleQuestion,
   IconRefresh as RefreshCw,
+  IconSettings,
   IconX,
 } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { reconcileConfigDraft } from "./configDraft";
 import { ModelPickerDialog } from "./AppDialogs";
+import { SystemSettingsDialog } from "./SystemSettingsDialog";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
 import { UsageAnalysisPanel } from "./UsageAnalysisPanel";
@@ -58,7 +60,7 @@ import type {
   PluginMarketplaceStatus,
   Profile,
 } from "./App.types";
-import { Badge, Button, Switch, Tooltip } from "./components/ui";
+import { Badge, Button, Tooltip } from "./components/ui";
 
 const Check = IconCheck;
 const extensionRequest: ExtensionTransport = request => invoke("codex_extensions", { request });
@@ -159,6 +161,7 @@ export function App({
   const [loadFailed, setLoadFailed] = useState(false);
   const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
   const [injectionRepairRequested, setInjectionRepairRequested] = useState(false);
+  const [systemSettingsOpen, setSystemSettingsOpen] = useState(false);
   const popupContainer = modalContainer ?? null;
   const noticeController = useAppNoticeController();
   // 诊断清理结果用 HeroUI Toast 展示；同一次清理的“进行中 / 结果”共用一条提示，后者替换前者。
@@ -293,7 +296,7 @@ export function App({
     updateCheck,
     downloadedUpdate,
     checkForUpdates,
-    downloadUpdate,
+    askDownloadUpdate,
     askInstallDownloadedUpdate,
   } = useAppUpdates({
     embedded,
@@ -1106,11 +1109,15 @@ export function App({
   const handleRepairMainProcessInjection = useStableEvent(
     () => void repairMainProcessInjection(),
   );
-  const handleCheckForUpdates = useStableEvent(() => void checkForUpdates());
-  const handleDownloadUpdate = useStableEvent(() => void downloadUpdate());
-  const handleInstallDownloadedUpdate = useStableEvent(
-    askInstallDownloadedUpdate,
-  );
+  const handleFooterUpdateClick = useStableEvent(() => {
+    if (downloadedUpdate) {
+      askInstallDownloadedUpdate();
+    } else if (hasUpdate) {
+      askDownloadUpdate();
+    } else {
+      void checkForUpdates();
+    }
+  });
   const handleConfigChange = useStableEvent(editConfig);
   const handleAddNotificationChannel = useStableEvent(addNotificationChannel);
   const handleNotificationChannelChange = useStableEvent(
@@ -1400,48 +1407,48 @@ export function App({
       <SettingsLayout
         contentRef={settingsScroll}
         sidebarFooter={
-          <div className="sidebar-updates">
-            <div className="sidebar-update-version">
-              <span>Codey</span>
-              <span className="header-version-badge">v{status.appVersion || "0.0.1"}</span>
-            </div>
-            <Tooltip content={updateTooltipText} position="top">
-              <Button
-                size="xs"
-                className="sidebar-update-button"
-                variant={downloadedUpdate ? "default" : "brand-outline"}
-                disabled={isBusy}
-                aria-label={updateTooltipText}
-                onClick={() => {
-                  if (downloadedUpdate) handleInstallDownloadedUpdate();
-                  else if (hasUpdate) handleDownloadUpdate();
-                  else handleCheckForUpdates();
-                }}
-              >
-                {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
-                  <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
-                ) : downloadedUpdate ? (
-                  <IconCheck size={14} aria-hidden="true" />
-                ) : (
-                  <IconCircleArrowUp size={14} aria-hidden="true" />
-                )}
-                <span>{isInstallingUpdate ? "正在安装…" : isDownloadingUpdate ? "正在下载…" : isCheckingUpdate ? "正在检查…" : downloadedUpdate ? "安装并重启" : hasUpdate ? "下载更新" : "检查更新"}</span>
-              </Button>
-            </Tooltip>
-            {(downloadedUpdate || updateCheck?.updateAvailable) && (
-              <span className="sidebar-update-status" role="status">
-                {downloadedUpdate ? `v${downloadedUpdate.latestVersion} 已下载` : `v${updateCheck?.latestVersion} 可更新`}
+          <div className="sidebar-footer-bar">
+            <div className="sidebar-footer-left">
+              <span className="sidebar-footer-version font-mono">
+                v{status.appVersion || "0.0.1"}
               </span>
-            )}
-            <div className="sidebar-auto-update">
-              <span id="codey-auto-update-label">自动检查 Codey 更新</span>
-              <Switch
-                size="sm"
-                aria-labelledby="codey-auto-update-label"
-                checked={config.autoCheckCodeyUpdates !== false}
-                disabled={isBusy}
-                onCheckedChange={changeAutomaticUpdateChecks}
-              />
+              <Tooltip content={updateTooltipText} position="top">
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  className="sidebar-footer-icon-btn"
+                  disabled={isBusy && !isCheckingUpdate}
+                  aria-label={updateTooltipText}
+                  onClick={handleFooterUpdateClick}
+                >
+                  {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
+                    <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
+                  ) : downloadedUpdate ? (
+                    <IconCheck size={14} className="text-success" aria-hidden="true" />
+                  ) : hasUpdate ? (
+                    <span className="relative inline-flex items-center justify-center">
+                      <IconCircleArrowUp size={15} className="text-primary" aria-hidden="true" />
+                      <span className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-primary animate-pulse" />
+                    </span>
+                  ) : (
+                    <IconCircleArrowUp size={15} aria-hidden="true" />
+                  )}
+                </Button>
+              </Tooltip>
+            </div>
+
+            <div className="sidebar-footer-right">
+              <Tooltip content="系统设置与偏好" position="top">
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  className="sidebar-footer-icon-btn"
+                  aria-label="系统设置与偏好"
+                  onClick={() => setSystemSettingsOpen(true)}
+                >
+                  <IconSettings size={15} aria-hidden="true" />
+                </Button>
+              </Tooltip>
             </div>
           </div>
         }
@@ -1578,6 +1585,21 @@ export function App({
       <ConfirmationDialogHost
         container={popupContainer}
         controller={confirmationController}
+      />
+
+      <SystemSettingsDialog
+        open={systemSettingsOpen}
+        onOpenChange={setSystemSettingsOpen}
+        container={popupContainer}
+        appVersion={status.appVersion}
+        codexAppVersion={status.codexAppVersion}
+        codexAppPath={config.codexAppPath || status.codexAppPath}
+        isBusy={isBusy}
+        busy={busy}
+        onRepairCodexConfig={askRepairCodexConfig}
+        configRepairNotice={configRepairNotice}
+        autoCheckCodeyUpdates={config.autoCheckCodeyUpdates !== false}
+        onAutoCheckCodeyUpdatesChange={changeAutomaticUpdateChecks}
       />
     </main>
   );

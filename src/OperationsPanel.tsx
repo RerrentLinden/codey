@@ -8,7 +8,6 @@ import {
   IconCpu,
   IconDatabase,
   IconFileCheck,
-  IconFolderOpen,
   IconHistory,
   IconLoader2 as LoaderCircle,
   IconPlugConnected as PlugZap,
@@ -33,7 +32,6 @@ import {
 } from "./runtimeStatusPresentation";
 
 const Cpu = IconCpu;
-const FolderOpen = IconFolderOpen;
 const History = IconHistory;
 const EMPTY_INJECTION_SCRIPTS: NonNullable<
   RuntimeStatus["injectionScripts"]
@@ -82,16 +80,15 @@ type OperationsPanelProps = {
   pluginMarketplaceStatus: PluginMarketplaceStatus | null;
   onRepairPluginMarketplace: () => void;
   onRepairMainProcessInjection: () => void;
-  onRepairCodexConfig: () => void;
+  onRepairCodexConfig?: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
   injectionRepairing?: boolean;
-  onRestart: () => void;
+  onRestart?: () => void;
   showRestartAction?: boolean;
   restartStatusUnknown?: boolean;
 };
 
 function OperationsPanelComponent({
-  codexAppPath,
   fastContextToolsStatus,
   status,
   busy,
@@ -99,11 +96,8 @@ function OperationsPanelComponent({
   pluginMarketplaceStatus,
   onRepairPluginMarketplace,
   onRepairMainProcessInjection,
-  onRepairCodexConfig,
   configRepairNotice,
   injectionRepairing = false,
-  onRestart,
-  showRestartAction = true,
   restartStatusUnknown = false,
 }: OperationsPanelProps) {
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
@@ -210,12 +204,7 @@ function OperationsPanelComponent({
   const injectionStatusPending = injectionScripts.length === 0;
   const injectionError =
     internalInjectionError || failedInjectionScriptCount > 0;
-  const resolvedCodexPath = status.codexAppPath || "/Applications/ChatGPT.app";
   const restartPending = Boolean(status.restartRequired);
-  const codexVersion = status.codexAppVersion?.trim();
-  const codexVersionLabel = codexVersion
-    ? `Codex v${codexVersion}`
-    : "Codex 版本未知";
 
 
   type MetricItem = {
@@ -425,75 +414,9 @@ function OperationsPanelComponent({
   return (
     <section
       className={`operations-hub${restartPending ? " pending" : status.running ? " running" : ""}`}
-      aria-labelledby="operations-title"
+      aria-label="服务状态与诊断"
     >
       <div className="operations-panel">
-        <div className="operations-hero-card codey-card mb-3 p-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-col gap-1.5 min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h3 id="operations-title" className="m-0 text-sm font-semibold text-foreground">
-                  Codex 运行状态
-                </h3>
-                <Badge
-                  className="operations-running-badge"
-                  variant={
-                    restartPending
-                      ? "warning"
-                      : status.running
-                        ? "success"
-                        : "secondary"
-                  }
-                >
-                  <span className="relative flex h-2 w-2 items-center justify-center mr-1.5" aria-hidden="true">
-                    {status.running && !restartPending && (
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                    )}
-                    <span
-                      className={`relative inline-flex rounded-full h-2 w-2 ${
-                        restartPending
-                          ? "bg-amber-500"
-                          : status.running
-                            ? "bg-emerald-500"
-                            : "bg-zinc-400"
-                      }`}
-                    />
-                  </span>
-                  {restartPending
-                    ? "等待重启"
-                    : status.running
-                      ? "运行中"
-                      : "未启动"}
-                </Badge>
-                <span className="codex-version-tag">{codexVersionLabel}</span>
-              </div>
-              <div
-                className="path-display header-path-display flex items-center gap-1.5 font-mono text-[11px] text-muted truncate"
-                aria-label="Codex 应用路径"
-              >
-                <FolderOpen size={13} className="shrink-0" aria-hidden="true" />
-                <code className="truncate">{codexAppPath || resolvedCodexPath}</code>
-              </div>
-            </div>
-
-            {showRestartAction && (
-              <Button
-                variant={status.running ? "warning" : "default"}
-                size="sm"
-                disabled={isBusy || (!restartStatusUnknown && (status.restartInProgress || !status.running))}
-                onClick={onRestart}
-              >
-                {busy === "restart" || (status.restartInProgress && !restartStatusUnknown) ? (
-                  <LoaderCircle className="animate-spin" aria-hidden="true" />
-                ) : (
-                  <RefreshCw aria-hidden="true" />
-                )}
-                <span>{restartStatusUnknown ? "重新查询状态" : status.running ? "重启 Codex" : "未运行"}</span>
-              </Button>
-            )}
-          </div>
-        </div>
-
         {/* 3列核心服务卡片 */}
         <div
           className="operations-status-cards grid grid-cols-1 gap-2.5 sm:grid-cols-3 mb-3"
@@ -577,40 +500,6 @@ function OperationsPanelComponent({
                 key={expandedStatusCard.title}
                 className={`operations-expanded-card tone-${expandedStatusCard.tone}`}
               >
-                {(expandedStatusCard.showInjectionScripts ||
-                  expandedStatusCard.enabledFeatureCount !== undefined) && (
-                  <div className="expanded-tray-toolbar">
-                    <div className="flex items-center gap-2">
-                      {expandedStatusCard.enabledFeatureCount !==
-                        undefined && (
-                        <span className="expanded-card-feature-count">
-                          已生效 {expandedStatusCard.enabledFeatureCount} 项功能
-                        </span>
-                      )}
-                    </div>
-                    <div className="expanded-card-actions">
-                      {expandedStatusCard.showInjectionScripts && (
-                        <Button
-                          variant="outline"
-                          size="xs"
-                          disabled={isBusy}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            onRepairCodexConfig();
-                          }}
-                        >
-                          {busy === "repair-codex-config" ? (
-                            <LoaderCircle className="animate-spin" aria-hidden="true" />
-                          ) : (
-                            <RefreshCw aria-hidden="true" />
-                          )}
-                          {busy === "repair-codex-config" ? "检查修复中…" : "修复 Codex 配置"}
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                )}
-
                 <div className="expanded-card-body">
                   {expandedStatusCard.showInjectionScripts && configRepairNotice && (
                     <p role="status" className={`mb-3 whitespace-pre-line break-words text-sm ${configRepairNotice.tone === "error" ? "text-danger" : "text-[var(--codey-text-secondary)]"}`}>
@@ -687,7 +576,11 @@ function OperationsPanelComponent({
                       aria-labelledby="injection-status-title"
                     >
                       <div className="injection-status-header">
-                        <h4 id="injection-status-title">已生效功能</h4>
+                        <h4 id="injection-status-title">
+                          {enabledOptimizationFeatures.length > 0
+                            ? `已生效 ${enabledOptimizationFeatures.length} 项功能`
+                            : "已生效功能"}
+                        </h4>
                       </div>
 
                       {enabledOptimizationFeatures.length > 0 ? (

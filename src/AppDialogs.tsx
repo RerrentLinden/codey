@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import {
   IconAlertTriangle as AlertTriangle,
   IconCheck as Check,
+  IconCircleArrowUp as CircleArrowUp,
   IconCpu,
   IconLoader2 as LoaderCircle,
   IconPlus as Plus,
@@ -420,6 +421,9 @@ function ConfirmationDialogComponent({
     confirmation?.action === "delete-notification-channel" ||
     confirmation?.action === "delete-route" ||
     confirmation?.action === "delete-official-account";
+  const isUpdate =
+    confirmation?.action === "download-update" ||
+    confirmation?.action === "install-update";
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="confirmation-dialog" container={container}>
@@ -428,7 +432,9 @@ function ConfirmationDialogComponent({
           <DialogDescription>{confirmation?.description}</DialogDescription>
         </DialogHeader>
         <DialogFooter>
-          <Button variant="outline" onClick={onClose}>取消</Button>
+          <Button variant="outline" onClick={onClose}>
+            {isUpdate ? "稍后" : "取消"}
+          </Button>
           <Button
             variant={
               destructive
@@ -441,11 +447,15 @@ function ConfirmationDialogComponent({
               if (confirmation) onConfirm(confirmation);
             }}
           >
-            {destructive
-              ? <Trash2 aria-hidden="true" />
-              : confirmation?.action === "restart"
-              ? <RefreshCw aria-hidden="true" />
-              : <Check aria-hidden="true" />}
+            {destructive ? (
+              <Trash2 aria-hidden="true" />
+            ) : confirmation?.action === "restart" ? (
+              <RefreshCw aria-hidden="true" />
+            ) : isUpdate ? (
+              <CircleArrowUp aria-hidden="true" />
+            ) : (
+              <Check aria-hidden="true" />
+            )}
             {confirmation?.confirmLabel}
           </Button>
         </DialogFooter>
