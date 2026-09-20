@@ -1,0 +1,106 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+import ts from "typescript";
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
+const dependencyUrl = new URL("../src/codeyPlugins.ts", import.meta.url);
+const { validatePluginConfigText } = await loadTypeScriptModule(dependencyUrl);
+const dependency = ts.transpileModule(await readFile(dependencyUrl, "utf8"), {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 },
+}).outputText;
+const source = (await readFile(new URL("../src/pluginConfigDocument.ts", import.meta.url), "utf8"))
+  .replace('"./codeyPlugins"', JSON.stringify(`data:text/javascript;base64,${Buffer.from(dependency).toString("base64")}`));
+const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 } }).outputText;
+const { parsePluginConfigDocument: parse, validatePluginConfigValue: validate, serializePluginConfigDocument: serialize } =
+  await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
+const flatten = document => {
+  const result = new Map();
+  const visit = entry => { result.set(JSON.stringify(entry.path), entry); entry.children.forEach(visit); };
+  document.entries.forEach(visit);
+  return result;
+};
+const entryAt = (document, ...path) => flatten(document).get(JSON.stringify(path));
+const edits = (...pairs) => new Map(pairs.map(([path, value]) => [JSON.stringify(path), value]));
+
+test("unchanged source preserves CRLF, escaped text, numeric spelling and comments exactly", () => {
+  const content = '{\r\n  "_comments": {"x":"不可改", "missing":"保留"},\r\n  "x" : "\\u4e2d\\n\\/", "n":900719925474099312345, "e":1.000e+02\r\n}\r\n';
+  const document = parse(content);
+  assert.equal(entryAt(document, "x").valueText, "中\n/");
+  assert.equal(entryAt(document, "n").valueText, "900719925474099312345");
+  assert.equal(entryAt(document, "e").valueText, "1.000e+02");
+  assert.equal(serialize(document, new Map()), content);
+  assert.equal(serialize(document, edits([["x"], "中\n/"], [["n"], "900719925474099312345"])), content);
+  assert.equal(entryAt(document, "_comments"), undefined);
+});
+
+test("several replacements use original positions and preserve every other source byte", () => {
+  const content = '{ "_comments":{"a":"说明"}, "a":"a", "list":[false, 20, null], "untouched":1e2 }';
+  const updated = serialize(parse(content), edits([["a"], '多行\n"\\😀'], [["list", 0], "true"], [["list", 1], "-0.05e+2"], [["list", 2], '"新值"']));
+  assert.equal(updated, '{ "_comments":{"a":"说明"}, "a":"多行\\n\\\"\\\\😀", "list":[true, -0.05e+2, "新值"], "untouched":1e2 }');
+  assert.equal(validatePluginConfigText(updated), undefined);
+  assert.equal(parse(updated).entries[1].children[0].key, "[0]");
+});
+
+test("comments follow nearest local field then ancestor paths across arrays", () => {
+  const document = parse(JSON.stringify({
+    _comments: { stateConfigs: "列表说明", "stateConfigs.model": "祖先模型说明", "stateConfigs.deep.value": "深层说明", missing: "未匹配" },
+    stateConfigs: [{ model: "gpt6", deep: { value: 1 } }, { _comments: { model: "本项说明" }, model: "5.5" }],
+  }));
+  assert.equal(entryAt(document, "stateConfigs").comment, "列表说明");
+  assert.equal(entryAt(document, "stateConfigs", 0).comment, undefined);
+  assert.equal(entryAt(document, "stateConfigs", 0, "model").comment, "祖先模型说明");
+  assert.equal(entryAt(document, "stateConfigs", 1, "model").comment, "本项说明");
+  assert.equal(entryAt(document, "stateConfigs", 0, "deep", "value").comment, "深层说明");
+  assert.ok([...flatten(document).values()].every(entry => !entry.path.includes("_comments")));
+});
+
+test("literal dotted names take precedence and arbitrary names cannot pollute prototypes", () => {
+  const content = '{"_comments":{"a.b":"字面字段", "__proto__":"普通键", "constructor":"普通键二", "":"空键"},"a.b":1,"a":{"b":2},"__proto__":false,"constructor":"x","":null}';
+  const document = parse(content);
+  assert.equal(entryAt(document, "a.b").comment, "字面字段");
+  assert.equal(entryAt(document, "a", "b").comment, undefined);
+  assert.notEqual(entryAt(document, "a.b").id, entryAt(document, "a", "b").id);
+  assert.equal(entryAt(document, "__proto__").comment, "普通键");
+  assert.equal(entryAt(document, "constructor").comment, "普通键二");
+  assert.equal(entryAt(document, "").comment, "空键");
+  assert.equal(Object.prototype.polluted, undefined);
+  const updated = serialize(document, edits([["__proto__"], "true"], [[""], "42"]));
+  assert.equal(JSON.parse(updated).__proto__, true);
+  assert.equal(JSON.parse(updated)[""], 42);
+});
+
+test("values keep original types with scalar-only conversion from null", () => {
+  const document = parse('{"n":1,"s":"a","b":false,"nil":null,"a":[],"o":{}}');
+  const numeric = entryAt(document, "n");
+  for (const text of ["0", "-0", "1.25", "-1e-9", "2E+3"]) assert.equal(validate(numeric, text), undefined);
+  for (const text of ["", " ", " 1", "1 ", "+1", "01", ".5", "1.", "Infinity", "NaN", "1e999", "false", "{}"])
+    assert.ok(validate(numeric, text), text);
+  assert.equal(validate(entryAt(document, "s"), "arbitrary\ntext"), undefined);
+  for (const text of ["0", "null", "TRUE", " false"]) assert.ok(validate(entryAt(document, "b"), text));
+  for (const text of ['"text"', "-2", "true", "false", "null"]) assert.equal(validate(entryAt(document, "nil"), text), undefined);
+  for (const text of ["{}", "[]", "invalid", "1e999"]) assert.ok(validate(entryAt(document, "nil"), text));
+  assert.ok(validate(entryAt(document, "a"), "[]"));
+  assert.ok(validate(entryAt(document, "o"), "{}"));
+});
+
+test("saving rejects invalid types, structures, annotations and nonexistent entries", () => {
+  const document = parse('{"_comments":{"n":"说明"},"n":1,"a":[],"o":{}}');
+  for (const [path, value] of [[["n"], "false"], [["a"], "[]"], [["o"], "{}"], [["unknown"], "1"], [["_comments", "n"], "改说明"]])
+    assert.throws(() => serialize(document, edits([path, value])));
+  entryAt(document, "n").kind = "string";
+  assert.throws(() => serialize(document, edits([["n"], "bad"])), /有限数字/);
+});
+
+test("invalid documents report format, annotations, duplicates and nesting limits", () => {
+  for (const content of ["null", "[]", "{", '{"x":1,}', '{"x":1 //注释\n}']) assert.throws(() => parse(content));
+  for (const content of ['{"_comments":[]}', '{"a":[{"_comments":{"x":1}}]}']) assert.throws(() => parse(content), /配置注释/);
+  for (const content of ['{"a":1,"a":2}', '{"_comments":{"a":"1","a":"2"}}', '{"a":1,"\\u0061":2}']) assert.throws(() => parse(content), /重复/);
+  assert.throws(() => parse('{"x":' + '['.repeat(130) + '0' + ']'.repeat(130) + '}'), /嵌套/);
+  assert.throws(() => parse('{"x":1e999}'), /有限值/);
+});
+
+test("final serialized size is checked using UTF-8 bytes", () => {
+  const document = parse('{"text":""}');
+  assert.throws(() => serialize(document, edits([["text"], "中".repeat(400000)])), /1 MiB/);
+});

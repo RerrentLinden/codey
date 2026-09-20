@@ -503,13 +503,34 @@ if (import.meta.env.DEV) {
     });
 
     const pluginPreviewMode = new URLSearchParams(window.location.search).get("plugins");
-    const previewPlugins = ["installed", "config-error", "config-invalid", "config-conflict"].includes(pluginPreviewMode ?? "") ? [{
+    const previewPlugins = ["installed", "config-error", "config-invalid", "config-conflict", "config-values"].includes(pluginPreviewMode ?? "") ? [{
       id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
       description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled", restartRequired: false,
       configPath: "/preview/codey-plugins/installed/dev.codey.header-demo/config.json", capabilities: ["request.beforeSend"],
       pluginDir: "/preview/codey-plugins/installed/dev.codey.header-demo", dataDir: "/preview/codey-plugins/installed/dev.codey.header-demo/data", logDir: "/preview/codey-plugins/installed/dev.codey.header-demo/logs",
     }] : [];
-    let pluginConfigContent = pluginPreviewMode === "config-invalid" ? '{ "value": ' : '{\n  "value": "demo"\n}\n';
+    let pluginConfigContent = pluginPreviewMode === "config-invalid" ? '{ "value": ' : pluginPreviewMode === "config-values" ? JSON.stringify({
+      _comments: {
+        value: "请求头使用的文本。这里只能修改值，字段名和说明保留在配置文件中。",
+        maxAttempts: "每轮最多尝试次数。达到次数或总时限时停止；修改数字后保存，再重新启用插件即可应用。",
+        enabled: "是否启用此项功能。",
+        rules: "按账号类型和模型分别设置参数。每项的说明显示在对应字段上方。",
+        "rules.accountType": "账号类型，例如 pro、plus、go、team。",
+        "rules.model": "本项对应的模型。",
+        "rules.allowedStateLengths": "允许的 state 字节长度；数组中的每个值可单独修改。",
+        notes: "多行文本会保留换行。",
+      },
+      value: "demo",
+      maxAttempts: 10,
+      enabled: true,
+      rules: [
+        { accountType: "pro", model: "gpt6", allowedStateLengths: [292] },
+        { _comments: { model: "本项使用单独的模型说明。" }, accountType: "plus", model: "5.6", allowedStateLengths: [292, 300] },
+      ],
+      notes: "第一行\n第二行",
+      optional: null,
+      empty: [],
+    }, null, 2) + "\n" : '{\n  "_comments": { "value": "请求头的值。" },\n  "value": "demo"\n}\n';
     let activePluginConfigContent: string | null = null;
     const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
     const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
