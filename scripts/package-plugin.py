@@ -6,7 +6,7 @@ import json
 import pathlib
 import platform
 import sys
-from typing import cast
+from typing import Union, cast
 import zipfile
 
 
@@ -44,8 +44,8 @@ except (UnicodeDecodeError, ValueError, RecursionError):
     parser.error("配置模板必须是有效的 UTF-8 JSON")
 if not isinstance(value, dict):
     parser.error("配置模板必须是 JSON 对象")
-pending: list[tuple[dict[str, object] | list[object], str]] = [
-    (cast(dict[str, object] | list[object], value), "$")
+pending: list[tuple[Union[dict[str, object], list[object]], str]] = [
+    (cast(Union[dict[str, object], list[object]], value), "$")
 ]
 while pending:
     current, path = pending.pop()
