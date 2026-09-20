@@ -2,7 +2,7 @@
 // main.tsx via a dynamic import that only exists in Vite dev builds, so this
 // module never ships in the production overlay.
 import type { ProviderStatus, Config, ModelState, OfficialAccount, Profile } from "../App.types";
-import pluginConfigHtml from "../../examples/plugins/header-demo/ui/config.html?raw";
+import { pluginConfigBusinessValuesEqual, validatePluginConfigText } from "../codeyPlugins";
 import {
   AUTO_REVIEW_MODEL,
   includesModelId,
@@ -501,13 +501,15 @@ if (import.meta.env.DEV) {
     });
 
     const pluginPreviewMode = new URLSearchParams(window.location.search).get("plugins");
-    const previewPlugins = ["installed", "html", "html-error"].includes(pluginPreviewMode ?? "") ? [{
+    const previewPlugins = ["installed", "config-error", "config-invalid", "config-conflict"].includes(pluginPreviewMode ?? "") ? [{
       id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
       description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled", restartRequired: false,
-      config: { value: "demo" } as Record<string, unknown>, configSchema: { type: "object", properties: { value: { type: "string", title: "请求头值", minLength: 1 } }, required: ["value"] }, capabilities: ["request.beforeSend"],
+      configPath: "/preview/codey-plugins/installed/dev.codey.header-demo/config.json", capabilities: ["request.beforeSend"],
       pluginDir: "/preview/codey-plugins/installed/dev.codey.header-demo", dataDir: "/preview/codey-plugins/installed/dev.codey.header-demo/data", logDir: "/preview/codey-plugins/installed/dev.codey.header-demo/logs",
-      configUi: pluginPreviewMode?.startsWith("html") ? { type: "html", entry: "ui/config.html", sha256: "preview" } : null,
     }] : [];
+    let pluginConfigContent = pluginPreviewMode === "config-invalid" ? '{ "value": ' : '{\n  "value": "demo"\n}\n';
+    let activePluginConfigContent: string | null = null;
+    const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
@@ -518,11 +520,27 @@ if (import.meta.env.DEV) {
         if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
         return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
-      if (command === "set_codey_plugin_enabled" || command === "configure_codey_plugin") {
+      if (command === "set_codey_plugin_enabled" || command === "save_codey_plugin_config_file") {
         const plugin = previewPlugins.find(item => item.id === args?.pluginId);
         if (!plugin) throw new Error("预览：插件不存在");
-        if (command === "set_codey_plugin_enabled") { plugin.enabled = Boolean(args?.enabled); plugin.status = plugin.enabled ? "enabled" : "disabled"; plugin.restartRequired = false; }
-        else { plugin.config = args?.config as Record<string, unknown>; plugin.restartRequired = plugin.enabled; }
+        if (command === "set_codey_plugin_enabled") {
+          if (args?.enabled) {
+            const invalid = validatePluginConfigText(pluginConfigContent);
+            if (invalid) throw new Error(invalid);
+          }
+          plugin.enabled = Boolean(args?.enabled); plugin.status = plugin.enabled ? "enabled" : "disabled"; plugin.restartRequired = false;
+          activePluginConfigContent = plugin.enabled ? pluginConfigContent : null;
+        }
+        else {
+          const content = args?.content;
+          if (typeof content !== "string") throw new Error("配置内容无效");
+          const invalid = validatePluginConfigText(content);
+          if (invalid) throw new Error(invalid);
+          if (pluginPreviewMode === "config-conflict") pluginConfigContent = '{"value":"external"}\n';
+          if (args?.expectedSha256 !== await configHash(pluginConfigContent)) throw new Error("配置文件已被其他程序修改，请重新加载后再保存。");
+          pluginConfigContent = content;
+          plugin.restartRequired = plugin.enabled && (activePluginConfigContent === null || !pluginConfigBusinessValuesEqual(activePluginConfigContent, content));
+        }
         return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
       if (command === "uninstall_codey_plugin") {
@@ -531,10 +549,11 @@ if (import.meta.env.DEV) {
         return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
       if (command === "select_codey_plugin_package") return null;
-      if (command === "get_codey_plugin_config_ui") {
-        if (pluginPreviewMode === "html-error") throw new Error("预览：插件配置页面校验失败");
+      if (command === "get_codey_plugin_config_file") {
+        if (pluginPreviewMode === "config-error") throw new Error("预览：配置文件暂时无法读取");
         const plugin = previewPlugins.find(item => item.id === args?.pluginId);
-        return plugin?.configUi ? { pluginId: plugin.id, version: plugin.version, html: pluginConfigHtml } : null;
+        if (!plugin) throw new Error("预览：插件不存在");
+        return { pluginId: plugin.id, version: plugin.version, path: plugin.configPath, content: pluginConfigContent, sha256: await configHash(pluginConfigContent) };
       }
 
       if (command === "load_codey_config") {

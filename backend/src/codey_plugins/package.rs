@@ -1,6 +1,5 @@
-use super::{Manifest, schema};
+use super::Manifest;
 use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -10,7 +9,6 @@ use std::{
 };
 
 pub const MAX_PACKAGE: u64 = 64 * 1024 * 1024;
-pub const MAX_CONFIG_UI: u64 = 1024 * 1024;
 const MAX_EXTRACTED: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
@@ -19,12 +17,12 @@ pub struct Inspection {
     pub path: String,
     pub sha256: String,
     pub manifest: Manifest,
-    pub config_schema: Value,
 }
 
 pub struct Package {
     pub inspection: Inspection,
     pub files: BTreeMap<String, Vec<u8>>,
+    pub default_config: String,
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -94,21 +92,8 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             std::env::consts::ARCH
         ));
     }
-    if !safe_relative(&manifest.entry) || !safe_relative(&manifest.config_schema) {
-        return Err("插件入口或配置路径无效".into());
-    }
-    if let Some(ui) = &manifest.config_ui {
-        if ui.kind != "html" || !safe_relative(&ui.entry) {
-            return Err("插件配置页类型或路径无效".into());
-        }
-        if ui.sha256.len() != 64
-            || !ui
-                .sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return Err("configUi.sha256 必须是小写 SHA-256".into());
-        }
+    if !safe_relative(&manifest.entry) {
+        return Err("插件入口路径无效".into());
     }
     let extension = if cfg!(target_os = "windows") {
         "dll"
@@ -234,49 +219,120 @@ pub fn read(path: &Path) -> Result<Package, String> {
     let manifest: Manifest =
         serde_json::from_slice(manifest_bytes).map_err(|e| format!("manifest 无效: {e}"))?;
     validate_manifest(&manifest)?;
-    if let Some(ui) = &manifest.config_ui {
-        validate_config_ui_bytes(ui, files.get(&ui.entry).ok_or("找不到插件配置页")?)?;
-    }
     let library = files.get(&manifest.entry).ok_or("找不到插件入口动态库")?;
     if digest(library) != manifest.library_sha256 {
         return Err("插件动态库 SHA-256 不匹配".into());
     }
-    let config_bytes = files.get(&manifest.config_schema).ok_or("找不到配置定义")?;
-    if config_bytes.len() > 1024 * 1024 {
-        return Err("配置定义过大".into());
-    }
-    let config_schema: Value = serde_json::from_slice(config_bytes).map_err(|e| e.to_string())?;
-    schema::check_schema(&config_schema)?;
-    if config_schema.get("type").and_then(Value::as_str) != Some("object") {
-        return Err("插件根配置必须为 object".into());
-    }
+    let default_config = if manifest
+        .legacy_config_schema
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        == Some(super::CONFIG_FILE)
+    {
+        "{}\n".to_owned()
+    } else if let Some(bytes) = files.get(super::CONFIG_FILE) {
+        let content = std::str::from_utf8(bytes).map_err(|_| "配置文件必须为 UTF-8")?;
+        super::parse_config(content)?;
+        content.to_owned()
+    } else {
+        "{}\n".to_owned()
+    };
     Ok(Package {
         inspection: Inspection {
             path: path.to_string_lossy().into(),
             sha256,
             manifest,
-            config_schema,
         },
         files,
+        default_config,
     })
-}
-
-pub fn validate_config_ui_bytes<'a>(
-    ui: &super::ConfigUi,
-    bytes: &'a [u8],
-) -> Result<&'a str, String> {
-    if bytes.len() as u64 > MAX_CONFIG_UI {
-        return Err("插件配置页超过 1 MiB".into());
-    }
-    if digest(bytes) != ui.sha256 {
-        return Err("插件配置页 SHA-256 不匹配".into());
-    }
-    std::str::from_utf8(bytes).map_err(|_| "插件配置页必须为 UTF-8".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn package_fixture(
+        config: Option<&[u8]>,
+        legacy_schema: Option<&str>,
+    ) -> Result<Package, String> {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.codey-plugin");
+        let mut manifest =
+            serde_json::to_value(super::super::tests::fixture_package().inspection.manifest)
+                .unwrap();
+        manifest["librarySha256"] = digest(b"library").into();
+        if let Some(schema) = legacy_schema {
+            manifest["configSchema"] = schema.into();
+            manifest["configUi"] =
+                serde_json::json!({"type":"html", "entry":"missing.html", "sha256":"ignored"});
+        }
+        let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        let mut entries = vec![
+            (
+                "manifest.json".to_owned(),
+                serde_json::to_vec(&manifest).unwrap(),
+            ),
+            (
+                manifest["entry"].as_str().unwrap().to_owned(),
+                b"library".to_vec(),
+            ),
+        ];
+        if let Some(config) = config {
+            entries.push(("config.json".into(), config.to_vec()));
+        }
+        for (name, bytes) in entries {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(&bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        read(&path)
+    }
+
+    #[test]
+    fn package_defaults_are_fixed_json_text_and_legacy_metadata_is_ignored() {
+        let text = b"{\r\n \"value\": 1\r\n}\r\n";
+        let package = package_fixture(Some(text), None).unwrap();
+        assert_eq!(package.default_config.as_bytes(), text);
+        let legacy = package_fixture(Some(b"not a schema"), Some("config.json")).unwrap();
+        assert_eq!(legacy.default_config.trim(), "{}");
+        let legacy_without_file = package_fixture(None, Some("missing.schema.json")).unwrap();
+        assert_eq!(legacy_without_file.default_config.trim(), "{}");
+        let metadata = serde_json::to_value(legacy.inspection).unwrap();
+        assert!(metadata.get("configSchema").is_none());
+        assert!(metadata["manifest"].get("configSchema").is_none());
+        assert!(metadata["manifest"].get("configUi").is_none());
+        for invalid in [b"[]".as_slice(), b"{broken".as_slice(), &[0xff]] {
+            assert!(package_fixture(Some(invalid), None).is_err());
+        }
+        assert!(
+            package_fixture(
+                Some(&vec![b' '; super::super::MAX_CONFIG_BYTES as usize + 1]),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn package_validates_comments_and_preserves_the_default_text() {
+        let text = "{\r\n  \"_comments\": {\"value\": \"说明\"},\r\n  \"value\": 1, \"rules\": [{\"_comments\": {}}]\r\n}\r\n";
+        let package = package_fixture(Some(text.as_bytes()), None).unwrap();
+        assert_eq!(package.default_config, text);
+        assert_eq!(package.files["config.json"], text.as_bytes());
+        for invalid in [
+            r#"{"_comments":[]}"#,
+            r#"{"rules":[{"_comments":{"model":false}}]}"#,
+        ] {
+            let error = package_fixture(Some(invalid.as_bytes()), None)
+                .err()
+                .unwrap();
+            assert!(error.contains("_comments"), "{error}");
+        }
+    }
+
     #[test]
     fn reject_traversal_and_platform_path_aliases() {
         for path in [
