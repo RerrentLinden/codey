@@ -287,33 +287,116 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
 }
 
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {
+    // 应用版本与平台包版本独立，不能从安装目录名或 build 编号推导。
     if app_dir.extension() == Some(OsStr::new("app")) {
-        return macos_app_version(app_dir);
+        return macos_app_version(app_dir)
+            .or_else(|| codex_resources_app_version(&app_dir.join("Contents").join("Resources")));
     }
-    let package_dir = if app_dir
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("app"))
-    {
-        app_dir.parent()?
-    } else {
-        app_dir
-    };
-    codex_package_version(package_dir)
-        .or_else(|| codex_directory_version(package_dir))
-        .or_else(|| codex_directory_version(app_dir))
-        .or_else(|| codex_version_file(package_dir))
-        .or_else(|| codex_version_file(app_dir))
+
+    codex_resources_app_version(&app_dir.join("resources"))
+        .or_else(|| codex_resources_app_version(&app_dir.join("app").join("resources")))
         .or_else(|| codex_executable_product_version(app_dir))
+}
+
+const MAX_ASAR_HEADER_BYTES: u32 = 16 * 1024 * 1024;
+const MAX_APP_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
+
+fn codex_resources_app_version(resources_dir: &Path) -> Option<String> {
+    asar_app_version(&resources_dir.join("app.asar"))
+        .or_else(|| app_package_json_version(&resources_dir.join("app").join("package.json")))
+}
+
+fn app_package_json_version(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut contents = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_APP_PACKAGE_JSON_BYTES + 1)
+        .read_to_end(&mut contents)
+        .ok()?;
+    package_json_version(&contents)
+}
+
+fn package_json_version(contents: &[u8]) -> Option<String> {
+    if contents.len() as u64 > MAX_APP_PACKAGE_JSON_BYTES {
+        return None;
+    }
+    let package: serde_json::Value = serde_json::from_slice(contents).ok()?;
+    normalize_version_value(package.get("version")?.as_str()?)
+}
+
+fn asar_app_version(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // 只解析根 package.json 的索引，其余文件条目由反序列化器跳过。
+    #[derive(serde::Deserialize)]
+    struct Header {
+        files: RootFiles,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RootFiles {
+        #[serde(rename = "package.json")]
+        package: PackageEntry,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PackageEntry {
+        size: u64,
+        offset: Option<String>,
+        #[serde(default)]
+        unpacked: bool,
+    }
+
+    let mut archive = std::fs::File::open(path).ok()?;
+    let archive_size = archive.metadata().ok()?.len();
+    let mut prefix = [0u8; 16];
+    archive.read_exact(&mut prefix).ok()?;
+    let size_pickle_length = u32::from_le_bytes(prefix[0..4].try_into().ok()?);
+    let header_size = u32::from_le_bytes(prefix[4..8].try_into().ok()?);
+    let payload_size = u32::from_le_bytes(prefix[8..12].try_into().ok()?);
+    let json_size = u32::from_le_bytes(prefix[12..16].try_into().ok()?);
+    if size_pickle_length != 4
+        || header_size.checked_sub(4)? != payload_size
+        || !(8..=MAX_ASAR_HEADER_BYTES).contains(&header_size)
+        || json_size == 0
+        || json_size > header_size - 8
+        || header_size - 8 - json_size > 3
+    {
+        return None;
+    }
+    let data_start = 8 + u64::from(header_size);
+    if data_start > archive_size {
+        return None;
+    }
+    let mut header_json = vec![0u8; json_size as usize];
+    archive.read_exact(&mut header_json).ok()?;
+    let header: Header = serde_json::from_slice(&header_json).ok()?;
+    let package = header.files.package;
+    if package.size > MAX_APP_PACKAGE_JSON_BYTES {
+        return None;
+    }
+    if package.unpacked {
+        return app_package_json_version(
+            &path.with_extension("asar.unpacked").join("package.json"),
+        );
+    }
+
+    let offset = package.offset?.parse::<u64>().ok()?;
+    let start = data_start.checked_add(offset)?;
+    if start.checked_add(package.size)? > archive_size {
+        return None;
+    }
+    archive.seek(SeekFrom::Start(start)).ok()?;
+    let mut contents = vec![0u8; package.size as usize];
+    archive.read_exact(&mut contents).ok()?;
+    package_json_version(&contents)
 }
 
 #[cfg(windows)]
 fn codex_executable_product_version(app_dir: &Path) -> Option<String> {
-    use std::ffi::c_void;
-    use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FFI_SIGNATURE, VS_FIXEDFILEINFO,
-        VerQueryValueW,
-    };
+    use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW};
     use windows::core::PCWSTR;
 
     let executable = build_codex_executable(app_dir);
@@ -356,29 +439,7 @@ fn codex_executable_product_version(app_dir: &Path) -> Option<String> {
         }
     }
 
-    let mut fixed_info = std::ptr::null_mut::<c_void>();
-    let mut fixed_info_len = 0u32;
-    let root = ['\\' as u16, 0];
-    if !unsafe {
-        VerQueryValueW(
-            info.as_ptr().cast(),
-            PCWSTR(root.as_ptr()),
-            &mut fixed_info,
-            &mut fixed_info_len,
-        )
-    }
-    .as_bool()
-        || fixed_info.is_null()
-        || fixed_info_len < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
-    {
-        return None;
-    }
-
-    let fixed_info = unsafe { fixed_info.cast::<VS_FIXEDFILEINFO>().read_unaligned() };
-    if fixed_info.dwSignature != VS_FFI_SIGNATURE as u32 {
-        return None;
-    }
-    fixed_windows_product_version(&fixed_info)
+    None
 }
 
 #[cfg(windows)]
@@ -459,41 +520,19 @@ fn query_windows_version_string(info: &[u8], sub_block: &str) -> Option<String> 
         .and_then(|value| normalize_version_value(&value))
 }
 
-#[cfg(windows)]
-fn fixed_windows_product_version(
-    info: &windows::Win32::Storage::FileSystem::VS_FIXEDFILEINFO,
-) -> Option<String> {
-    let (version_ms, version_ls) = if info.dwProductVersionMS != 0 || info.dwProductVersionLS != 0 {
-        (info.dwProductVersionMS, info.dwProductVersionLS)
-    } else {
-        (info.dwFileVersionMS, info.dwFileVersionLS)
-    };
-    let mut parts = vec![
-        version_ms >> 16,
-        version_ms & 0xffff,
-        version_ls >> 16,
-        version_ls & 0xffff,
-    ];
-    while parts.len() > 2 && parts.last() == Some(&0) {
-        parts.pop();
-    }
-    let version = parts
-        .into_iter()
-        .map(|part| part.to_string())
-        .collect::<Vec<_>>()
-        .join(".");
-    normalize_version_value(&version)
-}
-
 #[cfg(not(windows))]
 fn codex_executable_product_version(_app_dir: &Path) -> Option<String> {
     None
 }
 
-#[cfg(any(windows, test))]
 fn normalize_version_value(value: &str) -> Option<String> {
     let value = value.trim().trim_start_matches(['v', 'V']);
-    is_version_like(value).then(|| value.to_string())
+    let parts = value.split('.').collect::<Vec<_>>();
+    (parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|ch| ch.is_ascii_digit())))
+    .then(|| value.to_string())
 }
 
 /// 内置 CLI 的候选位置。Codex 更新改动过文件名与目录层级，所以按已知命名逐个
@@ -555,69 +594,9 @@ fn package_name_from_app_dir(app_dir: &Path) -> Option<String> {
     Some(package_name.to_string())
 }
 
-fn codex_package_version(package_dir: &Path) -> Option<String> {
-    let path = package_dir.to_string_lossy().replace('\\', "/");
-    let name = path
-        .split('/')
-        .rev()
-        .find(|part| codex_package_parts(part).is_some())?;
-    let (_, version, _) = codex_package_parts(name)?;
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
-    }
-}
-
-fn codex_directory_version(app_dir: &Path) -> Option<String> {
-    directory_version(app_dir).or_else(|| {
-        app_dir
-            .canonicalize()
-            .ok()
-            .and_then(|path| directory_version(&path))
-    })
-}
-
-fn directory_version(path: &Path) -> Option<String> {
-    let version = path.file_name()?.to_str()?;
-    if is_version_like(version) {
-        Some(version.to_string())
-    } else {
-        None
-    }
-}
-
-fn is_version_like(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    if first.is_empty() || !first.chars().all(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    let mut count = 1;
-    for part in parts {
-        if part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()) {
-            return false;
-        }
-        count += 1;
-    }
-    count >= 2
-}
-
-fn codex_version_file(app_dir: &Path) -> Option<String> {
-    let version = std::fs::read_to_string(app_dir.join("version")).ok()?;
-    let version = version.trim();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
-    }
-}
-
 fn macos_app_version(app_dir: &Path) -> Option<String> {
     macos_app_plist_value(app_dir, "CFBundleShortVersionString")
-        .or_else(|| macos_app_plist_value(app_dir, "CFBundleVersion"))
+        .and_then(|version| normalize_version_value(&version))
 }
 
 fn macos_app_plist_value(app_dir: &Path, key: &str) -> Option<String> {
@@ -816,11 +795,171 @@ mod tests {
 
     #[test]
     fn product_version_normalization_accepts_desktop_version_format() {
+        for (raw, expected) in [
+            ("  v26.803.81509  ", "26.803.81509"),
+            ("V26.915.31945", "26.915.31945"),
+            ("26.903.0", "26.903.0"),
+        ] {
+            assert_eq!(normalize_version_value(raw).as_deref(), Some(expected));
+        }
+        for raw in [
+            "26.915.4065.0",
+            "26.903",
+            "9922",
+            "Codex 26.803.81509",
+            "26..1",
+        ] {
+            assert_eq!(normalize_version_value(raw), None, "{raw}");
+        }
+    }
+
+    fn test_asar(package_entry: serde_json::Value, data: &[u8]) -> Vec<u8> {
+        let header = serde_json::to_vec(&serde_json::json!({
+            "files": { "package.json": package_entry }
+        }))
+        .unwrap();
+        let padded_size = (header.len() + 3) & !3;
+        let header_size = padded_size + 8;
+        let mut bytes = Vec::new();
+        for value in [
+            4,
+            header_size as u32,
+            header_size as u32 - 4,
+            header.len() as u32,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&header);
+        bytes.resize(8 + header_size, 0);
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    fn write_app_asar(resources: &Path, version: &str) {
+        let package = serde_json::to_vec(&serde_json::json!({
+            "name": "openai-codex-electron",
+            "version": version,
+            "codexBuildNumber": "9922"
+        }))
+        .unwrap();
+        let mut data = b"other file".to_vec();
+        let entry = serde_json::json!({ "size": package.len(), "offset": data.len().to_string() });
+        data.extend_from_slice(&package);
+        std::fs::create_dir_all(resources).unwrap();
+        std::fs::write(resources.join("app.asar"), test_asar(entry, &data)).unwrap();
+    }
+
+    #[test]
+    fn app_version_uses_application_metadata_instead_of_windows_package_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp
+            .path()
+            .join("OpenAI.Codex_26.915.4065.0_x64__publisher");
+        let app_dir = package.join("app");
+        write_app_asar(&app_dir.join("resources"), "26.915.31945");
+        for path in [&package, &app_dir] {
+            assert_eq!(codex_app_version(path).as_deref(), Some("26.915.31945"));
+        }
+        assert_eq!(version_tuple(&package), Some(vec![26, 915, 4065, 0]));
+
+        let standalone = temp.path().join("Codex");
+        write_app_asar(&standalone.join("resources"), "26.915.31945");
         assert_eq!(
-            normalize_version_value("  v26.803.81509  ").as_deref(),
-            Some("26.803.81509")
+            codex_app_version(&standalone).as_deref(),
+            Some("26.915.31945")
         );
-        assert_eq!(normalize_version_value("Codex 26.803.81509"), None);
+    }
+
+    #[test]
+    fn app_version_does_not_use_package_directory_or_component_version_file() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "OpenAI.Codex_26.915.4065.0_x64__publisher",
+            "26.915.4065.0",
+            "26.915.4065",
+        ] {
+            let directory = temp.path().join(name);
+            let app_dir = directory.join("app");
+            std::fs::create_dir_all(&app_dir).unwrap();
+            std::fs::write(directory.join("version"), "26.915.4065.0").unwrap();
+            std::fs::write(app_dir.join("version"), "40.0.0").unwrap();
+            assert_eq!(codex_app_version(&directory), None);
+            assert_eq!(codex_app_version(&app_dir), None);
+        }
+    }
+
+    #[test]
+    fn macos_app_version_uses_short_version_and_asar_instead_of_build_number() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("Codex.app");
+        let contents = bundle.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        assert_eq!(codex_app_version(&bundle), None);
+
+        let plist = contents.join("Info.plist");
+        std::fs::write(&plist, "<key>CFBundleVersion</key><string>9922</string>").unwrap();
+        assert_eq!(codex_app_version(&bundle), None);
+        write_app_asar(&contents.join("Resources"), "26.915.31945");
+        assert_eq!(codex_app_version(&bundle).as_deref(), Some("26.915.31945"));
+        std::fs::write(&plist, "<key>CFBundleShortVersionString</key><string>26.908.70816</string><key>CFBundleVersion</key><string>9275</string>").unwrap();
+        assert_eq!(codex_app_version(&bundle).as_deref(), Some("26.908.70816"));
+    }
+
+    #[test]
+    fn app_version_reads_unpacked_package_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let resources = temp.path().join("resources");
+        let app = resources.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"version":"26.908.70816"}"#).unwrap();
+        assert_eq!(
+            codex_app_version(temp.path()).as_deref(),
+            Some("26.908.70816")
+        );
+
+        let package = br#"{"version":"26.915.31945","codexBuildNumber":"9922"}"#;
+        let unpacked = resources.join("app.asar.unpacked");
+        std::fs::create_dir_all(&unpacked).unwrap();
+        std::fs::write(unpacked.join("package.json"), package).unwrap();
+        let entry = serde_json::json!({ "size": package.len(), "unpacked": true });
+        std::fs::write(resources.join("app.asar"), test_asar(entry, &[])).unwrap();
+        assert_eq!(
+            codex_app_version(temp.path()).as_deref(),
+            Some("26.915.31945")
+        );
+    }
+
+    #[test]
+    fn asar_app_version_rejects_invalid_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("app.asar");
+        let package = br#"{"version":"26.915.31945"}"#;
+        for entry in [
+            serde_json::json!({ "size": package.len(), "offset": u64::MAX.to_string() }),
+            serde_json::json!({ "size": MAX_APP_PACKAGE_JSON_BYTES + 1, "offset": "0" }),
+            serde_json::json!({ "size": package.len() + 1, "offset": "0" }),
+            serde_json::json!({ "size": package.len(), "offset": "invalid" }),
+        ] {
+            std::fs::write(&archive, test_asar(entry, package)).unwrap();
+            assert_eq!(asar_app_version(&archive), None);
+        }
+
+        let entry = serde_json::json!({ "size": package.len(), "offset": "0" });
+        let valid = test_asar(entry, package);
+        let mut oversized = valid.clone();
+        oversized[4..8].copy_from_slice(&(MAX_ASAR_HEADER_BYTES + 1).to_le_bytes());
+        oversized[8..12].copy_from_slice(&(MAX_ASAR_HEADER_BYTES - 3).to_le_bytes());
+        for bytes in [
+            vec![],
+            valid[..15].to_vec(),
+            valid[..valid.len() - 1].to_vec(),
+            oversized,
+        ] {
+            std::fs::write(&archive, bytes).unwrap();
+            assert_eq!(asar_app_version(&archive), None);
+        }
+        write_app_asar(temp.path(), "26.915.4065.0");
+        assert_eq!(asar_app_version(&archive), None);
     }
 
     #[test]
