@@ -1426,3 +1426,108 @@ fn dependency_declarations_are_explicit_and_invalid_declarations_remain_visible(
     let id = invalid["skills"][0]["id"].clone();
     assert!(f.mutate(json!({"action":"save_skill","id":id,"content":fs::read_to_string(f.source.join("SKILL.md")).unwrap()})).is_err());
 }
+
+#[test]
+fn skill_names_stay_unique_across_scope_roots_and_renames() {
+    let f = Fixture::new("");
+    // 目录名与目标目录不同、但 name 相同的既有 Skill 同样算冲突。
+    let external = f.home.parent().unwrap().join(".agents/skills/other-dir");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(
+        external.join("SKILL.md"),
+        "---\nname: demo\ndescription: external copy\n---\n# External\n",
+    )
+    .unwrap();
+    for request in [
+        json!({"action":"install_skill","sourcePath":f.source}),
+        json!({"action":"create_skill","content":"---\nname: demo\ndescription: created copy\n---\n"}),
+    ] {
+        assert!(
+            f.mutate(request)
+                .unwrap_err()
+                .to_string()
+                .contains("已存在名为 demo")
+        );
+    }
+    f.mutate(json!({"action":"create_skill","content":"---\nname: alpha\ndescription: a\n---\n"}))
+        .unwrap();
+    f.mutate(json!({"action":"create_skill","content":"---\nname: beta\ndescription: b\n---\n"}))
+        .unwrap();
+    let id = f.list()["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "beta")
+        .unwrap()["id"]
+        .clone();
+    // 改名撞上同范围其他 Skill 要拒绝；名称不变时保存照常。
+    assert!(
+        f.mutate(
+            json!({"action":"save_skill","id":id,"content":"---\nname: alpha\ndescription: b\n---\n"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("已存在名为 alpha")
+    );
+    f.mutate(
+        json!({"action":"save_skill","id":id,"content":"---\nname: beta\ndescription: b2\n---\n"}),
+    )
+    .unwrap();
+    let listed = f.list();
+    let skills = listed["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 3);
+    assert_eq!(skills.iter().filter(|entry| entry["name"] == "beta").count(), 1);
+}
+
+#[test]
+fn builtin_skills_do_not_block_installing_a_user_skill() {
+    let f = Fixture::new("");
+    let builtin = f.home.join("skills/.system/system");
+    fs::create_dir_all(&builtin).unwrap();
+    fs::write(
+        builtin.join("SKILL.md"),
+        "---\nname: demo\ndescription: builtin copy\n---\n# Builtin\n",
+    )
+    .unwrap();
+    // 系统内置资源用户无法改名或卸载，不能因此挡住自己的 Skill。
+    f.mutate(json!({"action":"install_skill","sourcePath":f.source}))
+        .unwrap();
+    let listed = f.list();
+    let ownership: Vec<_> = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap().to_owned(),
+                entry["ownership"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(ownership.contains(&("demo".to_owned(), "builtin".to_owned())));
+    assert!(ownership.contains(&("demo".to_owned(), "managed".to_owned())));
+}
+
+#[test]
+fn external_skills_report_their_directory_instead_of_a_scope_token() {
+    let f = Fixture::new("");
+    let external = f.home.parent().unwrap().join(".agents/skills/demo");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(
+        external.join("SKILL.md"),
+        "---\nname: demo\ndescription: external copy\n---\n# External\n",
+    )
+    .unwrap();
+    let listed = f.list();
+    let entry = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["ownership"] == "external")
+        .unwrap()
+        .clone();
+    let expected = external.to_string_lossy().into_owned();
+    // 外部安装没有托管记录：来源留空，由界面回退显示实际目录路径。
+    assert_eq!(entry["origin"].as_str(), Some(""));
+    assert_eq!(entry["sourcePath"].as_str(), Some(expected.as_str()));
+}

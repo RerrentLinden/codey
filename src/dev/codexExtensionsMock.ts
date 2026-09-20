@@ -162,7 +162,10 @@ export function createCodexExtensionsPreview(platform: string) {
         entry.canEdit =
           !entry.readOnly &&
           (!("ownership" in entry) || entry.ownership === "managed");
-        entry.canRemove = entry.canEdit;
+        // 与后端一致：外部安装可以直接删除，系统内置与插件缓存只读。
+        entry.canRemove =
+          !entry.readOnly &&
+          (!("ownership" in entry) || entry.ownership !== "builtin");
       }
       inventory.mcps.forEach((entry) => {
         entry.scope = scope.kind;
@@ -433,8 +436,8 @@ export function createCodexExtensionsPreview(platform: string) {
         state.bodies[id] = String(request.content);
         break;
       case "uninstall_skill":
-        if (skill().readOnly || skill().ownership !== "managed")
-          throw new Error("此 Skill 不可卸载");
+        if (skill().readOnly || skill().canRemove === false)
+          throw new Error("Skill 当前不允许删除，请检查目录或冲突规则");
         state.inventory.skills = state.inventory.skills.filter(
           (item) => item.id !== id,
         );

@@ -270,8 +270,7 @@ export function ExtensionList({
                     busy ||
                     entry.canCheck === false ||
                     (kind === "mcp" &&
-                      (entry.configurationStatus === "invalid" ||
-                        entry.readOnly))
+                      entry.configurationStatus === "invalid")
                   }
                   onClick={() => onAction("check", entry)}
                 >

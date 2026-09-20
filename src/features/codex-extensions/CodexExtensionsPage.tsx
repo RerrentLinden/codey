@@ -228,7 +228,9 @@ export function CodexExtensionsPage({
       description:
         kind === "mcp"
           ? "将移除该服务的配置注册并自动刷新 Codex，不删除外部程序。移除后如需再次使用，请重新导入配置。"
-          : "将删除这份 Codey 托管安装及其本地文件，保留原始来源。卸载后如需再次使用，请重新安装。若文件已被外部修改，后端可能拒绝卸载。",
+          : "ownership" in entry && entry.ownership === "external"
+            ? "将直接删除该外部安装目录及其全部资源文件，不经过 Codey 托管记录，删除后无法从本页恢复。目录内容无法完整校验时会拒绝删除。"
+            : "将删除这份 Codey 托管安装及其本地文件，保留原始来源。卸载后如需再次使用，请重新安装。若文件已被外部修改，后端可能拒绝卸载。",
       destructive: true,
       action: {
         action: kind === "mcp" ? "remove_mcp" : "uninstall_skill",
@@ -270,7 +272,7 @@ export function CodexExtensionsPage({
       setConfirmation({
         title: "保存 MCP 配置",
         description:
-          "这份配置可能被 Codex 加载。请确认信任修改后的程序或远程地址。",
+          "保存后会立即刷新到 Codex 并生效，无需重启；草稿未显式禁用的服务会被启用。请确认信任修改后的程序或远程地址。",
         action: { ...action, revision: draft.revision, confirmed: true },
       });
       return;

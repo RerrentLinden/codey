@@ -155,3 +155,39 @@ test("提交失败返回 failed 并保留错误，单飞与不确定状态仍然
   controller.run({ action: "get_mcp", id: "demo" });
   assert.equal(h.writes.length, 2, "只读操作不受不确定状态阻塞");
 });
+
+test("保存提示按 applyStatus 区分，重启提示不重复后端消息", async () => {
+  const h = createHarness();
+  let controller = h.render();
+  h.reads[0].resolve({ revision: "r1" });
+  await settle();
+  controller = h.render();
+
+  const saving = controller.mutate({ action: "save_skill" });
+  h.writes[0].resolve({
+    inventory: { revision: "r2" },
+    applyStatus: "restart-required",
+    message: "配置已保存。",
+  });
+  assert.equal(await saving, "ok");
+  controller = h.render();
+  assert.equal(
+    controller.notice,
+    "配置已保存，请重启 Codex 后确认生效；运行时覆盖可能影响最终状态。",
+  );
+
+  // 自动刷新成功的状态直接使用后端说明，不追加重启提示。
+  const applying = controller.mutate({ action: "save_mcp" });
+  controller = h.render();
+  h.writes[1].resolve({
+    inventory: { revision: "r3" },
+    applyStatus: "applied",
+    message: "MCP 配置已保存并通知 Codex 重新加载，无需重启。",
+  });
+  assert.equal(await applying, "ok");
+  controller = h.render();
+  assert.equal(
+    controller.notice,
+    "MCP 配置已保存并通知 Codex 重新加载，无需重启。",
+  );
+});

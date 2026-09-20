@@ -195,3 +195,23 @@ test("preview scenarios cover empty, large, permission, offline and conflict", a
     /其他程序修改/,
   );
 });
+test("external skills can be removed while builtin and cached ones stay read-only", async () => {
+  const request = preview(),
+    initial = await request({ action: "list" });
+  const external = initial.skills.find(
+    (entry) => entry.ownership === "external",
+  );
+  const builtin = initial.skills.find((entry) => entry.ownership === "builtin");
+  assert.equal(external.canRemove, true);
+  assert.equal(builtin.canRemove, false);
+  const removed = await request({
+    action: "uninstall_skill",
+    id: external.id,
+    revision: initial.revision,
+    confirmed: true,
+  });
+  assert.equal(
+    removed.inventory.skills.some((entry) => entry.id === external.id),
+    false,
+  );
+});

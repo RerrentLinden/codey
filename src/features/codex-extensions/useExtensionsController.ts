@@ -164,8 +164,11 @@ export function useExtensionsController(
     async (action: Record<string, unknown>) => {
       const outcome = await run<MutationResult>(action, (result) => {
         setInventory(result.inventory);
+        // 后端 message 已说明保存结果，这里只在仍需重启时补充生效方式，避免同一句提示重复两遍。
         setNotice(
-          `${result.message}${result.applyStatus === "restart-required" ? " 配置已保存，请重启 Codex 后确认生效；运行时覆盖可能影响最终状态。" : ""}`,
+          result.applyStatus === "restart-required"
+            ? "配置已保存，请重启 Codex 后确认生效；运行时覆盖可能影响最终状态。"
+            : result.message,
         );
       });
       // 提交已落库但清单结果被抢占：不能静默丢弃，提示用户刷新确认。

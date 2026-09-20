@@ -100,7 +100,7 @@ pub fn entries(
         let effective_scope = if is_system { "system" } else { scope };
         let version = if error.is_none() { cache.read(&manifest).ok().flatten().and_then(manifest_version) } else { None };
         let (dependencies, dependency_warnings) = dependencies(path, cache);
-        let mut entry = json!({"id":id(&manifest),"name":name,"description":description,"enabled":!disabled.contains(&manifest),"enabledKnown":!readonly,"sourcePath":path,"manifestPath":manifest,"scope":effective_scope,"ownership":ownership,"origin":registry.get(path).map(|m|m.source.as_str()).unwrap_or(scope),"readOnly":readonly,"updatedAt":fsutil::updated_at(&manifest),"configurationStatus":if error.is_none(){"valid"}else{"invalid"},"version":version,"dependencies":dependencies,"dependencyWarnings":dependency_warnings,"canEdit":!readonly && ownership == "managed" && fsutil::writable(&manifest),"canToggle":!readonly,"canRemove":!readonly && path != root && fsutil::writable(path),"canCheck":true});
+        let mut entry = json!({"id":id(&manifest),"name":name,"description":description,"enabled":!disabled.contains(&manifest),"enabledKnown":!readonly,"sourcePath":path,"manifestPath":manifest,"scope":effective_scope,"ownership":ownership,"origin":registry.get(path).map(|m|m.source.as_str()).unwrap_or(""),"readOnly":readonly,"updatedAt":fsutil::updated_at(&manifest),"configurationStatus":if error.is_none(){"valid"}else{"invalid"},"version":version,"dependencies":dependencies,"dependencyWarnings":dependency_warnings,"canEdit":!readonly && ownership == "managed" && fsutil::writable(&manifest),"canToggle":!readonly,"canRemove":!readonly && path != root && fsutil::writable(path),"canCheck":true});
         if readonly { entry["reason"] = json!(if scope == "plugin" { "插件缓存资源，仅展示，不代表当前会话已加载" } else { "Codex 系统资源不可修改" }); }
         if let Some(error) = error { entry["error"] = json!(error); }
         entry
@@ -122,6 +122,22 @@ fn manifest_version(bytes: &[u8]) -> Option<String> {
         .as_str()
         .map(str::to_owned)
         .or_else(|| version.as_number().map(ToString::to_string))
+}
+
+/// 列出一个根目录下所有可解析 Skill 的名称与清单路径，用于同范围重名检查。
+/// 无法解析的元数据直接跳过：它们已在清单里单独报告，不参与重名判断。
+pub fn named_manifests(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut warnings = Vec::new();
+    let mut cache = fsutil::ReadCache::default();
+    discover(root, &mut warnings)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "SKILL.md"))
+        .filter_map(|manifest| {
+            let bytes = cache.read(&manifest).ok().flatten()?;
+            let (name, _) = metadata(bytes).ok()?;
+            Some((name, manifest))
+        })
+        .collect()
 }
 
 pub fn external_removal_files(path: &Path) -> Result<Vec<PathBuf>> {

@@ -69,6 +69,38 @@ impl ExtensionService {
         skill_config::disabled(&doc)
     }
 
+    fn skill_roots(&self, scope: &Scope) -> Vec<PathBuf> {
+        match scope {
+            Scope::User => vec![
+                self.user_home.join(".agents/skills"),
+                self.codex_home.join("skills"),
+            ],
+            Scope::Project { project_path } => vec![
+                project_path.join(".agents/skills"),
+                project_path.join(".codex/skills"),
+            ],
+        }
+    }
+
+    /// Codex 按 SKILL.md 的名称加载，同范围重名会让实际生效项不确定，
+    /// 因此安装、创建和改名都要确认名称在整个作用域内唯一。
+    fn ensure_name_available(&self, scope: &Scope, name: &str, target: &Path) -> Result<()> {
+        for root in self.skill_roots(scope) {
+            for (existing, manifest) in skills::named_manifests(&root) {
+                // 系统内置资源由 Codex 提供，用户无法改名或卸载，不能因此挡住自己的 Skill。
+                if manifest.components().any(|c| c.as_os_str() == ".system") {
+                    continue;
+                }
+                ensure!(
+                    existing != name || manifest == target,
+                    "当前范围已存在名为 {name} 的 Skill（{}）；请先重命名或卸载后再试",
+                    manifest.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn inventory(&self, scope: &Scope) -> Result<Value> {
         let config_path = self.config_path(scope)?;
         let mut cache = fsutil::ReadCache::default();
@@ -554,12 +586,13 @@ impl ExtensionService {
                 }
                 if action == "save_skill" {
                     let content = Self::required(&request, "content")?.as_bytes().to_vec();
-                    skills::metadata(&content)?;
+                    let (name, _) = skills::metadata(&content)?;
                     ensure!(
                         content.len() as u64 <= fsutil::MAX_FILE,
                         "Skill 文件超过大小限制"
                     );
                     let target = path.join("SKILL.md");
+                    self.ensure_name_available(&scope, &name, &target)?;
                     managed
                         .files
                         .insert(target.clone(), fsutil::digest(&content));
@@ -620,6 +653,7 @@ impl ExtensionService {
                     "Skill 目标或启停配置目录不可写"
                 );
                 ensure!(!target.exists(), "安装目标已存在，请先解决同名目录冲突");
+                self.ensure_name_available(&scope, &name, &target.join("SKILL.md"))?;
                 // 禁用规则先于 SKILL.md 落盘，避免正在运行的 Codex 提前发现并启用。
                 let user_config = self.codex_home.join("config.toml");
                 let mut doc = mcp::parse(fsutil::read(&user_config)?.as_deref())?;
