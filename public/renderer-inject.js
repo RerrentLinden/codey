@@ -372,6 +372,7 @@
   };
 
   const normalizeAppServerUsageWindow = (window) => {
+    if (typeof window?.usedPercent !== "number" || typeof window?.windowDurationMins !== "number") return null;
     const usedPercent = Number(window?.usedPercent);
     const windowMinutes = Number(window?.windowDurationMins);
     if (!Number.isFinite(usedPercent) || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
@@ -389,11 +390,12 @@
   };
 
   const normalizeAppServerAccountUsage = (response) => {
+    const unavailable = { status: "unavailable", code: "codex_usage_incompatible", message: "当前 Codex 暂时无法提供额度信息" };
     const payload = response?.result && typeof response.result === "object"
       ? response.result
       : response;
     if (!payload || typeof payload !== "object") {
-      throw new Error("Codex 官方额度响应格式无效");
+      return unavailable;
     }
     // 账号摘要只读取通用额度，不能合并模型专属的 rateLimitsByLimitId。
     const buckets = [];
@@ -412,9 +414,15 @@
     const secondary = primary === windowsByKind.get("weekly")
       ? windowsByKind.get("five-hour") || null
       : windowsByKind.get("weekly") || null;
-    const credits = buckets.find((bucket) => bucket.credits)?.credits || payload.credits || null;
+    const rawCredits = buckets.find((bucket) => bucket.credits)?.credits || payload.credits || null;
+    const credits = rawCredits && typeof rawCredits === "object"
+      && (rawCredits.unlimited === true || (rawCredits.hasCredits === true
+        && (typeof rawCredits.balance === "number"
+          || (typeof rawCredits.balance === "string" && rawCredits.balance.trim() !== ""))
+        && Number.isFinite(Number(rawCredits.balance))))
+      ? rawCredits : null;
     if (!primary && !secondary && !credits) {
-      throw new Error("Codex 官方额度响应中没有可展示的信息");
+      return unavailable;
     }
     const planType = buckets
       .map((bucket) => bucket.planType)
@@ -769,10 +777,11 @@
   const readAccountUsageFromAppServer = async (backendResult) => {
     const loaded = await loadSessionTools();
     if (!loaded || typeof window.__codeyReadAccountRateLimits !== "function") {
-      throw new Error("Codex 官方额度读取接口不可用");
+      return { status: "unavailable", code: "codex_usage_incompatible", message: "当前 Codex 暂时无法提供额度信息" };
     }
     const response = await window.__codeyReadAccountRateLimits();
     const snapshot = normalizeAppServerAccountUsage(response);
+    if (snapshot.status !== "ok") return snapshot;
     // Publish Codex's managed-auth result so the independent log window can reuse it.
     if (Number.isSafeInteger(backendResult?.authGeneration)) {
       const stored = await callBridge("/api/store_official_account_usage", {
@@ -802,7 +811,8 @@
       );
       if (result?.status === "error" || result?.stale) {
         try {
-          result = await withTimeout(readAccountUsageFromAppServer(result), accountUsageTimeoutMs, "读取 Codex 周额度超时");
+          const fallback = await withTimeout(readAccountUsageFromAppServer(result), accountUsageTimeoutMs, "读取 Codex 周额度超时");
+          if (fallback?.status === "ok") result = fallback;
         } catch { /* Keep the backend error when the fallback is unavailable. */ }
       }
       // A dialog query never enables the account display or its polling.
@@ -825,11 +835,12 @@
       );
       if (result?.status === "error" || result?.stale) {
         try {
-          result = await withTimeout(
+          const fallback = await withTimeout(
             readAccountUsageFromAppServer(result),
             accountUsageTimeoutMs,
             "读取 Codex 官方额度超时",
           );
+          if (fallback?.status === "ok") result = fallback;
         } catch {
           // Preserve the original backend error. It is normally more actionable
           // when the current Codex asset does not expose AppServerManager yet.

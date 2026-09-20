@@ -439,7 +439,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   let quotaUsageCalls = 0;
   let quotaUsageResult = accountUsageResult;
   let appServerUsageCalls = 0;
-  const appServerUsageResult = {
+  let appServerUsageResult = {
     rateLimits: {
       limitId: "codex",
       primary: {
@@ -466,6 +466,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     },
   };
   const scheduledDelays = [];
+  let storedUsageSnapshots = 0;
   const window = {
     __codeyReadAccountRateLimits: async () => {
       appServerUsageCalls += 1;
@@ -479,6 +480,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
         return quotaUsageResult;
       }
       if (path === "/api/store_official_account_usage") {
+        storedUsageSnapshots += 1;
         assert.equal(args.authGeneration, 1);
         assert.equal(args.snapshot.primary.usedPercent, 20);
         assert.ok(args.snapshot.fetchedAt > 0);
@@ -661,6 +663,21 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   dispatchWindowEvent({ type: "codey:config-changed" });
   await window.__codeyReadQuotaAccountUsage();
   assert.equal(quotaUsageCalls, 5, "configuration changes invalidate reuse");
+  const storedBeforeDrift = storedUsageSnapshots;
+  for (const changedResponse of [
+    { newRateLimits: { weekly: 20 } },
+    { rateLimits: { primary: { usedPercent: null, windowDurationMins: 10080 } } },
+    { rateLimits: { primary: { usedPercent: "", windowDurationMins: 10080 }, credits: {} } },
+    { status: "unavailable", code: "codey_capability_unavailable" },
+  ]) {
+    appServerUsageResult = changedResponse;
+    quotaUsageResult = { ...first, stale: true, authGeneration: 1 };
+    const result = await window.__codeyReadQuotaAccountUsage();
+    assert.equal(result, quotaUsageResult, "unsupported fallback preserves the backend snapshot");
+    assert.equal(storedUsageSnapshots, storedBeforeDrift, "unknown response never writes a successful snapshot");
+  }
+  quotaUsageResult = { status: "error", message: "offline", authGeneration: 1 };
+  assert.equal(await window.__codeyReadQuotaAccountUsage(), quotaUsageResult, "missing capability does not turn a backend error into success");
 });
 
 const createStartupUpdateFixture = (bridge) => {

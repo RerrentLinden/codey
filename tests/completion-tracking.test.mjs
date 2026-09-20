@@ -400,6 +400,105 @@ test("reconciles when the conversation appears after renderer startup", async ()
   assert.deepEqual(events.map((event) => event.payload.conversationId), ["session-1"]);
 });
 
+test("usage-only manager remains available when deletion and reconciliation are missing", async () => {
+  const requests = [];
+  const runtime = loadInjection({
+    discoveredAppServerManager: { sendRequest(method) { requests.push(method); return { rateLimits: {} }; } },
+    selectedTurnIds: ["turn-1"],
+  });
+  await flushMicrotasks();
+  assert.equal(runtime.window.__codeyPageCapabilities.reconcile.status, "unavailable");
+  assert.ok((await runtime.window.__codeyReadAccountRateLimits()).rateLimits);
+  assert.deepEqual(requests, ["account/rateLimits/read"]);
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+  assert.equal(runtime.alerts.length, 0);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1"]);
+  assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "unavailable");
+});
+
+test("message deletion preflights resume and refresh before releasing or persisting", async () => {
+  for (const missing of ["resumeConversation", "refreshRecentConversations", "discardConversationFromCache"]) {
+    let releases = 0;
+    const manager = {
+      discardConversationFromCache() { releases += 1; },
+      resumeConversation() {},
+      refreshRecentConversations() {},
+      sendRequest() {},
+    };
+    delete manager[missing];
+    const runtime = loadInjection({ discoveredAppServerManager: manager, selectedTurnIds: ["turn-1"] });
+    await flushMicrotasks();
+    await runtime.window.__codeyDeleteSelectedMessages();
+    assert.equal(releases, 0, missing);
+    assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false, missing);
+  }
+});
+
+test("failed discovery backs off independently and recovers when a manager appears", async () => {
+  let imports = 0;
+  // Exercise discovery through an already discoverable manager asset.
+  const manager = { sendRequest() { return { rateLimits: {} }; } };
+  const discovered = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "" });
+  const originalImport = discovered.window.__codeyImportCodexAsset;
+  discovered.window.__codeyImportCodexAsset = async (...args) => { imports += 1; return originalImport(...args); };
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }), { code: "codey_capability_unavailable" });
+  const firstImports = imports;
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
+  assert.equal(imports, firstImports);
+  discovered.advanceTime(1_000);
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
+  assert.ok(imports > firstImports);
+  const secondImports = imports;
+  discovered.advanceTime(1_000);
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
+  assert.equal(imports, secondImports, "second failure waits two seconds");
+  Object.assign(manager, { discardConversationFromCache() {}, resumeConversation() {}, refreshRecentConversations() {} });
+  const controller = await discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  assert.equal(controller.manager, manager);
+  assert.equal(discovered.window.__codeyPageCapabilities.deleteMessages.status, "available");
+  assert.ok((await discovered.window.__codeyReadAccountRateLimits()).rateLimits);
+});
+
+test("timed out discovery cannot later issue a message deletion", async () => {
+  const manager = { discardConversationFromCache() {}, resumeConversation() {}, refreshRecentConversations() {} };
+  const runtime = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "", selectedTurnIds: ["turn-1"] });
+  const originalImport = runtime.window.__codeyImportCodexAsset;
+  let release;
+  runtime.window.__codeyImportCodexAsset = (...args) => new Promise((resolve) => { release = () => resolve(originalImport(...args)); });
+  runtime.setSessionId("session-1");
+  const deletion = runtime.window.__codeyDeleteSelectedMessages();
+  await flushMicrotasks();
+  runtime.flushTimers();
+  await deletion;
+  release();
+  await flushMicrotasks();
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+  assert.equal(runtime.alerts.length, 0);
+});
+
+test("disposed capability discovery cannot replace a new installation's controller or status", async () => {
+  const manager = { sendRequest() { return { rateLimits: {} }; } };
+  const runtime = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "" });
+  const originalImport = runtime.window.__codeyImportCodexAsset;
+  let release;
+  runtime.window.__codeyImportCodexAsset = (...args) => new Promise((resolve) => {
+    release = () => resolve(originalImport(...args));
+  });
+  const pending = runtime.window.__codeyLoadCodexSessionController({ feature: "usage" });
+  await flushMicrotasks();
+  runtime.window.__codeySessionToolsInstall.dispose();
+  const replacement = { kind: "manager", manager: { sendRequest() {} } };
+  const replacementStatus = { usage: { status: "available", message: "" } };
+  runtime.window.__codeyCodexSessionController = replacement;
+  runtime.window.__codeyPageCapabilities = replacementStatus;
+  release();
+  await assert.rejects(pending, { code: "codey_capability_unavailable" });
+  assert.equal(runtime.window.__codeyCodexSessionController, replacement);
+  assert.equal(runtime.window.__codeyPageCapabilities, replacementStatus);
+  assert.equal(replacementStatus.usage.status, "available");
+});
+
 test("rediscovers a patched manager cached before completion reconciliation was available", async () => {
   const managerEvents = [];
   const discoveredAppServerManager = {

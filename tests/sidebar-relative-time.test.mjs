@@ -24,6 +24,7 @@ class FakeElement extends FakeElementCore {
 
 function loadInjection({
   advanceTimeoutClock = false,
+  deferNativeTimeouts = false,
   assetModules = new Map(),
   bridgeHandler,
   entryScriptUrls = [],
@@ -84,6 +85,7 @@ function loadInjection({
     setTimeout: (callback, delayMs = 0) => {
       const timeoutId = nextTimeoutId;
       nextTimeoutId += 1;
+      if (deferNativeTimeouts && delayMs === 5_000) return timeoutId;
       queueMicrotask(() => {
         if (canceledTimeouts.delete(timeoutId)) return;
         if (advanceTimeoutClock) nowMs += Math.max(0, Number(delayMs) || 0);
@@ -1192,6 +1194,7 @@ test("discovers the current app-initial asset and resolves AppServerManager from
   };
   const { window } = loadInjection({
     assetModules: new Map([[appInitialUrl, { arbitraryExport: resolver }]]),
+    deferNativeTimeouts: true,
     entryScriptUrls: [entryUrl],
     fetchHandler: async (url) => ({
       ok: url === entryUrl,

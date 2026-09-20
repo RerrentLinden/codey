@@ -1111,11 +1111,19 @@ pub(crate) fn windows_cli_wrapper_target(app_dir: &std::path::Path) -> Result<Pa
                 codey_runtime_core::app_paths::codex_runtime_executable_missing(app_dir)
             )
         })?;
+    windows_cli_wrapper_target_from_source(app_dir, &target)
+}
+
+#[cfg(any(windows, test))]
+fn windows_cli_wrapper_target_from_source(
+    app_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<PathBuf> {
     if codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir).is_none() {
-        return Ok(target);
+        return Ok(target.to_path_buf());
     }
     let local_app_data = windows_local_app_data(std::env::var_os("LOCALAPPDATA"))?;
-    stage_windows_cli_runtime(&target, &local_app_data)
+    stage_windows_cli_runtime(target, &local_app_data)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1164,21 +1172,25 @@ async fn prepare_cli_wrapper(
     handshake_optional: bool,
 ) -> Result<CliWrapperLaunch> {
     let codey = std::env::current_exe().context("定位 Codey 兼容执行器失败")?;
-    #[cfg(windows)]
-    let target = {
-        let app_dir = app_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || windows_cli_wrapper_target(&app_dir))
-            .await
-            .context("准备 Windows Codex 用户运行文件的任务异常退出")??
-    };
-    #[cfg(target_os = "macos")]
-    let target =
+    let source =
         codey_runtime_core::app_paths::codex_runtime_executable(app_dir).ok_or_else(|| {
             anyhow::anyhow!(
                 "{}",
                 codey_runtime_core::app_paths::codex_runtime_executable_missing(app_dir)
             )
         })?;
+    #[cfg(windows)]
+    let target = {
+        let app_dir = app_dir.to_path_buf();
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || {
+            windows_cli_wrapper_target_from_source(&app_dir, &source)
+        })
+        .await
+        .context("准备 Windows Codex 用户运行文件的任务异常退出")??
+    };
+    #[cfg(target_os = "macos")]
+    let target = source.clone();
     validate_code_mode_host(&target)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1192,6 +1204,10 @@ async fn prepare_cli_wrapper(
         (
             crate::codex_startup_patch::CLI_WRAPPER_TARGET_ENV.to_string(),
             target.to_string_lossy().to_string(),
+        ),
+        (
+            crate::codex_startup_patch::CLI_WRAPPER_SOURCE_ENV.to_string(),
+            source.to_string_lossy().to_string(),
         ),
         (
             crate::codex_startup_patch::CLI_WRAPPER_OVERRIDES_ENV.to_string(),

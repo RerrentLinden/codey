@@ -13,6 +13,12 @@ type CommentScope = { node: TokenNode; descriptions: Map<string, string>; keys: 
 const spans = new WeakMap<PluginConfigDocument, Map<string, TokenNode>>();
 const numberPattern = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 const maxDepth = 128;
+type ConfigValueShape = { kind: PluginConfigEntry["kind"]; children: readonly ConfigValueShape[] };
+
+export function isEditableConfigArray(entry: ConfigValueShape): boolean {
+  return entry.kind === "array" && entry.children.every(child => child.kind !== "object" &&
+    (child.kind !== "array" || isEditableConfigArray(child)));
+}
 
 export function parsePluginConfigDocument(content: string): PluginConfigDocument {
   const error = validatePluginConfigText(content);
@@ -58,6 +64,7 @@ export function parsePluginConfigDocument(content: string): PluginConfigDocument
         whitespace();
       }
       offset++;
+      if (kind === "array" && isEditableConfigArray({ kind, children })) valueText = content.slice(start, offset);
     } else if (first === '"') {
       kind = "string";
       valueText = stringToken();
@@ -99,9 +106,25 @@ export function parsePluginConfigDocument(content: string): PluginConfigDocument
   return document;
 }
 
-export function validatePluginConfigValue(entry: PluginConfigEntry, text: string): string | undefined {
+export function validatePluginConfigValue(entry: ConfigValueShape, text: string): string | undefined {
   switch (entry.kind) {
-    case "object": case "array": return "只能修改配置项的值，不能修改配置结构。";
+    case "object": return "只能修改配置项的值，不能修改对象结构。";
+    case "array": {
+      if (!isEditableConfigArray(entry)) return "包含对象的数组只能逐项修改字段值。";
+      try {
+        const value: unknown = JSON.parse(text);
+        if (!Array.isArray(value)) return "请输入 JSON 数组，例如 [292, 300]。";
+        const pending: unknown[] = [...value];
+        while (pending.length) {
+          const item = pending.pop();
+          if (Array.isArray(item)) {
+            for (const child of item) pending.push(child);
+          } else if (item !== null && typeof item === "object") return "值数组只能包含字符串、数字、布尔值、null 或这些值组成的数组。";
+          else if (typeof item === "number" && !Number.isFinite(item)) return "数组中的数字必须为有限值。";
+        }
+        return undefined;
+      } catch { return "请输入完整的 JSON 数组，例如 [292, 300]；字符串需使用双引号。"; }
+    }
     case "string": return undefined;
     case "number": return numberPattern.test(text) && Number.isFinite(Number(text)) ? undefined : "请输入有效的有限数字。";
     case "boolean": return text === "true" || text === "false" ? undefined : "布尔值只能为 true 或 false。";
@@ -124,17 +147,21 @@ export function serializePluginConfigDocument(document: PluginConfigDocument, ed
   for (const [id, text] of edits) {
     const node = index.get(id);
     if (!node) throw new Error("配置项不存在，无法保存修改。");
-    const entry: PluginConfigEntry = { id, key: String(node.key), path: node.path, kind: node.kind, valueText: node.valueText, children: [] };
-    const error = validatePluginConfigValue(entry, text);
+    const error = validatePluginConfigValue(node, text);
     if (error) throw new Error(`${JSON.stringify(node.path)}：${error}`);
     if (text === node.valueText) continue;
     replacements.push({ start: node.start, end: node.end, text: node.kind === "string" ? JSON.stringify(text) : text });
   }
+  const ordered = replacements.sort((left, right) => right.start - left.start);
+  for (let i = 1; i < ordered.length; i++) {
+    if (ordered[i].end > ordered[i - 1].start) throw new Error("不能同时修改整个数组及其中的元素。");
+  }
   let content = document.content;
-  for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+  for (const replacement of ordered) {
     content = content.slice(0, replacement.start) + replacement.text + content.slice(replacement.end);
   }
   const error = validatePluginConfigText(content);
   if (error) throw new Error(error);
+  parsePluginConfigDocument(content);
   return content;
 }

@@ -226,12 +226,19 @@ test("Codex CLI wrapper environment does not leak into the real CLI", async () =
   const { startupPatch } = await loadSpawnCodexSections();
   assert.match(
     startupPatch,
-    /for name in \[\s*"CODEX_CLI_PATH",\s*CLI_WRAPPER_TARGET_ENV,/,
+    /for name in \[\s*"CODEX_CLI_PATH",\s*CLI_WRAPPER_TARGET_ENV,\s*CLI_WRAPPER_SOURCE_ENV,/,
   );
   assert.match(
     startupPatch,
     /for name in \[[\s\S]*?STARTUP_PATCH_MARKER_ENV,[\s\S]*?"NODE_OPTIONS",/,
   );
+});
+
+test("CLI relay provenance records the discovered source before Windows runtime staging", async () => {
+  const { launcher, startupPatch } = await loadSpawnCodexSections();
+  assert.match(startupPatch, /const CLI_WRAPPER_SOURCE_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_SOURCE"/);
+  assert.match(launcher, /windows_cli_wrapper_target_from_source\(&app_dir, &source\)/);
+  assert.match(launcher, /CLI_WRAPPER_SOURCE_ENV\.to_string\(\),\s*source\.to_string_lossy\(\)\.to_string\(\)/);
 });
 
 test("NODE_OPTIONS require path is preferred when the fuse is on", async () => {

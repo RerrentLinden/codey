@@ -116,9 +116,9 @@ test("saves only changed values with digest and preserves annotations and whites
   const h = dialogHarness(plugin());
   const original = '{ "_comments": { "text": "字段说明" }, "text" : "saved", "rules": [{ "_comments": { "x": "说明" }, "x": 1 }] }\n';
   await load(h, 0, original);
-  assert.equal(field(h, "text").props.value, "saved");
+  assert.equal(field(h, "text").props.value, '"saved"');
   assert.equal(h.find("textarea").length, 0);
-  edit(h, 'draft "quoted"\nline');
+  edit(h, JSON.stringify('draft "quoted"\nline'));
   const save = button(h, "保存配置").props.onClick; save(); save(); h.render();
   assert.equal(h.calls.length, 2);
   assert.deepEqual(h.calls[1].args, { pluginId: "demo", content: original.replace('"saved"', JSON.stringify('draft "quoted"\nline')), expectedSha256: hash });
@@ -134,10 +134,13 @@ test("annotations are non-selectable text above immutable field labels", async (
   const comment = h.find("p").find(node => node.props.children === "说明第一行\n说明第二行");
   assert.deepEqual(comment.props.style, { userSelect: "none", WebkitUserSelect: "none" });
   assert.equal(comment.props.contentEditable, undefined);
+  assert.ok(comment.props.className.includes("text-[11px]"));
+  assert.ok(comment.props.className.includes("text-zinc-500"));
+  assert.ok(comment.props.className.includes("dark:text-zinc-400"));
   const row = h.find("div").find(node => Array.isArray(node.props.children) && node.props.children[0]?.props?.id === comment.props.id);
   assert.ok(row);
   assert.equal(field(h, "text").props["aria-describedby"], comment.props.id);
-  assert.ok(h.find("label").some(node => node.props.children === "text"));
+  assert.ok(h.find("label").some(node => node.props.children === '"text": '));
   assert.ok(field(h, "rules.0.x"));
   assert.equal(h.find("input").length, 2);
   assert.equal(field(h, "_comments.text"), undefined);
@@ -158,9 +161,10 @@ test("scalar validation blocks invalid saves and preserves numeric tokens", asyn
   const h = dialogHarness(plugin()); await load(h, 0, '{"count":9007199254740993,"enabled":true,"optional":null,"multi":"first\\nsecond","empty":[],"object":{}}');
   assert.equal(field(h, "count").props.value, "9007199254740993");
   assert.equal(field(h, "count").props.type, "text");
-  assert.equal(field(h, "enabled").type, "select");
-  assert.equal(field(h, "multi").type, "textarea");
-  assert.equal(h.find("p").filter(n => n.props.children === "无可编辑值").length, 2);
+  assert.equal(field(h, "enabled").type, "input");
+  assert.equal(field(h, "multi").type, "input");
+  assert.equal(field(h, "multi").props.value, JSON.stringify("first\nsecond"));
+  assert.ok(h.find("div").some(n => n.props["aria-label"] === "JSON 配置编辑器"));
   edit(h, "1e", "count");
   assert.equal(button(h, "保存配置").props.disabled, true);
   button(h, "保存配置").props.onClick(); assert.equal(h.calls.length, 1);
@@ -171,7 +175,7 @@ test("scalar validation blocks invalid saves and preserves numeric tokens", asyn
 });
 
 test("dirty close and reload require confirmation and keep drafts", async () => {
-  const h = dialogHarness(plugin()); await load(h); edit(h, "draft");
+  const h = dialogHarness(plugin()); await load(h); edit(h, '"draft"');
   h.find("Dialog")[0].props.onOpenChange(false); h.render();
   assert.equal(h.closed, 0); assert.equal(h.find("section").length, 1);
   button(h, "继续编辑").props.onClick(); h.render();
@@ -186,9 +190,9 @@ test("dirty close and reload require confirmation and keep drafts", async () => 
 test("load errors can retry; save conflicts preserve draft", async () => {
   const h = dialogHarness(plugin()); h.calls[0].reject(new Error("read failed")); await flush(); h.render();
   button(h, "重试读取").props.onClick(); await load(h, 1);
-  edit(h, "draft"); button(h, "保存配置").props.onClick();
+  edit(h, '"draft"'); button(h, "保存配置").props.onClick();
   h.calls[2].reject(new Error("配置文件已被修改")); await flush(); h.render();
-  assert.equal(field(h, "text").props.value, "draft");
+  assert.equal(field(h, "text").props.value, '"draft"');
   assert.equal(h.closed, 0); assert.equal(h.changed.length, 0);
 });
 
@@ -217,7 +221,7 @@ for (const change of [{ version: "2" }, { id: "other" }]) test(`old reads ignore
 });
 
 for (const outcome of ["resolve", "reject"]) test(`old save ${outcome} ignored after version change`, async () => {
-  const h = dialogHarness(plugin()); await load(h); edit(h, "draft"); button(h, "保存配置").props.onClick();
+  const h = dialogHarness(plugin()); await load(h); edit(h, '"draft"'); button(h, "保存配置").props.onClick();
   h.render({ ...plugin(), version: "2" });
   if (outcome === "resolve") h.calls[1].resolve({ plugins: [], platform: "linux", arch: "x86_64" });
   else h.calls[1].reject(new Error("stale"));
@@ -226,16 +230,122 @@ for (const outcome of ["resolve", "reject"]) test(`old save ${outcome} ignored a
 });
 
 test("runtime refresh preserves draft and restored value closes without warning", async () => {
-  const h = dialogHarness(plugin()); await load(h); edit(h, "draft"); h.render({ ...plugin(), enabled: false });
-  assert.equal(h.calls.length, 1); assert.equal(field(h, "text").props.value, "draft");
-  edit(h, "saved"); button(h, "返回插件管理").props.onClick(); assert.equal(h.closed, 1);
+  const h = dialogHarness(plugin()); await load(h); edit(h, '"draft"'); h.render({ ...plugin(), enabled: false });
+  assert.equal(h.calls.length, 1); assert.equal(field(h, "text").props.value, '"draft"');
+  edit(h, '"saved"'); button(h, "返回插件管理").props.onClick(); assert.equal(h.closed, 1);
 });
 
 test("keyboard save uses the latest value before a render", async () => {
   const h = dialogHarness(plugin()); await load(h);
-  field(h, "text").props.onChange({ target: { value: "latest" } });
+  field(h, "text").props.onChange({ target: { value: '"latest"' } });
   let prevented = false;
   h.find("div").find(node => node.props.onKeyDown).props.onKeyDown({ ctrlKey: true, key: "s", preventDefault() { prevented = true; } });
   assert.equal(prevented, true);
   assert.equal(h.calls[1].args.content, text.replace("saved", "latest"));
+});
+
+test("invalid raw string drafts are dirty and block keyboard save until corrected", async () => {
+  for (const token of ['"unfinished', 'true', '"value", "injected": true', '{"injected":true}']) {
+    const h = dialogHarness(plugin()); await load(h);
+    field(h, "text").props.onChange({ target: { value: token } });
+    h.find("div").find(node => node.props.onKeyDown).props.onKeyDown({ ctrlKey: true, key: "s", preventDefault() {} });
+    h.render();
+    assert.equal(h.calls.length, 1);
+    assert.equal(button(h, "保存配置").props.disabled, true);
+    assert.equal(field(h, "text").props["aria-invalid"], true);
+    h.find("Dialog")[0].props.onOpenChange(false); h.render();
+    assert.equal(h.closed, 0); assert.equal(h.find("section").length, 1);
+    button(h, "继续编辑").props.onClick(); h.render();
+    edit(h, '"corrected"');
+    assert.equal(button(h, "保存配置").props.disabled, false);
+    button(h, "保存配置").props.onClick();
+    assert.equal(h.calls[1].args.content, text.replace('"saved"', '"corrected"'));
+  }
+});
+
+test("JSON punctuation is fixed and string escapes keep their decoded content", async () => {
+  const h = dialogHarness(plugin());
+  await load(h, 0, '{"text":"saved","rules":[{"enabled":true}],"empty":[]}');
+  assert.ok(h.find("label").some(node => node.props.children === '"rules": '));
+  assert.ok(h.find("span").some(node => Array.isArray(node.props.children) && node.props.children.includes("[")));
+  assert.equal(h.find("textarea").length, 0); assert.equal(h.find("select").length, 0);
+  edit(h, '"line\\n\\\"quoted\\\"\\t\\u4e2d"');
+  edit(h, '"false"', 'rules.0.enabled');
+  assert.equal(button(h, "保存配置").props.disabled, true);
+  edit(h, 'false', 'rules.0.enabled');
+  button(h, "保存配置").props.onClick();
+  const result = JSON.parse(h.calls[1].args.content);
+  assert.equal(result.text, 'line\n"quoted"\t中');
+  assert.equal(result.rules[0].enabled, false);
+  assert.deepEqual(result.empty, []);
+});
+
+test("value arrays are single JSON fields supporting adding, removing and clearing items", async () => {
+  for (const value of ['[292, 300]', '[]', '["text", true, null, [1, 2]]', '[900719925474099312345, 1.000e+02]']) {
+    const h = dialogHarness(plugin());
+    const original = '{ "_comments":{"allowedStateLengths":"长度说明"}, "allowedStateLengths" : [292], "flag":false }\n';
+    await load(h, 0, original);
+    assert.equal(field(h, "allowedStateLengths").props.value, "[292]");
+    assert.equal(field(h, "allowedStateLengths.0"), undefined);
+    const comment = h.find("p").find(node => node.props.children === "长度说明");
+    assert.equal(field(h, "allowedStateLengths").props["aria-describedby"], comment.props.id);
+    assert.equal(comment.props.style.userSelect, "none");
+    edit(h, value, "allowedStateLengths");
+    assert.equal(button(h, "保存配置").props.disabled, false);
+    button(h, "保存配置").props.onClick();
+    assert.deepEqual(h.calls[1].args, { pluginId: "demo", content: original.replace('[292]', value), expectedSha256: hash });
+  }
+  const h = dialogHarness(plugin());
+  await load(h, 0, '{"values":[292, 300]}');
+  edit(h, '[300]', 'values');
+  button(h, "保存配置").props.onClick();
+  assert.deepEqual(JSON.parse(h.calls[1].args.content), { values: [300] });
+});
+
+test("multiline arrays display compactly without changing string whitespace or numeric precision", async () => {
+  const h = dialogHarness(plugin());
+  const original = '{"values":[\n  "a b", "quote\\\" and space", 900719925474099312345, 1.000e+02\n],"other":1}';
+  await load(h, 0, original);
+  assert.equal(field(h, "values").props.value, '["a b","quote\\\" and space",900719925474099312345,1.000e+02]');
+  assert.equal(button(h, "保存配置").props.disabled, true);
+  edit(h, '2', 'other');
+  button(h, "保存配置").props.onClick();
+  assert.equal(h.calls[1].args.content, original.replace('"other":1', '"other":2'));
+});
+
+test("empty and nested value arrays can be edited and saved with the latest keyboard draft", async () => {
+  const h = dialogHarness(plugin());
+  await load(h, 0, '{"empty":[],"nested":[[1],[]],"rules":[{"_comments":{"x":"只读说明"},"x":1}]}');
+  assert.equal(field(h, "empty").props.value, '[]');
+  assert.equal(field(h, "nested").props.value, '[[1],[]]');
+  assert.equal(field(h, "nested.0"), undefined);
+  assert.equal(field(h, "rules"), undefined);
+  assert.ok(field(h, "rules.0.x"));
+  edit(h, '[[2, 3], [true]]', 'nested');
+  field(h, "empty").props.onChange({ target: { value: '[292, 300]' } });
+  h.find("div").find(node => node.props.onKeyDown).props.onKeyDown({ ctrlKey: true, key: "s", preventDefault() {} });
+  assert.deepEqual(JSON.parse(h.calls[1].args.content), { empty: [292, 300], nested: [[2, 3], [true]], rules: [{ _comments: { x: "只读说明" }, x: 1 }] });
+});
+
+test("invalid array drafts block button and keyboard saves and remain dirty until repaired", async () => {
+  for (const value of ['[292,', '[292,]', '[1e999]', '292', '"[292]"', '[{}]', '[{"_comments":{"x":"注释"}}]']) {
+    const h = dialogHarness(plugin());
+    await load(h, 0, '{"values":[292],"other":1}');
+    field(h, "values").props.onChange({ target: { value } });
+    h.find("div").find(node => node.props.onKeyDown).props.onKeyDown({ ctrlKey: true, key: "s", preventDefault() {} });
+    h.render();
+    assert.equal(h.calls.length, 1);
+    assert.equal(button(h, "保存配置").props.disabled, true);
+    assert.equal(field(h, "values").props["aria-invalid"], true);
+    button(h, "保存配置").props.onClick();
+    assert.equal(h.calls.length, 1);
+    h.find("Dialog")[0].props.onOpenChange(false); h.render();
+    assert.equal(h.closed, 0);
+    assert.equal(h.find("section").length, 1);
+    button(h, "继续编辑").props.onClick(); h.render();
+    edit(h, '[292, 300]', 'values');
+    assert.equal(button(h, "保存配置").props.disabled, false);
+    button(h, "保存配置").props.onClick();
+    assert.deepEqual(JSON.parse(h.calls[1].args.content), { values: [292, 300], other: 1 });
+  }
 });

@@ -12,7 +12,7 @@ const dependency = ts.transpileModule(await readFile(dependencyUrl, "utf8"), {
 const source = (await readFile(new URL("../src/pluginConfigDocument.ts", import.meta.url), "utf8"))
   .replace('"./codeyPlugins"', JSON.stringify(`data:text/javascript;base64,${Buffer.from(dependency).toString("base64")}`));
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 } }).outputText;
-const { parsePluginConfigDocument: parse, validatePluginConfigValue: validate, serializePluginConfigDocument: serialize } =
+const { isEditableConfigArray, parsePluginConfigDocument: parse, validatePluginConfigValue: validate, serializePluginConfigDocument: serialize } =
   await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 const flatten = document => {
   const result = new Map();
@@ -80,13 +80,13 @@ test("values keep original types with scalar-only conversion from null", () => {
   for (const text of ["0", "null", "TRUE", " false"]) assert.ok(validate(entryAt(document, "b"), text));
   for (const text of ['"text"', "-2", "true", "false", "null"]) assert.equal(validate(entryAt(document, "nil"), text), undefined);
   for (const text of ["{}", "[]", "invalid", "1e999"]) assert.ok(validate(entryAt(document, "nil"), text));
-  assert.ok(validate(entryAt(document, "a"), "[]"));
+  assert.equal(validate(entryAt(document, "a"), "[]"), undefined);
   assert.ok(validate(entryAt(document, "o"), "{}"));
 });
 
 test("saving rejects invalid types, structures, annotations and nonexistent entries", () => {
   const document = parse('{"_comments":{"n":"说明"},"n":1,"a":[],"o":{}}');
-  for (const [path, value] of [[["n"], "false"], [["a"], "[]"], [["o"], "{}"], [["unknown"], "1"], [["_comments", "n"], "改说明"]])
+  for (const [path, value] of [[["n"], "false"], [["a"], "{}"], [["o"], "{}"], [["unknown"], "1"], [["_comments", "n"], "改说明"]])
     assert.throws(() => serialize(document, edits([path, value])));
   entryAt(document, "n").kind = "string";
   assert.throws(() => serialize(document, edits([["n"], "bad"])), /有限数字/);
@@ -103,4 +103,51 @@ test("invalid documents report format, annotations, duplicates and nesting limit
 test("final serialized size is checked using UTF-8 bytes", () => {
   const document = parse('{"text":""}');
   assert.throws(() => serialize(document, edits([["text"], "中".repeat(400000)])), /1 MiB/);
+});
+
+test("whole value arrays can add, remove and clear items without changing other source tokens", () => {
+  const content = '{\r\n "_comments":{"lengths":"长度说明"}, "lengths" : [292, 300], "empty": [], "n":1e2\r\n}\r\n';
+  const document = parse(content);
+  const entry = entryAt(document, "lengths");
+  assert.equal(isEditableConfigArray(entry), true);
+  assert.equal(entry.valueText, "[292, 300]");
+  assert.equal(entry.children.length, 2);
+  for (const value of ['[292, 300, 400]', '[300]', '[]', '["text",true,null,12,[false,[]]]']) {
+    assert.equal(validate(entry, value), undefined);
+    assert.equal(serialize(document, edits([["lengths"], value])), content.replace('[292, 300]', value));
+  }
+  const value = '[900719925474099312345, 1.000e+02, -0]';
+  assert.equal(serialize(document, edits([["empty"], value])), content.replace('"empty": []', `"empty": ${value}`));
+  assert.equal(serialize(document, edits([["lengths"], entry.valueText])), content);
+});
+
+test("value arrays reject invalid JSON, objects, annotations, overflow and non-arrays", () => {
+  const document = parse('{"values":[1]}');
+  for (const value of ['[', '[1,]', '[NaN]', '[1e999]', '1', 'null', '"[]"', '{}', '[{}]', '[[{"_comments":{"x":"说明"}}]]', '[1],"injected":2']) {
+    assert.ok(validate(entryAt(document, "values"), value), value);
+    assert.throws(() => serialize(document, edits([["values"], value])), undefined, value);
+  }
+});
+
+test("nested value arrays retain token precision while object arrays cannot be replaced", () => {
+  const content = '{"values":[[9007199254740993],[]],"rules":[{"_comments":{"x":"说明"},"x":1}],"mixed":[0,[{}]]}';
+  const document = parse(content);
+  assert.equal(isEditableConfigArray(entryAt(document, "values")), true);
+  assert.equal(entryAt(document, "values").valueText, '[[9007199254740993],[]]');
+  assert.equal(isEditableConfigArray(entryAt(document, "rules")), false);
+  assert.equal(isEditableConfigArray(entryAt(document, "mixed")), false);
+  entryAt(document, "rules").children = [];
+  assert.throws(() => serialize(document, edits([["rules"], '[]'])), /包含对象/);
+  assert.equal(serialize(document, edits([["rules", 0, "x"], '2'])), content.replace('"x":1', '"x":2'));
+});
+
+test("overlapping parent array and child edits are rejected in either order", () => {
+  const document = parse('{"values":[[1],2],"other":false}');
+  for (const pairs of [
+    [[["values"], '[3]'], [["values", 0, 0], '4']],
+    [[["values", 0], '[3,4]'], [["values"], '[]']],
+  ]) {
+    assert.throws(() => serialize(document, edits(...pairs)), /同时修改/);
+    assert.throws(() => serialize(document, edits(...pairs.toReversed())), /同时修改/);
+  }
 });

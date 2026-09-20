@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import vm from "node:vm";
@@ -25,6 +25,7 @@ async function loadPatchInIsolatedContext(
   installMessagePatch = true,
   miscModel = null,
   spawnImplementation = () => ({ pid: 4242 }),
+  errorLoggerExecutable = null,
 ) {
   const Module = process.getBuiltinModule("module");
   const originalLoad = Module._load;
@@ -65,6 +66,7 @@ async function loadPatchInIsolatedContext(
         miscModel,
         runtimeConfigOverrides,
         requireAppServerRuntimeOverrides: true,
+        errorLoggerExecutable,
       }),
       context,
     );
@@ -83,15 +85,30 @@ async function loadPatchInIsolatedContext(
   }
 }
 
-const relayWrapper = join(tmpdir(), "codey-cli-wrapper");
-const relayContext = (configs) => ({
+const relayDirectory = await mkdtemp(join(tmpdir(), "codey-relay-spawn-"));
+const relayWrapper = join(relayDirectory, "codey-cli-wrapper");
+const relayTarget = join(relayDirectory, "codex");
+const relaySourceDirectory = join(relayDirectory, "bundled");
+const customCliDirectory = join(relayDirectory, "custom");
+await mkdir(relaySourceDirectory);
+await mkdir(customCliDirectory);
+const relaySource = join(relaySourceDirectory, "codex");
+const customCli = join(customCliDirectory, "codex");
+for (const filename of [relayWrapper, relayTarget, relaySource, customCli]) {
+  await writeFile(filename, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+}
+const recursiveTarget = join(relayDirectory, "recursive-codex");
+await symlink(relayWrapper, recursiveTarget);
+test.after(() => rm(relayDirectory, { recursive: true, force: true }));
+const relayContext = (configs, environment = {}) => ({
   process: { ...process, env: {
     ...process.env,
     CODEY_DISABLE_MACOS_CHILD_PROCESS_SAMPLER: "false",
     CODEX_CLI_PATH: relayWrapper,
     CODEY_CODEX_CLI_STDIN_RELAY: relayWrapper,
-    CODEY_CODEX_CLI_WRAPPER_TARGET: join(tmpdir(), "codex"),
+    CODEY_CODEX_CLI_WRAPPER_TARGET: relayTarget,
     CODEY_CODEX_CLI_WRAPPER_OVERRIDES: JSON.stringify(configs),
+    ...environment,
   } },
 });
 
@@ -383,14 +400,91 @@ test("router mode degrades consistently before and after a verified wrapper spaw
   }
 });
 
-test("router mode refuses transport drift without the actual relay wrapper and config", async () => {
+test("router mode redirects native CLI launches through the prepared relay after transport drift", async () => {
+  const configs = ['model_provider="codey_router"'];
+  for (const command of [relayTarget, "codex", relaySource, relayWrapper]) {
+    const runtime = await loadPatchInIsolatedContext(configs, relayContext(configs, {
+      CODEY_CODEX_CLI_WRAPPER_SOURCE: relaySource,
+      PATH: relayDirectory,
+    }), false);
+    try {
+      process.getBuiltinModule("child_process").spawn(command, ["app-server"]);
+      assert.equal(runtime.spawnCalls.length, 1);
+      assert.equal(runtime.spawnCalls[0][0], relayWrapper);
+      const status = runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides;
+      assert.equal(status.command, relayWrapper);
+      assert.equal(status.stdinRelayAvailable, true);
+      assert.equal(await runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(),
+        "codey-app-server-runtime-overrides-degraded");
+    } finally { runtime.restore(); }
+  }
+});
+
+test("relay restores only its execution context into a filtered child environment without mutating inputs", async () => {
+  const configs = ['model_provider="codey_router"'];
+  const parentEnvironment = {
+    CODEY_CODEX_CLI_WRAPPER_PORT: "12345", CODEY_CODEX_CLI_WRAPPER_TOKEN: "test-token",
+    CODEY_CODEX_CLI_WRAPPER_MARKER: join(relayDirectory, "marker"),
+    CODEY_CODEX_CLI_WRAPPER_SUBAGENT: "1", CODEY_CODEX_CLI_WRAPPER_HANDSHAKE_OPTIONAL: "1",
+    CODEY_CODEX_CLI_WRAPPER_SOURCE: relaySource,
+    CODEX_HOME: join(relayDirectory, "home"), NO_PROXY: "localhost,127.0.0.1",
+    OMITTED_PARENT_VARIABLE: "do not restore",
+  };
+  const runtime = await loadPatchInIsolatedContext(configs, relayContext(configs, parentEnvironment), false);
+  try {
+    const env = Object.freeze({ PATH: relayDirectory, CHILD_ONLY: "keep", CODEY_CODEX_CLI_WRAPPER_TARGET: "stale" });
+    const options = Object.freeze({ env, cwd: relayDirectory, stdio: Object.freeze(["pipe", "pipe", "inherit"]), windowsHide: true });
+    const args = Object.freeze(["app-server", "--listen", "stdio://", "-c", "analytics.enabled=false", "-c", configs[0]]);
+    const parentBefore = { ...runtime.context.process.env };
+    process.getBuiltinModule("child_process").spawn("codex", args, options);
+    const [command, forwardedArgs, forwardedOptions] = runtime.spawnCalls[0];
+    assert.equal(command, relayWrapper);
+    assert.equal(forwardedArgs, args);
+    assert.equal(forwardedOptions.cwd, options.cwd);
+    assert.equal(forwardedOptions.stdio, options.stdio);
+    assert.equal(forwardedOptions.windowsHide, true);
+    assert.notEqual(forwardedOptions, options);
+    assert.notEqual(forwardedOptions.env, env);
+    assert.equal(env.CODEY_CODEX_CLI_WRAPPER_TARGET, "stale");
+    assert.equal(forwardedOptions.env.CODEY_CODEX_CLI_WRAPPER_TARGET, relayTarget);
+    for (const [key, value] of Object.entries(parentEnvironment)) {
+      if (key !== "OMITTED_PARENT_VARIABLE") assert.equal(forwardedOptions.env[key], value, key);
+    }
+    assert.equal(forwardedOptions.env.OMITTED_PARENT_VARIABLE, undefined);
+    assert.equal(forwardedOptions.env.CHILD_ONLY, "keep");
+    assert.equal(forwardedOptions.env.PATH, relayDirectory);
+    assert.equal(forwardedOptions.env.CODEX_APP_SERVER_FORCE_CLI, "1");
+    assert.deepEqual(runtime.context.process.env, parentBefore);
+    assert.equal(await runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(),
+      "codey-app-server-runtime-overrides-degraded");
+  } finally { runtime.restore(); }
+});
+
+test("router mode refuses transport drift without a valid prepared relay and native command", async () => {
   const configs = ['model_provider="codey_router"'];
   const cases = [
     { context: {}, command: "codex" },
-    { context: relayContext(configs), command: "codex" },
-    { context: relayContext(configs), command: relayWrapper, options: { env: {} } },
     { context: relayContext([]), command: relayWrapper },
     { context: relayContext([...configs, 'model_provider="openai"']), command: relayWrapper },
+    ...[
+      { CODEX_CLI_PATH: "other-wrapper" },
+      { CODEY_CODEX_CLI_STDIN_RELAY: "" },
+      { CODEY_CODEX_CLI_WRAPPER_TARGET: "relative-codex" },
+      { CODEY_CODEX_CLI_WRAPPER_TARGET: join(relayDirectory, "missing") },
+      { CODEY_CODEX_CLI_WRAPPER_TARGET: relayDirectory },
+      { CODEY_CODEX_CLI_WRAPPER_TARGET: relayWrapper },
+      { CODEY_CODEX_CLI_WRAPPER_TARGET: recursiveTarget },
+      { CODEY_CODEX_CLI_WRAPPER_SOURCE: recursiveTarget },
+      { CODEY_CODEX_CLI_WRAPPER_SOURCE: join(relayDirectory, "missing") },
+      { CODEY_CODEX_CLI_WRAPPER_OVERRIDES: "invalid json" },
+      { CODEY_CODEX_CLI_WRAPPER_OVERRIDES: "{}" },
+      { CODEY_CODEX_CLI_WRAPPER_OVERRIDES: '[42]' },
+    ].map((env) => ({ context: relayContext(configs, env), command: relayTarget })),
+    { context: relayContext(configs), command: customCli },
+    { context: relayContext(configs), command: "custom-app-server" },
+    { context: relayContext(configs), command: "codex", options: { env: { PATH: `${customCliDirectory}${delimiter}${relayDirectory}` } } },
+    { context: relayContext(configs), command: relayTarget, options: { shell: true } },
+    { context: relayContext(configs), command: relayWrapper, options: { windowsVerbatimArguments: true } },
   ];
   for (const { context, command, options } of cases) {
     const runtime = await loadPatchInIsolatedContext(configs, context, false);
@@ -401,6 +495,67 @@ test("router mode refuses transport drift without the actual relay wrapper and c
       assert.equal(runtime.spawnCalls.length, 0);
     } finally { runtime.restore(); }
   }
+});
+
+test("relay requires every effective native override in the parent configuration", async () => {
+  const configs = ['model_provider="codey_router"', 'model="current"', 'model="required"'];
+  for (const parentConfigs of [configs.slice(0, 1), configs.slice(0, 2), [configs[0], configs[2]]]) {
+    const runtime = await loadPatchInIsolatedContext(configs, relayContext(parentConfigs), false);
+    try {
+      if (parentConfigs.at(-1) === configs[2]) {
+        process.getBuiltinModule("child_process").spawn(relayTarget, ["app-server"], { env: {} });
+        assert.equal(await runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(),
+          "codey-app-server-runtime-overrides-degraded");
+      } else {
+        assert.throws(() => process.getBuiltinModule("child_process").spawn(relayTarget, ["app-server"]), /未确认使用 Codey/);
+        assert.equal(runtime.spawnCalls.length, 0);
+      }
+    } finally { runtime.restore(); }
+  }
+});
+
+test("relay refuses a target pointing at the Codey executable behind the macOS wrapper", async () => {
+  const configs = ['model_provider="codey_router"'];
+  const runtime = await loadPatchInIsolatedContext(configs, relayContext(configs), false, null,
+    () => ({ pid: 4242 }), relayTarget);
+  try {
+    assert.throws(() => process.getBuiltinModule("child_process").spawn(relayTarget, ["app-server"]), /未确认使用 Codey/);
+    assert.equal(runtime.spawnCalls.length, 0);
+  } finally { runtime.restore(); }
+});
+
+test("relay fallback preserves successful source patches and unrelated spawns", async () => {
+  const configs = ['model_provider="codey_router"'];
+  for (const patched of [false, true]) {
+    const runtime = await loadPatchInIsolatedContext(configs, relayContext(configs), patched);
+    try {
+      const args = ["--version"];
+      const options = { env: { CHILD_ONLY: "keep" } };
+      process.getBuiltinModule("child_process").spawn(customCli, args, options);
+      assert.deepEqual(runtime.spawnCalls[0], [customCli, args, options]);
+      if (patched) {
+        process.getBuiltinModule("child_process").spawn(relayTarget, ["app-server"], options);
+        assert.equal(runtime.spawnCalls[1][0], relayTarget);
+        assert.equal(runtime.spawnCalls[1][2].env.CODEY_CODEX_CLI_WRAPPER_TARGET, undefined);
+        assert.equal(await runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(),
+          "codey-app-server-runtime-overrides-verified");
+      }
+    } finally { runtime.restore(); }
+  }
+});
+
+test("relay fallback cannot mark a synchronous wrapper spawn failure complete", async () => {
+  const configs = ['model_provider="codey_router"'];
+  const runtime = await loadPatchInIsolatedContext(configs, relayContext(configs), false, null, () => {
+    throw new Error("wrapper spawn failed");
+  });
+  try {
+    assert.throws(() => process.getBuiltinModule("child_process").spawn(relayTarget, ["app-server"]), /wrapper spawn failed/);
+    const status = runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides;
+    assert.equal(status.complete, false);
+    assert.equal(status.command, relayWrapper);
+    await assert.rejects(runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(), /无法创建 app-server 进程/);
+  } finally { runtime.restore(); }
 });
 
 test("relay fallback cannot bypass missing runtime config validation", async () => {

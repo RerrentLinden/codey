@@ -3,6 +3,7 @@ import {
   IconAlertTriangle,
   IconCheck,
   IconFilePlus,
+  IconHelpCircle,
   IconPuzzle,
   IconRefresh,
   IconSearch,
@@ -22,11 +23,11 @@ import {
   DialogTitle,
   Input,
   Switch,
+  Tooltip,
 } from "./components/ui";
 import { PluginConfigDialog } from "./PluginConfigDialog";
 import {
   parseCodeyPluginsResult,
-  pluginStatusLabel,
   type CodeyPlugin,
   type CodeyPluginPreview,
   type CodeyPluginsResult,
@@ -404,16 +405,7 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
       ) : (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           {filteredPlugins.map((plugin) => {
-            const hasError = Boolean(plugin.lastError || plugin.status === "failed" || plugin.status === "error");
-            const badgeVariant = !known
-              ? "secondary"
-              : hasError
-                ? "destructive"
-                : plugin.restartRequired
-                  ? "warning"
-                  : plugin.enabled
-                    ? "success"
-                    : "secondary";
+            const hasDirs = Boolean(plugin.pluginDir || plugin.dataDir || plugin.logDir);
 
             return (
               <article
@@ -441,16 +433,55 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                             v{plugin.version}
                           </span>
                         </div>
-                        <p className="mb-0 mt-0.5 truncate font-mono text-xs text-muted/75">
-                          {plugin.id}
-                        </p>
+                        <div className="mb-0 mt-0.5 flex items-center gap-1.5 font-mono text-xs text-muted/75">
+                          <span className="truncate">{plugin.id}</span>
+                          {hasDirs ? (
+                            <Tooltip
+                              delay={150}
+                              position="top"
+                              className="shrink-0"
+                              content={
+                                <div className="min-w-[200px] space-y-1.5 text-left leading-relaxed">
+                                  <div className="font-semibold text-xs">文件与存储目录</div>
+                                  {plugin.pluginDir ? (
+                                    <div>
+                                      <div className="text-[11px] font-medium opacity-75">插件目录</div>
+                                      <div className="mt-0.5 break-all font-mono text-[11px] select-text opacity-90">
+                                        {plugin.pluginDir}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {plugin.dataDir ? (
+                                    <div>
+                                      <div className="text-[11px] font-medium opacity-75">数据目录</div>
+                                      <div className="mt-0.5 break-all font-mono text-[11px] select-text opacity-90">
+                                        {plugin.dataDir}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {plugin.logDir ? (
+                                    <div>
+                                      <div className="text-[11px] font-medium opacity-75">日志目录</div>
+                                      <div className="mt-0.5 break-all font-mono text-[11px] select-text opacity-90">
+                                        {plugin.logDir}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              }
+                            >
+                              <span
+                                className="inline-flex shrink-0 cursor-help items-center text-muted/60 transition-colors hover:text-foreground"
+                                aria-label="查看文件与存储目录"
+                              >
+                                <IconHelpCircle size={13} aria-hidden="true" />
+                              </span>
+                            </Tooltip>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                     <div className="flex items-center gap-2.5 shrink-0">
-                      <Badge variant={badgeVariant}>
-                        {!known && "上次状态："}
-                        {pluginStatusLabel(plugin)}
-                      </Badge>
                       <Switch
                         size="sm"
                         checked={plugin.enabled}
@@ -497,32 +528,6 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                     <div role="alert" className="mt-3 rounded-lg border border-red-200/70 bg-red-50/70 p-2.5 text-[11.5px] text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
                       {plugin.lastError}
                     </div>
-                  )}
-
-                  {plugin.pluginDir && (
-                    <details className="mt-3 text-[11.5px] text-muted">
-                      <summary className="cursor-pointer select-none font-medium hover:text-foreground">
-                        文件与存储目录
-                      </summary>
-                      <dl className="mt-2 grid gap-1 rounded-lg bg-black/[0.02] p-2.5 font-mono text-[11px] dark:bg-white/[0.03]">
-                        <div className="flex flex-col">
-                          <dt className="text-muted/60">插件目录</dt>
-                          <dd className="m-0 break-all select-text text-foreground/90">{plugin.pluginDir}</dd>
-                        </div>
-                        {plugin.dataDir && (
-                          <div className="flex flex-col">
-                            <dt className="text-muted/60">数据目录</dt>
-                            <dd className="m-0 break-all select-text text-foreground/90">{plugin.dataDir}</dd>
-                          </div>
-                        )}
-                        {plugin.logDir && (
-                          <div className="flex flex-col">
-                            <dt className="text-muted/60">日志目录</dt>
-                            <dd className="m-0 break-all select-text text-foreground/90">{plugin.logDir}</dd>
-                          </div>
-                        )}
-                      </dl>
-                    </details>
                   )}
                 </div>
 

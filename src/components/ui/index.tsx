@@ -41,16 +41,17 @@ export function useToastContainer(element: HTMLElement | null, active = true) {
 type TooltipContentProps = React.ComponentProps<typeof HeroTooltip.Content>;
 export interface TooltipProps {
   children: React.ReactElement;
+  className?: string;
   content?: React.ReactNode;
   delay?: number;
   position?: TooltipContentProps["placement"];
 }
-export function Tooltip({ children, content, delay = 400, position = "top" }: TooltipProps) {
+export function Tooltip({ children, className, content, delay = 400, position = "top" }: TooltipProps) {
   if (content == null || content === "") return children;
   // 自带焦点行为的按钮可以直接作为触发器；普通元素需要 HeroUI 的触发器包裹以获得悬浮与焦点事件。
   const trigger = children.type === Button
     ? children
-    : <HeroTooltip.Trigger className="inline-flex max-w-full">{children}</HeroTooltip.Trigger>;
+    : <HeroTooltip.Trigger className={cn("inline-flex max-w-full", className)}>{children}</HeroTooltip.Trigger>;
   return (
     <HeroTooltip delay={delay} closeDelay={80}>
       {trigger}

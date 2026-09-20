@@ -31,6 +31,9 @@ const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) const CLI_WRAPPER_TARGET_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TARGET";
+/// 启动器实际发现的原始 CLI；Windows 商店版的执行目标可能是用户目录副本。
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) const CLI_WRAPPER_SOURCE_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_SOURCE";
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) const CLI_WRAPPER_OVERRIDES_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_OVERRIDES";
 /// 本次启动具备 stdin relay 的包装器路径，供主进程核对实际启动入口。
@@ -608,6 +611,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
         for name in [
             "CODEX_CLI_PATH",
             CLI_WRAPPER_TARGET_ENV,
+            CLI_WRAPPER_SOURCE_ENV,
             CLI_WRAPPER_OVERRIDES_ENV,
             CLI_WRAPPER_STDIN_RELAY_ENV,
             CLI_WRAPPER_SUBAGENT_ENV,
