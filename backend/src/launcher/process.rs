@@ -1246,6 +1246,12 @@ async fn prepare_cli_wrapper(
         .context("写入 macOS Codex CLI 兼容入口的任务异常退出")??;
         path
     };
+    if crate::codex_startup_patch::local_router_runtime_enabled(runtime_config_overrides) {
+        environment.push((
+            crate::codex_startup_patch::CLI_WRAPPER_STDIN_RELAY_ENV.to_string(),
+            wrapper.to_string_lossy().to_string(),
+        ));
+    }
     environment.insert(
         0,
         (
