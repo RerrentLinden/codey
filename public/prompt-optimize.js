@@ -1,4 +1,4 @@
-// Prompt-optimization button injected next to the Codex composer model picker.
+// Prompt-optimization button injected next to the Codex composer access picker.
 // The button joins the composer's native action row so it follows normal
 // responsive layout instead of floating above the input. The enabled flag is
 // read from /settings/get at runtime, so the console switch applies without a
@@ -104,7 +104,7 @@
         box-sizing: border-box;
         min-height: 26px !important;
         height: 26px !important;
-        margin: 0 6px 0 0;
+        margin: 0 0 0 6px;
         padding: 0 8px;
         border: 0;
         border-radius: 999px;
@@ -196,7 +196,7 @@
   };
 
   const controlLooksLikeComposerAction = (control) =>
-    /(^|[^a-z])(model|send|submit|attach|upload|microphone|mic|voice|full access)([^a-z]|$)|模型|发送|提交|附件|上传|语音|麦克风|完全访问/i.test(
+    /(^|[^a-z])(model|send|submit|attach|upload|microphone|mic|voice|full access|permissions?|approvals?)([^a-z]|$)|模型|发送|提交|附件|上传|语音|麦克风|完全访问|权限|审批|只读/i.test(
       controlDescriptor(control),
     );
 
@@ -300,46 +300,29 @@
     return rect.width > 0 && rect.height > 0;
   };
 
-  const modelControlScore = (control, inputRect) => {
+  const accessControlScore = (control, inputRect) => {
     const rect = control.getBoundingClientRect();
     if (rect.bottom <= inputRect.top) return Number.NEGATIVE_INFINITY;
     if (!controlIsNearInput(control, inputRect)) return Number.NEGATIVE_INFINITY;
     const descriptor = controlDescriptor(control);
-    const visibleText = [control.textContent, control.innerText]
-      .filter((value) => typeof value === "string" && value.trim())
-      .join(" ")
+    const visibleText = (control.textContent || control.innerText || "")
       .replace(/\s+/g, " ")
       .trim();
-    const hasModelHint = /(^|[^a-z])model([^a-z]|$)|模型/i.test(descriptor);
-    const hasModelValueHint =
-      /(^|[^a-z])(gpt|codex|claude|gemini|grok|llama|qwen|deepseek|mistral|sonnet|opus|haiku|mini|sol|low|medium|high|xhigh|auto)([^a-z]|$)|\bo\d+\b|\d+(?:\.\d+)?|低|中|高|极高|自动/i.test(
-        visibleText,
-      );
-    if (!hasModelHint && !hasModelValueHint) {
-      return Number.NEGATIVE_INFINITY;
-    }
-    if (
-      !hasModelHint &&
-      /完全访问|full access|附件|attach|上传|upload|优化/i.test(descriptor)
-    ) {
-      return Number.NEGATIVE_INFINITY;
-    }
-    if (
-      !hasModelHint &&
-      inputRect.width > 0 &&
-      rect.right < inputRect.left + inputRect.width * 0.45
-    ) {
+    const hasAccessHint =
+      /(^|[^a-z])(permissions?|approvals?|full access|read.only)([^a-z]|$)|权限|审批|完全访问|只读/i.test(descriptor);
+    const hasDefaultLabel = /^(default|默认)$/i.test(visibleText);
+    if (!hasAccessHint && !hasDefaultLabel) {
       return Number.NEGATIVE_INFINITY;
     }
     return (
-      (hasModelHint ? 1_000_000 : 0) +
+      (hasAccessHint ? 1_000_000 : 0) +
       (control.getAttribute?.("aria-haspopup") ? 100_000 : 0) +
-      Math.max(0, rect.right) * 10 +
+      Math.max(0, inputRect.right - rect.left) * 10 +
       Math.min(rect.width, 500)
     );
   };
 
-  const findModelInsertionTarget = () => {
+  const findAccessInsertionTarget = () => {
     if (!inputElement?.parentElement) return null;
     const inputRect = inputElement.getBoundingClientRect();
     const seen = new Set();
@@ -353,7 +336,7 @@
         if (inputElement.contains?.(control)) continue;
         if (seen.has(control) || !isVisibleControl(control)) continue;
         seen.add(control);
-        const score = modelControlScore(control, inputRect);
+        const score = accessControlScore(control, inputRect);
         if (score > bestScore) {
           bestControl = control;
           bestScore = score;
@@ -368,7 +351,20 @@
 
     let anchor = bestControl;
     let host = bestControl.parentElement;
-    while (host?.parentElement && host.children?.length === 1) {
+    while (host?.parentElement) {
+      const style = window.getComputedStyle(host);
+      // 横向操作行即使只有一个原生控件，也应保留为挂载容器。
+      // 跳过它会让按钮落到外层工具栏，脱离权限控件的左侧分组。
+      if (
+        (style.display === "flex" || style.display === "inline-flex") &&
+        (style.flexDirection === "row" || style.flexDirection === "row-reverse")
+      ) {
+        break;
+      }
+      // 排除已插入的按钮，避免它自身影响下一次定位。
+      if ([...(host.children || [])].filter((child) => child !== button).length !== 1) {
+        break;
+      }
       anchor = host;
       host = host.parentElement;
     }
@@ -376,10 +372,10 @@
     return { anchor, host };
   };
 
-  const isMountedBefore = (element, anchor, host) => {
+  const isMountedAfter = (element, anchor, host) => {
     if (element?.parentElement !== host) return false;
     const children = [...(host.children || [])];
-    return children.indexOf(element) + 1 === children.indexOf(anchor);
+    return children.indexOf(anchor) + 1 === children.indexOf(element);
   };
 
   const nodeIsInsideInputElement = (node) =>
@@ -403,7 +399,7 @@
       scheduleScan();
       return;
     }
-    const target = findModelInsertionTarget();
+    const target = findAccessInsertionTarget();
     if (!target) {
       removeButtonFromEditableInput();
       button.style.display = "none";
@@ -417,13 +413,13 @@
       button.style.display = "none";
       return;
     }
-    if (!isMountedBefore(button, target.anchor, target.host)) {
-      target.host.insertBefore(button, target.anchor);
+    if (!isMountedAfter(button, target.anchor, target.host)) {
+      target.host.insertBefore(button, target.anchor.nextElementSibling);
     }
     button.style.top = "";
     button.style.left = "";
     button.style.display = "inline-flex";
-    button.dataset.codeyPromptOptimizeLayout = "model-picker";
+    button.dataset.codeyPromptOptimizeLayout = "access-picker";
     updateButtonState();
   };
 
@@ -651,6 +647,7 @@
     const buttonHost = button?.parentElement;
     return Boolean(
       node === inputElement ||
+        node === button ||
         node === buttonHost ||
         node === inputElement?.parentElement ||
         node === buttonHost?.parentElement ||

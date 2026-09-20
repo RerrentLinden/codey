@@ -406,7 +406,12 @@ const createEnvironment = (options = {}) => {
       statusEvents.push(event);
       return true;
     },
-    getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    getComputedStyle: (element) => ({
+      display: "block",
+      visibility: "visible",
+      flexDirection: "row",
+      ...element.style,
+    }),
   };
 
   const testSetTimeout = (callback, delay, ...args) => {
@@ -519,7 +524,7 @@ test("mounts the optimize button when enabled and an API key is configured", asy
   const button = env.getElementById("codey-prompt-optimize-button");
   assert.ok(button, "button should be mounted");
   assert.equal(button.dataset.codeyPromptOptimize, "true");
-  assert.equal(button.dataset.codeyPromptOptimizeLayout, "model-picker");
+  assert.equal(button.dataset.codeyPromptOptimizeLayout, "access-picker");
   assert.equal(button.style.display, "inline-flex");
   assert.equal(button.disabled, true);
   assert.equal(button.getAttribute("aria-disabled"), "true");
@@ -537,6 +542,102 @@ test("mounts the optimize button when enabled and an API key is configured", asy
     disconnectCalls: 0,
     observeCalls: 1,
   });
+});
+
+test("keeps the optimize button in the left access row when it has a single native child", async () => {
+  const env = createEnvironment();
+  const accessActions = new FakeElement("div");
+  accessActions.style.display = "flex";
+  const pickerWrapper = new FakeElement("div");
+  pickerWrapper.appendChild(env.accessButton);
+  accessActions.appendChild(pickerWrapper);
+  env.toolbar.insertBefore(accessActions, env.modelButton);
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.equal(button.parentElement, accessActions);
+  assert.deepEqual(accessActions.children, [pickerWrapper, button]);
+
+  // 原生控件增减后，按钮仍应留在同一行。
+  const status = new FakeElement("span");
+  accessActions.appendChild(status);
+  env.emitMutation([{ type: "childList", target: accessActions }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  status.remove();
+  env.emitMutation([{ type: "childList", target: accessActions }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(button.parentElement, accessActions);
+  assert.deepEqual(accessActions.children, [pickerWrapper, button]);
+});
+
+test("repositions after a picker wrapper changes into a horizontal action row", async () => {
+  const env = createEnvironment();
+  const pickerWrapper = new FakeElement("div");
+  pickerWrapper.appendChild(env.accessButton);
+  env.toolbar.insertBefore(pickerWrapper, env.modelButton);
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.equal(button.parentElement, env.toolbar);
+  pickerWrapper.style.display = "inline-flex";
+  env.emitMutation([{ type: "attributes", target: pickerWrapper, attributeName: "style" }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  assert.deepEqual(pickerWrapper.children, [env.accessButton, button]);
+
+  pickerWrapper.style.display = "block";
+  env.emitMutation([{ type: "attributes", target: pickerWrapper, attributeName: "style" }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(pickerWrapper.nextElementSibling, button);
+});
+
+test("keeps the left position while model controls change and the access mode changes", async () => {
+  const env = createEnvironment();
+  await flush();
+  const button = env.getElementById("codey-prompt-optimize-button");
+  env.modelButton.setAttribute("aria-label", "模型");
+
+  for (const label of ["默认", "只读", "Full access", "Default", "Default permissions"]) {
+    env.accessButton.textContent = label;
+    const modelActions = new FakeElement("div");
+    modelActions.style.display = "flex";
+    modelActions.appendChild(env.modelButton);
+    env.toolbar.appendChild(modelActions);
+    env.emitMutation([{ type: "childList", target: env.toolbar }]);
+    await new Promise((resolve) => setTimeout(resolve, 280));
+    assert.equal(button.parentElement, env.toolbar);
+    assert.equal(env.accessButton.nextElementSibling, button);
+  }
+});
+
+test("hides the button while the access picker is absent instead of moving beside the model", async () => {
+  const env = createEnvironment();
+  await flush();
+  const button = env.getElementById("codey-prompt-optimize-button");
+  env.accessButton.visible = false;
+  env.emitMutation([{ type: "attributes", target: env.accessButton, attributeName: "hidden" }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  assert.equal(button.style.display, "none");
+
+  env.accessButton.visible = true;
+  env.emitMutation([{ type: "attributes", target: env.accessButton, attributeName: "hidden" }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  assert.equal(button.style.display, "inline-flex");
+  assert.equal(env.accessButton.nextElementSibling, button);
+});
+
+test("restores the left button when the native toolbar removes injected children", async () => {
+  const env = createEnvironment();
+  await flush();
+  const button = env.getElementById("codey-prompt-optimize-button");
+  button.remove();
+  env.emitMutation([{ type: "childList", target: env.toolbar, removedNodes: [button] }]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(env.getElementById("codey-prompt-optimize-button"), button);
+  assert.equal(env.accessButton.nextElementSibling, button);
+  assert.equal(button.style.display, "inline-flex");
 });
 
 test("mounts the optimize button for an enabled Codey route without a manual key", async () => {
