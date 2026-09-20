@@ -217,7 +217,11 @@ impl ExtensionService {
                             let bytes = cache.read(&path)?.context("Skill 资源已消失")?;
                             Ok((
                                 path.to_string_lossy().into_owned(),
-                                Some(format!("{}:{:?}", fsutil::digest(bytes), fsutil::file_mode(&path)?)),
+                                Some(format!(
+                                    "{}:{:?}",
+                                    fsutil::digest(bytes),
+                                    fsutil::file_mode(&path)?
+                                )),
                             ))
                         })
                         .collect()
@@ -520,7 +524,10 @@ impl ExtensionService {
                     == "external" =>
             {
                 let entry = self.entry(&inventory, Self::required(&request, "id")?)?;
-                ensure!(entry["canRemove"] == true, "Skill 当前不允许删除，请检查目录或冲突规则");
+                ensure!(
+                    entry["canRemove"] == true,
+                    "Skill 当前不允许删除，请检查目录或冲突规则"
+                );
                 let path = PathBuf::from(entry["sourcePath"].as_str().unwrap());
                 for target in skills::external_removal_files(&path)? {
                     ensure!(fsutil::writable(&target), "Skill 文件或所在目录不可写");
@@ -747,8 +754,14 @@ impl ExtensionService {
 
     fn clean_empty_skill_dirs(&self, scope: &Scope, removed: &[PathBuf]) {
         let roots = match scope {
-            Scope::User => vec![self.codex_home.join("skills"), self.user_home.join(".agents/skills")],
-            Scope::Project { project_path } => vec![project_path.join(".agents/skills"), project_path.join(".codex/skills")],
+            Scope::User => vec![
+                self.codex_home.join("skills"),
+                self.user_home.join(".agents/skills"),
+            ],
+            Scope::Project { project_path } => vec![
+                project_path.join(".agents/skills"),
+                project_path.join(".codex/skills"),
+            ],
         };
         for file in removed {
             let Some(root) = roots.iter().find(|root| file.starts_with(root)) else {
@@ -756,7 +769,7 @@ impl ExtensionService {
             };
             let mut dir = file.parent();
             while let Some(path) = dir {
-                if path == root || !path.starts_with(&root) || fsutil::safe_path(path).is_err() {
+                if path == root || !path.starts_with(root) || fsutil::safe_path(path).is_err() {
                     break;
                 }
                 if std::fs::remove_dir(path).is_err() {

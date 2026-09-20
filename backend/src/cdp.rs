@@ -1242,23 +1242,40 @@ mod tests {
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                 while let Some(message) = socket.next().await {
                     let message = message.unwrap();
-                    let Ok(text) = message.to_text() else { continue };
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
                     let request: serde_json::Value = serde_json::from_str(text).unwrap();
                     let evaluate = request["method"] == "Runtime.evaluate";
                     let result = if evaluate {
                         assert_eq!(request["params"]["awaitPromise"], true);
-                        assert!(request["params"]["expression"].as_str().unwrap().contains("__codeyReloadMcpServers"));
+                        assert!(
+                            request["params"]["expression"]
+                                .as_str()
+                                .unwrap()
+                                .contains("__codeyReloadMcpServers")
+                        );
                         payload.clone()
                     } else {
                         json!({})
                     };
-                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                        json!({"id":request["id"],"result":result}).to_string().into(),
-                    )).await.unwrap();
-                    if evaluate { break; }
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if evaluate {
+                        break;
+                    }
                 }
             });
-            assert_eq!(reload_mcp_servers(&format!("ws://{address}")).await.is_ok(), succeeds);
+            assert_eq!(
+                reload_mcp_servers(&format!("ws://{address}")).await.is_ok(),
+                succeeds
+            );
             server.await.unwrap();
         }
     }

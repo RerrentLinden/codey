@@ -48,7 +48,9 @@ pub(super) async fn invoke(state: &Arc<AppState>, args: &Value) -> Result<Value,
                 result["message"] = json!("MCP 配置已保存并通知 Codex 重新加载，无需重启。");
             } else {
                 result["applyStatus"] = json!("reload-failed");
-                result["message"] = json!("MCP 配置已保存，但未能确认 Codex 自动刷新。请确认 Codex 已连接后重新保存；旧版 Codex 可能需要重启。");
+                result["message"] = json!(
+                    "MCP 配置已保存，但未能确认 Codex 自动刷新。请确认 Codex 已连接后重新保存；旧版 Codex 可能需要重启。"
+                );
             }
         } else {
             result["applyStatus"] = json!("pending-runtime");

@@ -69,7 +69,7 @@ pub(crate) fn update_install_report_path(config_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(UPDATE_INSTALL_REPORT_FILE))
 }
 
-#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn write_update_install_report(config_path: &Path, report: &UpdateInstallReport) {
     write_update_install_report_at(&update_install_report_path(config_path), report);
 }
@@ -130,9 +130,9 @@ pub(crate) fn parse_installed_version_marker(contents: &str) -> Option<String> {
             let mut parts = token.split('.');
             let segments = parts.by_ref().take(3).collect::<Vec<_>>();
             segments.len() == 3
-                && segments
-                    .iter()
-                    .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+                && segments.iter().all(|segment| {
+                    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
+                })
         })
         .map(ToString::to_string)
 }
@@ -191,9 +191,7 @@ pub(crate) fn version_from_installer_name(file_name: &str) -> Option<String> {
     let mut index = 0;
     while index < bytes.len() {
         let starts_version = bytes[index].is_ascii_digit()
-            && (index == 0
-                || !bytes[index - 1].is_ascii_digit()
-                || bytes[index - 1] == b'.');
+            && (index == 0 || !bytes[index - 1].is_ascii_digit() || bytes[index - 1] == b'.');
         if !starts_version {
             index += 1;
             continue;
@@ -518,23 +516,28 @@ fn run_windows_update_helper(invocation: &UpdateHelperInvocation) -> Result<(), 
     let outcome = install_windows_update(invocation, &log_path);
 
     match outcome {
-        Ok(UpdateInstallOutcome::Updated) => match restart_codey(invocation, &log_path) {
-            Ok(()) => {
-                append_update_log(&log_path, "Update finished");
-                finish_update_report(&report_path, &report_version, "installed", "");
-                Ok(())
+        Ok(UpdateInstallOutcome::Updated | UpdateInstallOutcome::Failed) => {
+            match restart_codey(invocation, &log_path) {
+                Ok(()) => {
+                    append_update_log(&log_path, "Update finished");
+                    finish_update_report(&report_path, &report_version, "installed", "");
+                    Ok(())
+                }
+                Err(restart_error) => {
+                    append_update_log(&log_path, &format!("Restart failed: {restart_error}"));
+                    let message = format!("更新已安装，但重新启动失败：{restart_error}");
+                    finish_update_report(&report_path, &report_version, "failed", &message);
+                    Err(message)
+                }
             }
-            Err(restart_error) => {
-                append_update_log(&log_path, &format!("Restart failed: {restart_error}"));
-                let message = format!("更新已安装，但重新启动失败：{restart_error}");
-                finish_update_report(&report_path, &report_version, "failed", &message);
-                Err(message)
-            }
-        },
+        }
         // 安装结果无法证实（通常是从没有版本标记的老目录升级）。此时文件已经
         // 换过，交给重启后的新版自行确认，不向用户报错。
         Ok(UpdateInstallOutcome::Unverified) => {
-            append_update_log(&log_path, "Install result unverified; restarting to confirm");
+            append_update_log(
+                &log_path,
+                "Install result unverified; restarting to confirm",
+            );
             match restart_codey(invocation, &log_path) {
                 Ok(()) => {
                     finish_update_report(
@@ -565,12 +568,7 @@ fn run_windows_update_helper(invocation: &UpdateHelperInvocation) -> Result<(), 
 }
 
 #[cfg(target_os = "windows")]
-fn finish_update_report(
-    report_path: &Option<PathBuf>,
-    version: &str,
-    status: &str,
-    message: &str,
-) {
+fn finish_update_report(report_path: &Option<PathBuf>, version: &str, status: &str, message: &str) {
     let Some(path) = report_path else {
         return;
     };
@@ -971,7 +969,9 @@ mod tests {
         let parsed = parse_update_helper_invocation([
             OsString::from("helper.exe"),
             OsString::from(UPDATE_HELPER_FLAG),
-            OsString::from(r"C:\Users\Test User\config\updates\v1.2.3\Codey-1.2.3-windows-x64-setup.exe"),
+            OsString::from(
+                r"C:\Users\Test User\config\updates\v1.2.3\Codey-1.2.3-windows-x64-setup.exe",
+            ),
             OsString::from(r"C:\Users\Test User\Programs\Codey\Codey.exe"),
             OsString::from(r"C:\Users\Test User\Programs\Codey"),
             OsString::from("123456"),
@@ -1030,7 +1030,8 @@ mod tests {
 
     #[test]
     fn install_directory_argument_stays_unquoted_for_nsis() {
-        let argument = nsis_install_directory_argument(Path::new(r"C:\Users\Test User\Programs\Codey"));
+        let argument =
+            nsis_install_directory_argument(Path::new(r"C:\Users\Test User\Programs\Codey"));
 
         assert_eq!(
             argument,
@@ -1073,7 +1074,10 @@ mod tests {
             Some("1.2.3".to_string())
         );
         assert_eq!(version_from_installer_name("Codey setup.exe"), None);
-        assert_eq!(version_from_installer_name("Codey-windows-x64-setup.exe"), None);
+        assert_eq!(
+            version_from_installer_name("Codey-windows-x64-setup.exe"),
+            None
+        );
     }
 
     #[test]

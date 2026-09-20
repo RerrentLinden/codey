@@ -179,7 +179,10 @@ fn creation_does_not_overwrite_and_enabling_requires_confirmation() {
     assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), original);
     assert!(f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true,"confirmed":false})).is_err());
     assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), original);
-    f.mutate(json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true})).unwrap();
+    f.mutate(
+        json!({"action":"save_mcp","id":"new","configJson":{"command":"node"},"createOnly":true}),
+    )
+    .unwrap();
     assert_eq!(
         f.service.mcp_configuration(&Scope::User, "new").unwrap()["enabled"],
         true
@@ -200,7 +203,9 @@ fn json_stdio_import_preserves_strings_and_starts_enabled() {
         "tool_timeout_sec": 45,
         "custom": {"nested": ["future", "value"]}
     });
-    let result = f.mutate(json!({"action":"save_mcp","id":"local","configJson":config,"createOnly":true})).unwrap();
+    let result = f
+        .mutate(json!({"action":"save_mcp","id":"local","configJson":config,"createOnly":true}))
+        .unwrap();
     assert_eq!(result["applyStatus"], "reload-required");
     let stored = f.service.mcp_configuration(&Scope::User, "local").unwrap();
     let mut expected = config;
@@ -1476,7 +1481,13 @@ fn skill_names_stay_unique_across_scope_roots_and_renames() {
     let listed = f.list();
     let skills = listed["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 3);
-    assert_eq!(skills.iter().filter(|entry| entry["name"] == "beta").count(), 1);
+    assert_eq!(
+        skills
+            .iter()
+            .filter(|entry| entry["name"] == "beta")
+            .count(),
+        1
+    );
 }
 
 #[test]
