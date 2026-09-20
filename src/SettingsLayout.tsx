@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode, type RefObject } from "react";
 import {
   IconBook2,
   IconLayoutDashboard,
@@ -25,9 +25,10 @@ type SettingsSection = ReactNode | ((active: boolean) => ReactNode);
 type SettingsLayoutProps = {
   sections: Record<SettingsPageId, SettingsSection>;
   sidebarFooter?: ReactNode;
+  contentRef?: RefObject<HTMLDivElement | null>;
 };
 
-export function SettingsLayout({ sections, sidebarFooter }: SettingsLayoutProps) {
+export function SettingsLayout({ sections, sidebarFooter, contentRef }: SettingsLayoutProps) {
   const [activePage, setActivePage] = useState<SettingsPageId>("overview");
   const [visitedPages, setVisitedPages] = useState<ReadonlySet<SettingsPageId>>(
     () => new Set(["overview"]),
@@ -100,6 +101,7 @@ export function SettingsLayout({ sections, sidebarFooter }: SettingsLayoutProps)
             <section
               key={page.id}
               id={`${id}-page-${page.id}`}
+              ref={active ? contentRef : undefined}
               className="settings-page page-scroll"
               aria-labelledby={`${id}-menu-${page.id}`}
               hidden={!active}

@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   IconCheck as Check,
+  IconChartDonut,
   IconCpu,
   IconEdit as Edit,
   IconEye,
@@ -72,6 +73,7 @@ type ModelSectionProps = {
   subagentModelOptions?: SubagentModelOption[];
   onToggleLocalRouter: (checked: boolean) => void;
   onToggleRouteRequestLog: (checked: boolean) => void;
+  onOpenUsageAnalysis: (trigger: HTMLElement) => void;
   onSaveRoute: (route: Profile) => Promise<boolean>;
   onSetRouteEnabled: (routeId: string, enabled: boolean) => Promise<boolean>;
   onReorderRoute: (sourceId: string, targetId: string) => Promise<void>;
@@ -219,6 +221,7 @@ function ModelSectionComponent({
   subagentModelOptions = [],
   onToggleLocalRouter,
   onToggleRouteRequestLog,
+  onOpenUsageAnalysis,
   onSaveRoute,
   onSetRouteEnabled,
   onReorderRoute,
@@ -680,6 +683,17 @@ function ModelSectionComponent({
           : "统一管理供应商线路与模型目录"}
         actions={
           <div className="route-header-controls">
+            <Button
+              color="primary"
+              variant="filled"
+              size="sm"
+              onClick={(event) => {
+                if (event.currentTarget instanceof HTMLElement) onOpenUsageAnalysis(event.currentTarget);
+              }}
+            >
+              <IconChartDonut size={14} aria-hidden="true" />
+              <span>用量分析</span>
+            </Button>
             <div className="route-header-switch-item">
               <span className="route-header-switch-label">本地路由</span>
               <Switch

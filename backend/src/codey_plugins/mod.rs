@@ -855,8 +855,7 @@ impl Manager {
                         .and_then(|file| parse_config(&file.content));
                     let config_error = config.as_ref().err().cloned();
                     let restart_required = live.is_some_and(|p| {
-                        p.manifest.version != r.manifest.version
-                            || config.as_ref().map_or(true, |value| &p.config != value)
+                        p.manifest.version != r.manifest.version || config.as_ref() != Ok(&p.config)
                     });
                     let last_error = config_error.or_else(|| self.errors.get(id).cloned());
                     let status = if last_error.is_some() {

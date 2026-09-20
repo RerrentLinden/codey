@@ -780,8 +780,9 @@ if (import.meta.env.DEV) {
         const model = String(args.model || "");
         const status = String(args.status || "");
         const protocol = String(args.protocol || "");
-        const toUnixMs = Number(args.toUnixMs) || Date.now();
-        const fromUnixMs = Number(args.fromUnixMs) || toUnixMs - 86_400_000;
+        const allTime = command === "query_route_request_log_stats" && args.allTime === true;
+        const toUnixMs = allTime ? Date.now() : Number(args.toUnixMs) || Date.now();
+        const fromUnixMs = allTime ? Math.min(toUnixMs, ...previewRouteRequestLogs.map((item) => item.timestampUnixMs)) : Number(args.fromUnixMs) || toUnixMs - 86_400_000;
         const filtered = previewRouteRequestLogs.filter((item) => {
           if (item.timestampUnixMs < fromUnixMs || item.timestampUnixMs >= toUnixMs) return false;
           if (args.requestId && item.requestId !== args.requestId) return false;
@@ -827,6 +828,8 @@ if (import.meta.env.DEV) {
               successRate: total ? succeededCount / total * 100 : null,
               avgDuration: total ? sum(durations)! / total : null,
               avgTtft: ttfts.length ? sum(ttfts)! / ttfts.length : null,
+              avgRouterPreUpstream: null, avgUpstreamHeader: null, avgUpstreamFirstByte: null,
+              avgDownstreamFirstContent: ttfts.length ? sum(ttfts)! / ttfts.length : null, avgQueueDelay: null,
               inputTokensSum: sum(rows.map((item) => item.inputTokens)),
               outputTokensSum: sum(rows.map((item) => item.outputTokens)),
               totalTokensSum: sum(rows.map((item) => item.totalTokens)),
@@ -835,9 +838,10 @@ if (import.meta.env.DEV) {
               totalTokensKnownCount: rows.filter((item) => item.totalTokens != null).length,
             };
           };
-          const bucketMs = toUnixMs - fromUnixMs <= 7 * 86_400_000 ? 3_600_000 : 86_400_000;
+          const bucketMs = toUnixMs - fromUnixMs <= 7 * 86_400_000 ? 3_600_000 : Math.max(1, Math.ceil((toUnixMs - fromUnixMs) / (366 * 86_400_000))) * 86_400_000;
           const grouped = new Map<string, typeof filtered>();
           const buckets = new Map<number, typeof filtered>();
+          const dailyBuckets = new Map<number, typeof filtered>();
           for (const item of filtered) {
             const key = args.groupBy === "provider" ? item.provider : args.groupBy === "status" ? item.status
               : args.groupBy === "protocol" ? item.upstreamTransport : args.groupBy === "request_kind" ? item.requestKind
@@ -847,12 +851,15 @@ if (import.meta.env.DEV) {
             const bucket = Math.floor(item.timestampUnixMs / bucketMs) * bucketMs;
             grouped.set(key, [...(grouped.get(key) ?? []), item]);
             buckets.set(bucket, [...(buckets.get(bucket) ?? []), item]);
+            const day = Math.floor(item.timestampUnixMs / 86_400_000) * 86_400_000;
+            if (args.includeDailyTrend === true) dailyBuckets.set(day, [...(dailyBuckets.get(day) ?? []), item]);
           }
-          const groups = [...grouped].map(([key, rows]) => ({ key, ...aggregate(rows) })).sort((a, b) => b.total - a.total || a.key.localeCompare(b.key));
+          const groups = [...grouped].map(([key, rows]) => ({ key, ...aggregate(rows) })).sort((a, b) => (args.groupSort === "tokens" ? (b.totalTokensSum ?? -1) - (a.totalTokensSum ?? -1) : b.total - a.total) || a.key.localeCompare(b.key));
           return {
             status: "ok", backend: "sqlite", queryable: true, fromUnixMs, toUnixMs,
             ...aggregate(filtered), groups: groups.slice(0, 50), groupsTruncated: groups.length > 50, bucketMs,
             trend: [...buckets].sort(([a], [b]) => a - b).map(([timestampUnixMs, rows]) => ({ timestampUnixMs, ...aggregate(rows) })),
+            ...(args.includeDailyTrend === true ? { dailyTrend: [...dailyBuckets].sort(([a], [b]) => a - b).map(([timestampUnixMs, rows]) => ({ timestampUnixMs, total: rows.length, totalTokensSum: aggregate(rows).totalTokensSum, totalTokensKnownCount: aggregate(rows).totalTokensKnownCount })) } : {}),
             recordingHealth: { enabled: true, active: true, sampleRatePerMillion: 1_000_000, pendingEntries: 0,
               accepted: previewRouteRequestLogs.length, entriesWritten: previewRouteRequestLogs.length,
               sampledOut: 0, droppedFull: 0, droppedClosed: 0, writeDropped: 0, writeFailures: 0, observerPanics: 0, writerPanics: 0, shutdownTimeouts: 0 },

@@ -16,6 +16,7 @@ import { reconcileConfigDraft } from "./configDraft";
 import { ModelPickerDialog } from "./AppDialogs";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
+import { UsageAnalysisPanel } from "./UsageAnalysisPanel";
 import { OperationsPanel } from "./OperationsPanel";
 import { CodeyPluginsSection } from "./CodeyPluginsSection";
 import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
@@ -137,6 +138,23 @@ export function App({
   const [fastContextToolsStatus, setFastContextToolsStatus] =
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
   const [dirty, setDirty] = useState(false);
+  const [usageAnalysisOpen, setUsageAnalysisOpen] = useState(false);
+  const settingsScroll = useRef<HTMLDivElement>(null);
+  const usageReturn = useRef<{ trigger: HTMLElement; scrollTop: number } | null>(null);
+  const handleOpenUsageAnalysis = useCallback((trigger: HTMLElement) => {
+    usageReturn.current = { trigger, scrollTop: settingsScroll.current?.scrollTop ?? 0 };
+    setUsageAnalysisOpen(true);
+  }, []);
+  useEffect(() => {
+    if (usageAnalysisOpen || !usageReturn.current) return;
+    const previous = usageReturn.current;
+    const frame = requestAnimationFrame(() => {
+      if (settingsScroll.current) settingsScroll.current.scrollTop = previous.scrollTop;
+      previous.trigger.focus({ preventScroll: true });
+      usageReturn.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [usageAnalysisOpen]);
   const [busy, setBusy] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
@@ -902,6 +920,8 @@ export function App({
     }
     setDirty(false);
     setModelPickerVisible(false);
+    setUsageAnalysisOpen(false);
+    usageReturn.current = null;
     setConfirmation(null);
     onClose?.();
   }
@@ -1330,8 +1350,8 @@ export function App({
 
   const appContent = (
     <main className={`app-shell${embedded ? " embedded" : ""}`}>
-      <a className="skip-link" href="#codey-settings-content">
-        跳至设置内容
+      <a className="skip-link" href={usageAnalysisOpen ? "#usage-analysis-title" : "#codey-settings-content"}>
+        {usageAnalysisOpen ? "跳至用量分析" : "跳至设置内容"}
       </a>
 
       {!embedded && (
@@ -1372,7 +1392,13 @@ export function App({
         </header>
       )}
 
+      {usageAnalysisOpen ? (
+        <div className="page-scroll">
+          <UsageAnalysisPanel onBack={() => setUsageAnalysisOpen(false)} />
+        </div>
+      ) : (
       <SettingsLayout
+        contentRef={settingsScroll}
         sidebarFooter={
           <div className="sidebar-updates">
             <div className="sidebar-update-version">
@@ -1475,6 +1501,7 @@ export function App({
               subagentModelOptions={subagentModelOptions}
               onToggleLocalRouter={handleToggleLocalRouter}
               onToggleRouteRequestLog={handleToggleRouteRequestLog}
+              onOpenUsageAnalysis={handleOpenUsageAnalysis}
               onSaveRoute={handleSaveRoute}
               onSetRouteEnabled={handleSetRouteEnabled}
               onReorderRoute={handleReorderRoute}
@@ -1515,6 +1542,7 @@ export function App({
           ),
         }}
       />
+      )}
 
       <NoticeToast controller={noticeController} />
 

@@ -250,7 +250,7 @@ test("request log preview supports clearing all history", async () => {
 test("request log search debounce keeps the first page cursors when the query text is unchanged", async () => {
   const viewer = await readSource("src/RequestLogDialog.tsx");
   const source = viewer.match(
-    /useEffect\(\(\) => \{\n\s+const nextSearch = searchInput\.trim\(\);[\s\S]*?\}, \[searchInput, search\]\);/,
+    /useEffect\(\(\) => \{\r?\n\s+const nextSearch = searchInput\.trim\(\);[\s\S]*?\}, \[searchInput, search\]\);/,
   )?.[0];
 
   assert.ok(source);

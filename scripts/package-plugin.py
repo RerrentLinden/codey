@@ -5,7 +5,14 @@ import hashlib
 import json
 import pathlib
 import platform
+import sys
+from typing import cast
 import zipfile
+
+
+reconfigure = getattr(sys.stderr, "reconfigure", None)
+if callable(reconfigure):
+    reconfigure(encoding="utf-8")
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--library", type=pathlib.Path, required=True)
@@ -37,7 +44,9 @@ except (UnicodeDecodeError, ValueError, RecursionError):
     parser.error("配置模板必须是有效的 UTF-8 JSON")
 if not isinstance(value, dict):
     parser.error("配置模板必须是 JSON 对象")
-pending = [(value, "$")]
+pending: list[tuple[dict[str, object] | list[object], str]] = [
+    (cast(dict[str, object] | list[object], value), "$")
+]
 while pending:
     current, path = pending.pop()
     entries = enumerate(current) if isinstance(current, list) else current.items()

@@ -26,6 +26,7 @@ import { errorText } from "./appUtils";
 import { formatBytes, formatTimestamp } from "./formatters";
 import { modelIdsEqual } from "./modelIds";
 import { QuotaEstimateDialog } from "./QuotaEstimateDialog";
+import type { LogAnalytics } from "./usageAnalysis";
 import { maskEmail } from "./sensitiveText";
 import {
   Badge,
@@ -117,44 +118,6 @@ type RouteRequestLogQueryPage = {
 };
 
 type LogCursor = { timestampUnixMs: number; requestId: string };
-type LogSummary = {
-  total: number;
-  succeededCount: number;
-  failedCount: number;
-  incompleteCount: number;
-  cancelledCount: number;
-  successRate: number | null;
-  avgDuration: number | null;
-  avgTtft: number | null;
-  avgRouterPreUpstream: number | null;
-  avgUpstreamHeader: number | null;
-  avgUpstreamFirstByte: number | null;
-  avgDownstreamFirstContent: number | null;
-  avgQueueDelay: number | null;
-  inputTokensSum: number | null;
-  outputTokensSum: number | null;
-  totalTokensSum: number | null;
-  cachedTokensSum: number | null;
-  usageReportedCount: number;
-  totalTokensKnownCount: number;
-};
-type LogAnalytics = LogSummary & {
-  queryable: boolean;
-  fromUnixMs: number;
-  toUnixMs: number;
-  groups: Array<LogSummary & { key: string }>;
-  groupsTruncated: boolean;
-  trend: Array<{ timestampUnixMs: number; total: number; totalTokensSum: number | null; avgDuration: number | null; avgTtft: number | null; avgDownstreamFirstContent: number | null }>;
-  bucketMs: number;
-  databaseBytes?: number;
-  walBytes?: number;
-  recordingHealth?: {
-    enabled: boolean; active: boolean; sampleRatePerMillion: number; pendingEntries: number;
-    accepted: number; entriesWritten: number; sampledOut: number;
-    droppedFull: number; droppedClosed: number; writeDropped: number; writeFailures: number;
-    observerPanics: number; writerPanics: number; shutdownTimeouts: number;
-  } | null;
-};
 
 type ClearRouteRequestLogsResult = {
   status: "ok" | "failed";

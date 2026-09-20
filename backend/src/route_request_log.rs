@@ -339,6 +339,9 @@ pub(crate) struct RouteRequestLogQuery {
     pub session_id: Option<String>,
     pub official_account_id: Option<String>,
     pub group_by: Option<String>,
+    pub all_time: bool,
+    pub group_sort: Option<String>,
+    pub include_daily_trend: bool,
 }
 
 impl Default for RouteRequestLogQuery {
@@ -360,6 +363,9 @@ impl Default for RouteRequestLogQuery {
             session_id: None,
             official_account_id: None,
             group_by: None,
+            all_time: false,
+            group_sort: None,
+            include_daily_trend: false,
         }
     }
 }
@@ -386,6 +392,14 @@ impl RouteRequestLogQuery {
             "官方账号",
         )?;
         normalize_query_value(&mut self.group_by, MAX_QUERY_FILTER_BYTES, "统计维度")?;
+        normalize_query_value(&mut self.group_sort, MAX_QUERY_FILTER_BYTES, "统计排序")?;
+        if self
+            .group_sort
+            .as_deref()
+            .is_some_and(|value| value != "tokens")
+        {
+            anyhow::bail!("统计排序无效");
+        }
         if self.group_by.as_deref().is_some_and(|value| {
             !matches!(
                 value,
@@ -499,6 +513,15 @@ pub(crate) struct RouteRequestLogTrend {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RouteRequestLogDailyTrend {
+    pub timestamp_unix_ms: u64,
+    pub total: u64,
+    pub total_tokens_sum: Option<u64>,
+    pub total_tokens_known_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RouteRequestLogAnalytics {
     pub status: &'static str,
     pub backend: &'static str,
@@ -511,6 +534,7 @@ pub(crate) struct RouteRequestLogAnalytics {
     pub groups: Vec<RouteRequestLogGroup>,
     pub groups_truncated: bool,
     pub trend: Vec<RouteRequestLogTrend>,
+    pub daily_trend: Vec<RouteRequestLogDailyTrend>,
     pub bucket_ms: u64,
     pub database_bytes: u64,
     pub wal_bytes: u64,
@@ -2377,6 +2401,9 @@ pub(crate) fn query_route_request_logs(
     backend: RouteRequestLogBackend,
     query: RouteRequestLogQuery,
 ) -> anyhow::Result<RouteRequestLogQueryPage> {
+    if query.all_time || query.group_sort.is_some() || query.include_daily_trend {
+        anyhow::bail!("全部历史、统计排序和每日趋势仅适用于用量统计");
+    }
     let query = query.normalize()?;
     if backend == RouteRequestLogBackend::Ndjson {
         return Ok(RouteRequestLogQueryPage {
@@ -2750,11 +2777,21 @@ pub(crate) fn query_route_request_log_stats(
     backend: RouteRequestLogBackend,
     mut query: RouteRequestLogQuery,
 ) -> anyhow::Result<RouteRequestLogAnalytics> {
-    query.cursor_mode = true;
+    if query.all_time
+        && (query.from_unix_ms.is_some()
+            || query.to_unix_ms.is_some()
+            || query.cursor_mode
+            || query.cursor.is_some())
+    {
+        anyhow::bail!("全部历史统计不能同时指定时间范围或分页游标");
+    }
+    query.cursor_mode = !query.all_time;
     query.cursor = None;
-    let query = query.normalize()?;
-    let from = query.from_unix_ms.expect("normalized time range");
-    let to = query.to_unix_ms.expect("normalized time range");
+    let mut query = query.normalize()?;
+    let to = query.to_unix_ms.unwrap_or_else(unix_timestamp_ms);
+    let from = query
+        .from_unix_ms
+        .unwrap_or_else(|| to.saturating_sub(DAY_MS));
     let queryable = backend == RouteRequestLogBackend::Sqlite;
     let bucket_ms = if to - from <= 7 * DAY_MS {
         DAY_MS / 24
@@ -2772,6 +2809,7 @@ pub(crate) fn query_route_request_log_stats(
         groups: Vec::new(),
         groups_truncated: false,
         trend: Vec::new(),
+        daily_trend: Vec::new(),
         bucket_ms,
         database_bytes: fs::metadata(root.join(SQLITE_FILE_NAME))
             .map_or(0, |metadata| metadata.len()),
@@ -2785,6 +2823,27 @@ pub(crate) fn query_route_request_log_stats(
     let mut connection = open_query_connection(&path)?;
     let transaction = connection.transaction()?;
     let optional_columns = sqlite_optional_columns(&transaction, &path)?;
+    if query.all_time {
+        // Use the same filters and snapshot as the aggregates, excluding future timestamps.
+        query.cursor_mode = true;
+        query.from_unix_ms = Some(0);
+        query.to_unix_ms = Some(to);
+        let (where_clause, values) =
+            sqlite_query_filters(&query, optional_columns.official_account);
+        let earliest: Option<u64> = transaction.query_row(
+            &format!("SELECT MIN(timestamp_unix_ms) FROM route_request_logs{where_clause}"),
+            params_from_iter(values.iter()),
+            |row| row_optional_u64(row, 0),
+        )?;
+        result.from_unix_ms = earliest.unwrap_or(from);
+        query.from_unix_ms = Some(result.from_unix_ms);
+        let span = to - result.from_unix_ms;
+        result.bucket_ms = if span <= 7 * DAY_MS {
+            DAY_MS / 24
+        } else {
+            span.div_ceil(366 * DAY_MS).max(1) * DAY_MS
+        };
+    }
     let (where_clause, values) = sqlite_query_filters(&query, optional_columns.official_account);
     result.summary = transaction.query_row(
         &format!("SELECT {SUMMARY_COLUMNS} FROM route_request_logs{where_clause}"),
@@ -2804,10 +2863,15 @@ pub(crate) fn query_route_request_log_stats(
             "official_account" => "official_account_id",
             _ => unreachable!("validated grouping"),
         };
+        let order = if query.group_sort.as_deref() == Some("tokens") {
+            "SUM(total_tokens) IS NULL, SUM(total_tokens) DESC, group_key"
+        } else {
+            "COUNT(*) DESC, group_key"
+        };
         let sql = format!(
             "SELECT {SUMMARY_COLUMNS}, COALESCE({column}, '') AS group_key
             FROM route_request_logs{where_clause} GROUP BY group_key
-            ORDER BY COUNT(*) DESC, group_key LIMIT 51"
+            ORDER BY {order} LIMIT 51"
         );
         result.groups = transaction
             .prepare(&sql)?
@@ -2821,7 +2885,8 @@ pub(crate) fn query_route_request_log_stats(
         result.groups_truncated = result.groups.len() > 50;
         result.groups.truncate(50);
     }
-    // The validated range produces at most 367 daily or 169 hourly buckets.
+    // The range and adaptive UTC bucket width produce at most 367 buckets.
+    let bucket_ms = result.bucket_ms;
     let sql = format!("SELECT timestamp_unix_ms / {bucket_ms} * {bucket_ms} AS bucket,
         COUNT(*), SUM(total_tokens), AVG(CASE WHEN total_duration_ms >= 0 THEN total_duration_ms END),
         AVG(CASE WHEN COALESCE(downstream_first_content_ms, ttft_ms) >= 0 THEN COALESCE(downstream_first_content_ms, ttft_ms) END),
@@ -2840,6 +2905,24 @@ pub(crate) fn query_route_request_log_stats(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    if query.include_daily_trend {
+        let sql = format!(
+            "SELECT timestamp_unix_ms / {DAY_MS} * {DAY_MS} AS day,
+            COUNT(*), SUM(total_tokens), COUNT(total_tokens)
+            FROM route_request_logs{where_clause} GROUP BY day ORDER BY day"
+        );
+        result.daily_trend = transaction
+            .prepare(&sql)?
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok(RouteRequestLogDailyTrend {
+                    timestamp_unix_ms: row_u64(row, 0)?,
+                    total: row_u64(row, 1)?,
+                    total_tokens_sum: row_optional_u64(row, 2)?,
+                    total_tokens_known_count: row_u64(row, 3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
     transaction.commit()?;
     Ok(result)
 }
@@ -4102,6 +4185,357 @@ mod tests {
             .unwrap();
         assert_eq!(prune_sqlite_logs(&sqlite.connection, 0).unwrap(), 1_000);
         assert_eq!(prune_sqlite_logs(&sqlite.connection, 0).unwrap(), 501);
+    }
+
+    #[test]
+    fn sqlite_daily_trend_preserves_utc_days_filters_and_unknown_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
+        let from = DAY_MS + 100;
+        let to = 6 * DAY_MS + 100;
+        let entries = [
+            ("before", from - 1, Some(99)),
+            ("first", from, Some(10)),
+            ("mixed-unknown", 2 * DAY_MS - 1, None),
+            ("all-unknown", 2 * DAY_MS, None),
+            ("zero", 3 * DAY_MS, Some(0)),
+            ("last", to - 1, Some(20)),
+            ("after", to, Some(99)),
+        ]
+        .into_iter()
+        .map(|(id, timestamp, tokens)| {
+            let mut entry = sample_entry(id);
+            entry.timestamp_unix_ms = timestamp;
+            entry.token_usage.total_tokens = tokens;
+            queued(entry)
+        })
+        .collect::<Vec<_>>();
+        sink.write_batch(&entries).unwrap();
+        let mut excluded = sample_entry("other-model");
+        excluded.timestamp_unix_ms = from;
+        excluded.model = Some("excluded".into());
+        sink.write_batch(&[queued(excluded)]).unwrap();
+        let query = RouteRequestLogQuery {
+            from_unix_ms: Some(from),
+            to_unix_ms: Some(to),
+            model: sample_entry("model").model,
+            include_daily_trend: true,
+            ..Default::default()
+        };
+        let stats = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            query.clone(),
+        )
+        .unwrap();
+        let actual = stats
+            .daily_trend
+            .iter()
+            .map(|day| {
+                (
+                    day.timestamp_unix_ms,
+                    day.total,
+                    day.total_tokens_sum,
+                    day.total_tokens_known_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (DAY_MS, 2, Some(10), 1),
+                (2 * DAY_MS, 1, None, 0),
+                (3 * DAY_MS, 1, Some(0), 1),
+                (6 * DAY_MS, 1, Some(20), 1),
+            ]
+        );
+        assert_eq!(
+            stats.daily_trend.iter().map(|day| day.total).sum::<u64>(),
+            stats.summary.total,
+        );
+        assert_eq!(
+            Some(
+                stats
+                    .daily_trend
+                    .iter()
+                    .filter_map(|day| day.total_tokens_sum)
+                    .sum::<u64>()
+            ),
+            stats.summary.total_tokens_sum,
+        );
+        assert_eq!(
+            stats
+                .daily_trend
+                .iter()
+                .map(|day| day.total_tokens_known_count)
+                .sum::<u64>(),
+            stats.summary.total_tokens_known_count,
+        );
+        let serialized = serde_json::to_value(&stats).unwrap();
+        assert_eq!(
+            serialized["dailyTrend"][1]["totalTokensSum"],
+            serde_json::Value::Null,
+        );
+        assert_eq!(serialized["dailyTrend"][2]["totalTokensKnownCount"], 1);
+        let without_daily = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                include_daily_trend: false,
+                ..query.clone()
+            },
+        )
+        .unwrap();
+        assert!(without_daily.daily_trend.is_empty());
+        assert_eq!(without_daily.bucket_ms, stats.bucket_ms);
+        assert_eq!(
+            serde_json::to_value(without_daily.trend).unwrap(),
+            serialized["trend"],
+        );
+        let absent = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                request_id: Some("absent".into()),
+                ..query
+            },
+        )
+        .unwrap();
+        assert!(absent.daily_trend.is_empty());
+    }
+
+    #[test]
+    fn sqlite_all_time_statistics_preserve_history_and_bound_buckets() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
+        let now = unix_timestamp_ms();
+        let earliest = now - 800 * DAY_MS;
+        let entries = (0..800)
+            .map(|index| {
+                let mut entry = sample_entry(&format!("history-{index}"));
+                entry.timestamp_unix_ms = earliest + index * DAY_MS;
+                queued(entry)
+            })
+            .collect::<Vec<_>>();
+        sink.write_batch(&entries).unwrap();
+        let mut excluded = sample_entry("excluded-earlier-provider");
+        excluded.timestamp_unix_ms = 1;
+        excluded.provider = Some("other".into());
+        sink.write_batch(&[queued(excluded)]).unwrap();
+        let stats = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                all_time: true,
+                provider: Some("provider-a".into()),
+                include_daily_trend: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.summary.total, 800);
+        assert_eq!(stats.daily_trend.len(), 800);
+        for (index, day) in stats.daily_trend.iter().enumerate() {
+            assert_eq!(
+                day.timestamp_unix_ms,
+                earliest / DAY_MS * DAY_MS + index as u64 * DAY_MS,
+            );
+            assert_eq!(day.total, 1);
+            assert_eq!(
+                day.total_tokens_sum,
+                sample_entry("expected").token_usage.total_tokens,
+            );
+            assert_eq!(day.total_tokens_known_count, 1);
+        }
+        assert_eq!(
+            Some(
+                stats
+                    .daily_trend
+                    .iter()
+                    .filter_map(|day| day.total_tokens_sum)
+                    .sum::<u64>()
+            ),
+            stats.summary.total_tokens_sum,
+        );
+        assert_eq!(stats.from_unix_ms, earliest);
+        assert!(stats.to_unix_ms >= now);
+        assert_eq!(stats.bucket_ms % DAY_MS, 0);
+        assert!(stats.trend.len() <= 367);
+        assert!(stats.to_unix_ms / stats.bucket_ms - stats.from_unix_ms / stats.bucket_ms < 367);
+        assert_eq!(
+            stats.trend.iter().map(|bucket| bucket.total).sum::<u64>(),
+            800
+        );
+        assert!(
+            query_route_request_log_stats(
+                directory.path(),
+                RouteRequestLogBackend::Sqlite,
+                RouteRequestLogQuery {
+                    from_unix_ms: Some(earliest),
+                    to_unix_ms: Some(now),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sqlite_token_group_order_applies_before_truncation_and_preserves_unknowns() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
+        let mut entries = Vec::new();
+        for model in 0..50 {
+            for request in 0..2 {
+                let mut entry = sample_entry(&format!("small-{model}-{request}"));
+                entry.model = Some(format!("small-{model:02}"));
+                entry.token_usage.total_tokens = Some(1);
+                entries.push(queued(entry));
+            }
+        }
+        let mut high = sample_entry("high");
+        high.model = Some("high".into());
+        high.status = RequestStatus::Failed;
+        high.token_usage.total_tokens = Some(10_000);
+        entries.push(queued(high));
+        let mut unknown = sample_entry("unknown");
+        unknown.model = Some("unknown".into());
+        unknown.status = RequestStatus::Failed;
+        unknown.token_usage = RequestTokenUsage::default();
+        unknown.usage_reported = false;
+        entries.push(queued(unknown));
+        sink.write_batch(&entries).unwrap();
+        let query = RouteRequestLogQuery {
+            all_time: true,
+            group_by: Some("model".into()),
+            ..Default::default()
+        };
+        let default_order = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            query.clone(),
+        )
+        .unwrap();
+        assert_eq!(default_order.groups[0].key, "small-00");
+        assert!(default_order.groups.iter().all(|group| group.key != "high"));
+        let tokens = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                group_sort: Some("tokens".into()),
+                ..query.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(tokens.groups.len(), 50);
+        assert!(tokens.groups_truncated);
+        assert_eq!(tokens.groups[0].key, "high");
+        assert_eq!(tokens.groups[1].key, "small-00");
+        assert_eq!(tokens.summary.total_tokens_sum, Some(10_100));
+        assert_eq!(tokens.summary.total_tokens_known_count, 101);
+        let unknown = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                group_sort: Some("tokens".into()),
+                status: Some("failed".into()),
+                ..query
+            },
+        )
+        .unwrap();
+        assert_eq!(unknown.groups[0].key, "high");
+        assert_eq!(unknown.groups[1].key, "unknown");
+        assert_eq!(unknown.groups[1].summary.total_tokens_sum, None);
+    }
+
+    #[test]
+    fn all_time_statistics_validate_parameters_and_do_not_create_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let query: RouteRequestLogQuery = serde_json::from_value(serde_json::json!({
+            "allTime": true, "groupSort": "tokens", "includeDailyTrend": true,
+        }))
+        .unwrap();
+        assert!(query.all_time);
+        assert!(query.include_daily_trend);
+        assert!(!RouteRequestLogQuery::default().include_daily_trend);
+        for backend in [
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogBackend::Ndjson,
+        ] {
+            let stats =
+                query_route_request_log_stats(directory.path(), backend, query.clone()).unwrap();
+            assert_eq!(stats.summary.total, 0);
+            assert!(stats.trend.is_empty());
+            assert!(stats.daily_trend.is_empty());
+            assert!(stats.from_unix_ms < stats.to_unix_ms);
+            assert_eq!(stats.queryable, backend == RouteRequestLogBackend::Sqlite);
+        }
+        assert!(!directory.path().join(SQLITE_FILE_NAME).exists());
+        for stats_only in [
+            RouteRequestLogQuery {
+                all_time: true,
+                ..Default::default()
+            },
+            RouteRequestLogQuery {
+                group_sort: Some("tokens".into()),
+                ..Default::default()
+            },
+            RouteRequestLogQuery {
+                include_daily_trend: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                query_route_request_logs(
+                    directory.path(),
+                    RouteRequestLogBackend::Sqlite,
+                    stats_only
+                )
+                .is_err()
+            );
+        }
+        for invalid in [
+            RouteRequestLogQuery {
+                from_unix_ms: Some(1),
+                ..query.clone()
+            },
+            RouteRequestLogQuery {
+                to_unix_ms: Some(2),
+                ..query.clone()
+            },
+            RouteRequestLogQuery {
+                cursor_mode: true,
+                ..query.clone()
+            },
+            RouteRequestLogQuery {
+                cursor: Some(RouteRequestLogCursor {
+                    timestamp_unix_ms: 1,
+                    request_id: "one".into(),
+                }),
+                ..query.clone()
+            },
+            RouteRequestLogQuery {
+                group_sort: Some("arbitrary".into()),
+                ..query.clone()
+            },
+        ] {
+            assert!(
+                query_route_request_log_stats(
+                    directory.path(),
+                    RouteRequestLogBackend::Sqlite,
+                    invalid
+                )
+                .is_err()
+            );
+        }
+        let _sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
+        let empty =
+            query_route_request_log_stats(directory.path(), RouteRequestLogBackend::Sqlite, query)
+                .unwrap();
+        assert_eq!(empty.summary.total, 0);
+        assert!(empty.trend.is_empty());
+        assert!(empty.daily_trend.is_empty());
+        assert!(empty.from_unix_ms < empty.to_unix_ms);
     }
 
     #[test]
