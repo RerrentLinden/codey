@@ -364,6 +364,11 @@
   transition: filter 150ms ease, opacity 150ms ease;
 }
 
+.subagent-role-icon-box--default {
+  background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
+  color: var(--codey-text, #1d1d1f);
+}
+
 .subagent-role-disabled .subagent-role-icon-box {
   filter: grayscale(85%);
   opacity: 0.7;

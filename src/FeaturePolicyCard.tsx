@@ -56,6 +56,12 @@ const SUBAGENT_ACCESS_LABELS = {
   readOnly: "只读",
   write: "可写",
 } as const;
+const DEFAULT_SUBAGENT_TASK = {
+  id: "default",
+  name: "默认子代理",
+  icon: IconUsersGroup,
+  description: "未指定专用角色时使用的模型与思考深度。",
+} as const;
 const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
@@ -155,7 +161,10 @@ export function SubagentPolicyCardComponent({
     ({ id }) => config.subagentRoles[id]?.enabled !== false,
   ).length;
 
-  const renderRoleCard = (task: (typeof SUBAGENT_TASK_TYPES)[number]) => {
+  const renderRoleCard = (
+    task: (typeof SUBAGENT_TASK_TYPES)[number] | typeof DEFAULT_SUBAGENT_TASK,
+  ) => {
+    const isDefaultRole = task.id === "default";
     const TaskIcon = task.icon;
     const selection = config.subagentRoles[task.id] ?? {
       enabled: true,
@@ -172,15 +181,23 @@ export function SubagentPolicyCardComponent({
       label: REASONING_EFFORT_LABELS[effort] ?? effort,
       value: effort,
     }));
-    const updateRole = (next: Partial<typeof selection>) =>
+    const updateRole = (next: Partial<typeof selection>) => {
+      const nextSelection = { ...selection, ...next };
       onConfigChange({
         ...config,
+        ...(isDefaultRole
+          ? {
+              subagentModel: nextSelection.model,
+              subagentReasoningEffort: nextSelection.reasoningEffort,
+            }
+          : {}),
         subagentRoles: {
           ...config.subagentRoles,
-          [task.id]: { ...selection, ...next },
+          [task.id]: nextSelection,
         },
       });
-    const roleDisabled = !selection.enabled;
+    };
+    const roleDisabled = !isDefaultRole && !selection.enabled;
     const isSingleEnabledRole = selection.enabled && enabledRoleCount <= 1;
 
     return (
@@ -208,21 +225,23 @@ export function SubagentPolicyCardComponent({
               <p className="subagent-role-description">{task.description}</p>
             </div>
           </div>
-          <div
-            className="subagent-role-switch-wrap"
-            title={
-              isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : undefined
-            }
-          >
-            <Switch
-              checked={selection.enabled}
-              disabled={
-                subagentPolicyControlsDisabled || isSingleEnabledRole
+          {!isDefaultRole && (
+            <div
+              className="subagent-role-switch-wrap"
+              title={
+                isSingleEnabledRole ? "至少需要保留一个启用的调度角色" : undefined
               }
-              onCheckedChange={(enabled) => updateRole({ enabled })}
-              aria-label={`${selection.enabled ? "关闭" : "启用"}${task.name}角色`}
-            />
-          </div>
+            >
+              <Switch
+                checked={selection.enabled}
+                disabled={
+                  subagentPolicyControlsDisabled || isSingleEnabledRole
+                }
+                onCheckedChange={(enabled) => updateRole({ enabled })}
+                aria-label={`${selection.enabled ? "关闭" : "启用"}${task.name}角色`}
+              />
+            </div>
+          )}
         </div>
 
         <div className="subagent-role-controls-row">
@@ -317,6 +336,9 @@ export function SubagentPolicyCardComponent({
         <div className="module-card-body subagent-policy-body">
           {config.subagentOptimization ? (
             <>
+              <div className="subagent-group-card codey-card">
+                {renderRoleCard(DEFAULT_SUBAGENT_TASK)}
+              </div>
               <div className="subagent-group-card codey-card">
                 <div className="subagent-group-header">
                   <div className="subagent-group-title-wrap">
