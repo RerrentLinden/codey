@@ -74,7 +74,7 @@ function SystemSettingsDialogComponent({
       >
         <DialogHeader>
           <div className="flex items-center gap-3">
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[var(--codey-brand-subtle,#e8f0fe)] text-[var(--codey-accent,#0071e3)]">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[var(--codey-blue-soft)] text-[var(--codey-accent,#0071e3)]">
               <IconSettings size={18} aria-hidden="true" />
             </div>
             <div className="min-w-0 flex-1">
@@ -88,7 +88,7 @@ function SystemSettingsDialogComponent({
 
         <div className="flex flex-col gap-2.5 py-1 text-sm">
           {/* 版本与目录信息：三项合并为一个卡片，优雅兼容长目录路径 */}
-          <div className="flex flex-col rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-secondary,#f8f9fa)] p-3">
+          <div className="flex flex-col rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-muted)] p-3">
             {/* 上半部分：Codey 与 Codex 版本并排 */}
             <div className="grid grid-cols-2 divide-x divide-[var(--codey-border-subtle)] pb-2.5 border-b border-[var(--codey-border-subtle)]">
               <div className="flex items-center justify-between pr-3 min-w-0">
@@ -140,7 +140,7 @@ function SystemSettingsDialogComponent({
           </div>
 
           {/* Codex 配置维护 */}
-          <div className="flex flex-col gap-2 rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-secondary,#f8f9fa)] p-3">
+          <div className="flex flex-col gap-2 rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-muted)] p-3">
             <div className="flex items-center justify-between gap-3">
               <span className="text-xs font-semibold text-[var(--codey-text)]">
                 修复 Codex 配置
@@ -175,7 +175,7 @@ function SystemSettingsDialogComponent({
           </div>
 
           {/* 自动检查更新开关 */}
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-secondary,#f8f9fa)] p-3">
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-muted)] p-3">
             <span id="system-settings-auto-update-label" className="text-xs font-semibold text-[var(--codey-text)]">
               自动检查 Codey 更新
             </span>

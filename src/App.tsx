@@ -1411,6 +1411,16 @@ export function App({
             <div className="sidebar-footer-left">
               <span className="sidebar-footer-version font-mono">
                 v{status.appVersion || "0.0.1"}
+                {(updateCheck?.updateAvailable === true || Boolean(downloadedUpdate)) && (
+                  <span
+                    className="ml-1.5 inline-flex shrink-0"
+                    role="img"
+                    aria-label={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
+                    title={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
+                  >
+                    <span className="size-1.5 rounded-full bg-[var(--codey-red)]" aria-hidden="true" />
+                  </span>
+                )}
               </span>
               <Tooltip content={updateTooltipText} position="top">
                 <Button
