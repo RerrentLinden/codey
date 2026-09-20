@@ -438,6 +438,7 @@ dependencies = [
 name = "codey-plugin-sdk"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "fs2",
  "libc",

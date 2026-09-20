@@ -211,7 +211,11 @@ fn marketplace_plugins_available(
     if plugins.is_empty() {
         return Ok(false);
     }
-    let canonical_root = root.canonicalize()?;
+    // 损坏的快照必须走重装自愈，所以读取失败按「快照不可用」处理，不能把 IO
+    // 错误升级成整个市场初始化失败。
+    let Ok(canonical_root) = root.canonicalize() else {
+        return Ok(false);
+    };
     for plugin in plugins {
         let Some(name) = plugin
             .get("name")
@@ -245,14 +249,16 @@ fn marketplace_plugins_available(
             return Ok(false);
         };
         let manifest_path = root.join(relative).join(".codex-plugin/plugin.json");
-        if !manifest_path.is_file() {
+        // 悬空链接、缺失目标与不可读内容同样是「快照损坏」，一律触发重装。
+        let Ok(manifest_path) = manifest_path.canonicalize() else {
+            return Ok(false);
+        };
+        if !manifest_path.starts_with(&canonical_root) {
             return Ok(false);
         }
-        if !manifest_path.canonicalize()?.starts_with(&canonical_root) {
+        let Ok(bytes) = std::fs::read(&manifest_path) else {
             return Ok(false);
-        }
-        let bytes = std::fs::read(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        };
         let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return Ok(false);
         };
@@ -427,7 +433,10 @@ fn replace_directory_with_backup_name(
     }
     match std::fs::rename(source, destination) {
         // Keep the old directory: it may contain user-added files worth recovering.
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            prune_marketplace_backups(destination, backup_name);
+            Ok(())
+        }
         Err(error) => {
             if backup.exists() {
                 let _ = std::fs::rename(&backup, destination);
@@ -439,6 +448,44 @@ fn replace_directory_with_backup_name(
                     destination.display()
                 )
             })
+        }
+    }
+}
+
+/// 快照反复被判损坏时会不断留下完整旧副本，因此按名保留最近几份。
+const MARKETPLACE_BACKUP_LIMIT: usize = 3;
+
+fn prune_marketplace_backups(destination: &Path, backup_name: &str) {
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    let prefix = format!("{backup_name}-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let mut backups = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()?;
+            Some((modified, path))
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, path) in backups.into_iter().skip(MARKETPLACE_BACKUP_LIMIT) {
+        // 备份名可预测，因此只删除目录本身；链接留给人工处理，不跟随目标。
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let _ = std::fs::remove_dir_all(&path);
         }
     }
 }

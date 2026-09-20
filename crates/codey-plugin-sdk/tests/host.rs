@@ -1,4 +1,9 @@
 // Exercise the host independently of the desktop application and its UI runtime.
+// 宿主模块通过 `crate::fs_util` 取哈希与原子写实现，这里按同一路径接入，
+// 使被引入的插件模块能在不带桌面端其余依赖的前提下编译。
+#[allow(dead_code)]
+#[path = "../../../backend/src/fs_util.rs"]
+mod fs_util;
 #[path = "../../../backend/src/codey_plugins/mod.rs"]
 mod host;
 

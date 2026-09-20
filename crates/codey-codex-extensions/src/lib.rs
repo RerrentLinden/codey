@@ -135,7 +135,7 @@ impl ExtensionService {
                 cache.read(&path)?.map(fsutil::digest),
             ));
         }
-        for entry in &entries {
+        for entry in &mut entries {
             let manifest = PathBuf::from(entry["manifestPath"].as_str().unwrap());
             fingerprints.push((
                 manifest.to_string_lossy().into_owned(),
@@ -147,17 +147,34 @@ impl ExtensionService {
                 cache.read(&dependencies).ok().flatten().map(fsutil::digest),
             ));
             if entry["ownership"] == "managed" {
-                for path in fsutil::walk(manifest.parent().unwrap())? {
-                    fingerprints.push((
-                        path.to_string_lossy().into_owned(),
-                        cache.read(&path)?.map(|b| {
-                            format!(
-                                "{}:{:?}",
-                                fsutil::digest(b),
-                                fsutil::file_mode(&path).ok().flatten()
-                            )
-                        }),
-                    ));
+                match fsutil::walk(manifest.parent().unwrap()) {
+                    Ok(paths) => {
+                        for path in paths {
+                            fingerprints.push((
+                                path.to_string_lossy().into_owned(),
+                                cache.read(&path)?.map(|b| {
+                                    format!(
+                                        "{}:{:?}",
+                                        fsutil::digest(b),
+                                        fsutil::file_mode(&path).ok().flatten()
+                                    )
+                                }),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        // 目录里一个符号链接或超限文件就让整页失效会把用户挡在外面，
+                        // 因此降级为「暂停编辑与启停」。卸载保持可用：它是清除该问题
+                        // 的出口，且只删除本模块登记过的文件。
+                        entry["canEdit"] = json!(false);
+                        entry["canToggle"] = json!(false);
+                        entry["reason"] =
+                            json!(format!("目录内容无法完整校验，已暂停编辑与启停：{error}"));
+                        warnings.push(format!(
+                            "{} 的内容无法完整校验，已暂停编辑与启停：{error}",
+                            manifest.to_string_lossy()
+                        ));
+                    }
                 }
             }
         }
@@ -462,27 +479,44 @@ impl ExtensionService {
                 );
                 let mut registry = self.registry()?;
                 let managed = registry.get_mut(&path).context("托管记录不存在")?;
-                let actual = fsutil::walk(&path)?;
+                // 卸载只处理本模块登记过的文件，所以目录里多出的内容（符号链接、
+                // 超限文件等无法枚举的项）不该把用户锁在界面上：枚举失败时退回登记
+                // 清单，额外内容保持原样。编辑仍要求目录可完整校验，避免覆盖看不见
+                // 的外部修改。
+                let uninstalling = action == "uninstall_skill";
+                let actual = match fsutil::walk(&path) {
+                    Ok(actual) => actual,
+                    Err(_) if uninstalling => managed.files.keys().cloned().collect(),
+                    Err(error) => return Err(error),
+                };
                 ensure!(
-                    actual.len() == managed.files.len(),
+                    uninstalling || actual.len() == managed.files.len(),
                     "Skill 文件集合已被外部修改，请保留原文件并重新导入"
                 );
                 for p in actual {
-                    if !(action == "save_skill" && p == path.join("SKILL.md")) {
-                        ensure!(
-                            managed.files.get(&p)
-                                == fsutil::read(&p)?
-                                    .as_ref()
-                                    .map(|b| fsutil::digest(b))
-                                    .as_ref(),
-                            "Skill 文件已被外部修改，拒绝覆盖或删除"
-                        );
+                    // 覆盖写入的目标内容由请求决定，但权限必须保持与登记一致。
+                    let skip_content = action == "save_skill" && p == path.join("SKILL.md");
+                    if !skip_content {
+                        match fsutil::read(&p) {
+                            Ok(bytes) => ensure!(
+                                managed.files.get(&p) == bytes.map(|b| fsutil::digest(&b)).as_ref(),
+                                "Skill 文件已被外部修改，拒绝覆盖或删除"
+                            ),
+                            // 登记项被替换成链接或不可读内容时，删除它本身不会跟随链接，
+                            // 是用户清除该 Skill 的出口；编辑必须拒绝。
+                            Err(_) if uninstalling => {}
+                            Err(error) => return Err(error),
+                        }
                     }
-                    if let Some(mode) = managed.modes.get(&p) {
-                        ensure!(
-                            fsutil::file_mode(&p)? == Some(*mode),
-                            "Skill 文件权限已被外部修改，拒绝覆盖或删除"
-                        );
+                    if let Some(expected) = managed.modes.get(&p) {
+                        match fsutil::file_mode(&p) {
+                            Ok(mode) => ensure!(
+                                mode == Some(*expected),
+                                "Skill 文件权限已被外部修改，拒绝覆盖或删除"
+                            ),
+                            Err(_) if uninstalling => {}
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 if action == "save_skill" {

@@ -2,6 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { readSource } from "./helpers/read-source.mjs";
+import {
+  autoStubModule,
+  collectElements,
+  createComponentModule,
+  elementProps,
+  elementType,
+  textContent,
+} from "./helpers/jsx-tree.mjs";
 
 const [dialogSource, appSource, stylesSource, operationsSource] = await Promise.all([
   readSource("src/SystemSettingsDialog.tsx"),
@@ -10,35 +18,134 @@ const [dialogSource, appSource, stylesSource, operationsSource] = await Promise.
   readSource("src/OperationsPanel.tsx"),
 ]);
 
-test("SystemSettingsDialog renders versions, Codex path, repair button, and auto-update switch", () => {
-  assert.match(dialogSource, /export const SystemSettingsDialog = memo\(/);
-  // Codey 版本
-  assert.match(dialogSource, /Codey 版本/);
-  assert.match(dialogSource, /appVersion \|\| "0\.0\.1"/);
-  // Codex 版本
-  assert.match(dialogSource, /Codex 版本/);
-  assert.match(dialogSource, /codexAppVersion/);
-  // 不展示冗余的应用及运行状态徽章
-  assert.doesNotMatch(dialogSource, /当前应用/);
-  assert.doesNotMatch(dialogSource, />运行中</);
-  // Codex 目录与复制按钮
-  assert.match(dialogSource, /Codex 目录/);
-  assert.match(dialogSource, /handleCopyPath/);
-  // 修复 Codex 配置按钮与 notice
-  assert.match(dialogSource, /修复 Codex 配置/);
-  assert.match(dialogSource, /onRepairCodexConfig/);
-  assert.match(dialogSource, /:\s*"修复"\}/);
-  assert.match(dialogSource, /<IconTool/);
-  assert.doesNotMatch(dialogSource, /检查配置文件并修复异常/);
-  assert.match(dialogSource, /configRepairNotice/);
-  // 自动检查 Codey 更新开关
-  assert.match(dialogSource, /自动检查 Codey 更新/);
-  assert.doesNotMatch(dialogSource, /后台每隔 30 分钟自动检查新版本/);
-  assert.match(dialogSource, /autoCheckCodeyUpdates/);
-  assert.match(dialogSource, /onAutoCheckCodeyUpdatesChange/);
+// 组件库与图标按名字生成桩：断言的是真实组件渲染出的元素树（含事件接线），
+// 而不是源码里的字符串，因此把 onClick/onCheckedChange 改成空操作一定会失败。
+const ui = autoStubModule("ui");
+const icons = autoStubModule("icon");
+const { exports: dialog, reset } = await createComponentModule(
+  new URL("../src/SystemSettingsDialog.tsx", import.meta.url),
+  { stubs: { "./components/ui": ui, "@tabler/icons-react": icons } },
+);
+
+const clipboardWrites = [];
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: {
+    clipboard: {
+      writeText(value) {
+        clipboardWrites.push(value);
+        return Promise.resolve();
+      },
+    },
+  },
 });
 
-test("App sidebar footer renders left version and update icon, right settings icon", () => {
+function renderDialog(overrides = {}) {
+  reset();
+  const calls = { repair: 0, autoCheck: [] };
+  const props = {
+    open: true,
+    onOpenChange: () => {},
+    container: null,
+    appVersion: "1.1.1",
+    codexAppVersion: "0.4.0",
+    codexAppPath: "/Applications/ChatGPT.app",
+    isBusy: false,
+    busy: null,
+    onRepairCodexConfig: () => {
+      calls.repair += 1;
+    },
+    configRepairNotice: null,
+    autoCheckCodeyUpdates: true,
+    onAutoCheckCodeyUpdatesChange: (checked) => {
+      calls.autoCheck.push(checked);
+    },
+    ...overrides,
+  };
+  return { calls, props, tree: dialog.SystemSettingsDialog(props) };
+}
+
+const byLabel = (tree, label) =>
+  collectElements(tree, (element) => elementProps(element)["aria-label"] === label);
+const byText = (tree, text) =>
+  collectElements(
+    tree,
+    (element) =>
+      typeof elementProps(element).onClick === "function" &&
+      textContent(element).replace(/\s+/g, "") === text,
+  );
+const switches = (tree) =>
+  collectElements(tree, (element) => elementType(element) === ui.Switch);
+
+test("复制路径、修复配置与自动更新开关都接到真实回调", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  clipboardWrites.length = 0;
+  const { calls, tree } = renderDialog();
+  const text = textContent(tree);
+  assert.match(text, /v1\.1\.1/);
+  assert.match(text, /v0\.4\.0/);
+  assert.match(text, /\/Applications\/ChatGPT\.app/);
+
+  const [copyButton] = byLabel(tree, "复制 Codex 路径");
+  assert.ok(copyButton, "复制按钮必须带 aria-label");
+  await elementProps(copyButton).onClick();
+  assert.deepEqual(clipboardWrites, ["/Applications/ChatGPT.app"]);
+
+  // 未配置 Codex 路径时复制默认路径，按钮依旧可用。
+  clipboardWrites.length = 0;
+  const fallback = renderDialog({ codexAppPath: "" });
+  await elementProps(byLabel(fallback.tree, "复制 Codex 路径")[0]).onClick();
+  assert.deepEqual(clipboardWrites, ["/Applications/ChatGPT.app"]);
+
+  const [repairButton] = byText(tree, "修复");
+  assert.ok(repairButton, "修复按钮必须存在");
+  assert.equal(elementProps(repairButton).disabled, false);
+  elementProps(repairButton).onClick();
+  assert.equal(calls.repair, 1, "点击修复必须触发修复回调");
+
+  const [autoSwitch] = switches(tree);
+  assert.ok(autoSwitch, "自动检查更新必须是开关控件");
+  assert.equal(elementProps(autoSwitch).checked, true);
+  assert.equal(elementProps(autoSwitch).disabled, false);
+  const labelId = elementProps(autoSwitch)["aria-labelledby"];
+  assert.ok(labelId, "开关必须带可访问名");
+  assert.equal(
+    collectElements(tree, (element) => elementProps(element).id === labelId)
+      .length,
+    1,
+    "开关的可访问名必须指向渲染出的标题",
+  );
+  elementProps(autoSwitch).onCheckedChange(false);
+  elementProps(autoSwitch).onCheckedChange(true);
+  assert.deepEqual(calls.autoCheck, [false, true]);
+});
+
+test("开关跟随配置、修复中显示进行态", () => {
+  const off = renderDialog({ autoCheckCodeyUpdates: false });
+  assert.equal(elementProps(switches(off.tree)[0]).checked, false);
+
+  const busy = renderDialog({ busy: "repair-codex-config", isBusy: true });
+  const [busyButton] = byText(busy.tree, "修复中…");
+  assert.ok(busyButton, "修复进行中必须显示进行态");
+  assert.equal(elementProps(busyButton).disabled, true);
+  assert.equal(busy.calls.repair, 0);
+});
+
+test("系统设置不出现冗余状态文案", () => {
+  const { tree } = renderDialog();
+  const text = textContent(tree);
+  assert.doesNotMatch(text, /当前应用/);
+  assert.doesNotMatch(text, /运行中/);
+  assert.doesNotMatch(text, /检查配置文件并修复异常/);
+  assert.doesNotMatch(text, /后台每隔 30 分钟自动检查新版本/);
+  assert.doesNotMatch(dialogSource, /检查配置文件并修复异常/);
+});
+
+test("App 把系统设置对话框接到修复命令与自动更新保存入口", () => {
+  assert.match(appSource, /onRepairCodexConfig=\{askRepairCodexConfig\}/);
+  assert.match(appSource, /onAutoCheckCodeyUpdatesChange=\{changeAutomaticUpdateChecks\}/);
+  assert.match(appSource, /autoCheckCodeyUpdates=\{config\.autoCheckCodeyUpdates !== false\}/);
+  assert.match(appSource, /invoke<[\s\S]{0,240}?>\("repair_codex_config"\)/);
   assert.match(appSource, /className="sidebar-footer-bar"/);
   assert.match(appSource, /className="sidebar-footer-left"/);
   assert.doesNotMatch(appSource, /className="sidebar-footer-brand"/);

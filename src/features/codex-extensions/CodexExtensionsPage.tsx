@@ -35,7 +35,10 @@ import type {
   McpEntry,
   SkillEntry,
 } from "./types";
-import { useExtensionsController } from "./useExtensionsController";
+import {
+  useExtensionsController,
+  type RunOutcome,
+} from "./useExtensionsController";
 import { downloadResource } from "./download";
 import {
   NEW_MCP_JSON,
@@ -269,9 +272,17 @@ export function CodexExtensionsPage({
       });
       return;
     }
-    if (await controller.mutate({ ...action, revision: draft.revision }))
-      setDraft(null);
+    settleSave(await controller.mutate({ ...action, revision: draft.revision }));
   };
+
+  // 保存已落库（ok）时清掉草稿；被抢占（superseded）时后端同样已写入，
+  // 继续保留草稿会让用户误以为未提交，因此清草稿并刷新清单确认最新状态。
+  const settleSave = (outcome: RunOutcome) => {
+    if (outcome === "failed") return;
+    setDraft(null);
+    if (outcome === "superseded") void controller.refresh();
+  };
+
   const loadLatest = () => {
     if (!draft) return;
     if (draft.isNew || draft.kind === "install") {
@@ -744,10 +755,9 @@ export function CodexExtensionsPage({
               current.action.action === "test_mcp"
                 ? controller.inspect(current.action)
                 : controller.mutate(current.action)
-            ).then((success) => {
+            ).then((outcome) => {
               setConfirmation(null);
-              if (success && current.action.action === "save_mcp")
-                setDraft(null);
+              if (current.action.action === "save_mcp") settleSave(outcome);
             });
           }}
         />

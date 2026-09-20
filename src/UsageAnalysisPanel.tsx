@@ -36,6 +36,8 @@ export function UsageAnalysisPanel({ onBack }: { onBack: () => void }) {
     return `${colors[index]} ${start}deg ${angle}deg`;
   }).join(", ") : "";
   const trend = stats?.queryable ? usageTrend(stats) : { peak: null, bars: [] };
+  // 未上报用量的分桶画成低矮虚线柱，避免与零用量一样显示为空白。
+  const unknownBarHeight = 3;
   const percent = (tokens: number | null) => tokens != null && totalTokens != null && totalTokens > 0 ? tokens / totalTokens * 100 : null;
 
   return <section className="usage-analysis" aria-labelledby="usage-analysis-title">
@@ -97,11 +99,11 @@ export function UsageAnalysisPanel({ onBack }: { onBack: () => void }) {
                 <div className="usage-trend-chart"><div className="usage-trend-scale"><span>{formatUsageNumber(trend.peak)}</span><span>{formatUsageNumber(trend.peak == null ? null : trend.peak / 2)}</span><span>0</span></div><div className="usage-trend-plot">
                   <svg className="usage-trend" viewBox="0 0 800 140" preserveAspectRatio="none" role="img" aria-label="UTC 时间分桶的已知 Token 趋势，展开下方明细可读取每组数据">
                     {[11, 75, 139].map((y) => <line className="usage-gridline" key={y} x1="0" y1={y} x2="800" y2={y} strokeDasharray={y === 139 ? undefined : "4 5"} />)}
-                    {trend.bars.map((bucket) => <rect className="usage-trend-bar" key={bucket.timestampUnixMs} x={bucket.x} y={139 - bucket.height} width={bucket.width} height={bucket.height} rx="2"><title>{utc(bucket.timestampUnixMs)} UTC：{formatUsageNumber(bucket.totalTokensSum)} Token，{formatUsageNumber(bucket.total)} 次请求</title></rect>)}
+                    {trend.bars.map((bucket) => <rect className="usage-trend-bar" key={bucket.timestampUnixMs} x={bucket.x} y={139 - (bucket.tokensUnknown ? unknownBarHeight : bucket.height)} width={bucket.width} height={bucket.tokensUnknown ? unknownBarHeight : bucket.height} rx="2" style={bucket.tokensUnknown ? { fill: "none", stroke: "var(--codey-blue, #007aff)", strokeDasharray: "2 2", strokeWidth: 1.5, opacity: .75, vectorEffect: "non-scaling-stroke" } : undefined}><title>{utc(bucket.timestampUnixMs)} UTC：{bucket.tokensUnknown ? "用量未上报" : `${formatUsageNumber(bucket.totalTokensSum)} Token`}，{formatUsageNumber(bucket.total)} 次请求</title></rect>)}
                   </svg>
                   <div className="usage-trend-labels"><span>{utc(stats.fromUnixMs)}</span><span className="usage-trend-midpoint">{utc(stats.fromUnixMs + (stats.toUnixMs - stats.fromUnixMs) / 2)}</span><span>{utc(stats.toUnixMs)}</span></div>
                 </div></div>
-                <p className="usage-scope">空白可能表示没有请求或用量未上报；以明细为准。</p></>}
+                <p className="usage-scope">虚线柱表示该时段有请求但用量未上报；空白表示没有请求，以明细为准。</p></>}
                 <details className="usage-trend-details"><summary>查看趋势明细</summary><div className="usage-table-scroll"><table><thead><tr><th>分桶起点（UTC）</th><th>请求数</th><th>Token</th></tr></thead><tbody>{stats.trend.map((bucket) => <tr key={bucket.timestampUnixMs}><td>{utc(bucket.timestampUnixMs)}</td><td>{formatUsageNumber(bucket.total)}</td><td>{formatUsageNumber(bucket.totalTokensSum)}</td></tr>)}</tbody></table></div></details>
               </> : <p className="usage-scope">暂无趋势数据</p>}
             </div>

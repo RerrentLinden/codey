@@ -116,9 +116,10 @@ test("renderer core loads session tools after idle time or sidebar use", async (
     sessionTools,
     /window\.__codeySessionToolsInjectLoaded = true;\s*window\.__codeySessionToolsInjectLoading = false;\s*void reconcileStaleCompletedTask\(\);\s*scheduleInitialScan\(\)/,
   );
+  // 顺序要求：先复位 loading、再回收安装、最后重新抛出；允许中间有额外清理。
   assert.match(
     sessionTools,
-    /catch \(error\) \{\s*window\.__codeySessionToolsInjectLoading = false;\s*disposeInstall\?\.\(\);\s*throw error;/,
+    /catch \(error\) \{\s*window\.__codeySessionToolsInjectLoading = false;[\s\S]{0,400}?disposeInstall\?\.\(\);[\s\S]{0,400}?throw error;/,
   );
   assert.match(
     promptOptimize,

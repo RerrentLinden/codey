@@ -155,7 +155,9 @@ export function useAppUpdates({
     };
 
     const checkForUpdatesSilently = async () => {
-      if (cancelled || shouldPause()) return;
+      if (cancelled) return;
+      // 暂停只影响本次检查，定时器链必须继续，否则状态被手动清空后不再恢复自动检查。
+      if (shouldPause()) return schedule();
       const manualVersion = manualCheckVersion.current;
       setAutomaticallyChecking(true);
       try {
@@ -188,8 +190,10 @@ export function useAppUpdates({
         }
         // 更新地址不可达或检查超时时直接跳过；手动检查仍会展示具体错误。
       } finally {
-        if (!cancelled) setAutomaticallyChecking(false);
-        if (!cancelled && !shouldPause()) schedule();
+        if (!cancelled) {
+          setAutomaticallyChecking(false);
+          schedule();
+        }
       }
     };
 

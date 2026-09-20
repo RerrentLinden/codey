@@ -223,9 +223,15 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<PluginList, String> {
         state.plugins.get_mut(id).unwrap().enabled = true;
         state.plugins.get_mut(id).unwrap().load_error = None;
         if let Err(e) = manager.commit(state) {
-            if !was_loaded {
-                manager.live.remove(id);
-            }
+            let rolled_back = if was_loaded {
+                None
+            } else {
+                manager.live.remove(id)
+            };
+            // 插件原生 destroy 不能在全局管理锁内执行：慢插件会卡住全部插件管理与
+            // 请求回调，与 disable 分支保持一致。
+            drop(manager);
+            drop(rolled_back);
             return Err(e);
         }
         manager.errors.remove(id);
@@ -279,11 +285,18 @@ pub fn invoke(id: &str, method: &str, params: Value) -> Result<Value, String> {
         .lock()
         .map_err(|_| "插件实例锁已损坏")?
         .invoke(method, params);
-    if let Err(e) = &result
-        && let Ok(mut m) = manager()
-    {
-        m.errors.insert(id.to_owned(), e.clone());
-        m.log_event(id, "invoke_failed");
+    if let Ok(mut m) = manager() {
+        match &result {
+            // 一次成功说明插件已经恢复正常，不能继续把瞬时失败当作当前故障，
+            // 否则界面会一直显示运行异常。
+            Ok(_) => {
+                m.errors.remove(id);
+            }
+            Err(e) => {
+                m.errors.insert(id.to_owned(), e.clone());
+                m.log_event(id, "invoke_failed");
+            }
+        }
     }
     result
 }
@@ -340,27 +353,45 @@ pub fn dispatch_request_headers(
             Err(e) => {
                 // Retire only this generation. An old in-flight callback must not
                 // disable a replacement that was enabled while the callback ran.
-                let retired = if let Ok(mut m) = manager() {
-                    if m.live
-                        .get(id)
-                        .is_some_and(|active| Arc::ptr_eq(&active.instance, instance))
-                    {
-                        m.errors.insert(id.clone(), e);
-                        m.log_event(id, "request_callback_failed");
-                        let retired = m.live.remove(id);
-                        m.update_fast_path();
-                        retired
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let retired = manager()
+                    .ok()
+                    .filter(|m| {
+                        m.live
+                            .get(id)
+                            .is_some_and(|active| Arc::ptr_eq(&active.instance, instance))
+                    })
+                    .and_then(|mut m| retire_untrusted_plugin(&mut m, id, e));
                 drop(retired);
             }
         }
     }
     result
+}
+
+/// 撤销一个不可信的插件：内存态立即生效，同时按启动加载失败的做法持久化停用。
+/// 只改内存态会让重启后重新加载已被判定不安全的插件，界面也不再显示原因。
+fn retire_untrusted_plugin(m: &mut Manager, id: &str, error: String) -> Option<Active> {
+    let message = format!("请求回调失败，插件已自动停用，请检查后重新启用：{error}");
+    let mut state = m.state.clone();
+    let saved = match state.plugins.get_mut(id) {
+        Some(record) => {
+            record.enabled = false;
+            record.load_error = Some(message.clone());
+            m.commit(state)
+        }
+        None => Ok(()),
+    };
+    m.errors.insert(
+        id.to_owned(),
+        match saved {
+            Ok(()) => message,
+            Err(save_error) => format!("{message}；保存自动停用状态失败：{save_error}"),
+        },
+    );
+    m.log_event(id, "request_callback_failed");
+    let retired = m.live.remove(id);
+    m.update_fast_path();
+    retired
 }
 
 fn validate_patches(value: Value, allowed: &[String]) -> Result<Vec<HeaderPatch>, String> {
@@ -582,8 +613,15 @@ impl Manager {
                         {
                             continue;
                         }
-                        checked_directory(&entry.path())?;
-                        sources.push(entry.path());
+                        let path = entry.path();
+                        // 插件可以把缓存写进自己的目录，普通文件只删除它本身；
+                        // 符号链接仍然拒绝，避免顺着链接删到插件目录之外。
+                        if path.is_dir() {
+                            checked_directory(&path)?;
+                        } else {
+                            checked_file(&path)?;
+                        }
+                        sources.push(path);
                     }
                 }
             }
@@ -641,6 +679,8 @@ impl Manager {
         let legacy_config = old
             .and_then(|record| record.config.clone())
             .or_else(|| self.state.retained_config.get(&id).cloned());
+        // 升级成功后清理旧版本目录，先取成 owned 值，避免状态借用跨过后续提交。
+        let previous_directory = old.map(|record| record.directory.clone());
         // Unique paths prevent dlopen from reusing a retained mapping after reinstall.
         let version_directory = format!("{}-{}", inspection.manifest.version, uuid::Uuid::new_v4());
         let directory = format!("versions/{version_directory}");
@@ -694,7 +734,7 @@ impl Manager {
                 manifest: inspection.manifest,
                 config: None,
                 enabled,
-                directory,
+                directory: directory.clone(),
                 load_error: None,
             },
         );
@@ -708,6 +748,18 @@ impl Manager {
         }
         self.errors.remove(&id);
         self.log_event(&id, "installed");
+        // 安装总是新建唯一版本目录，升级留下的旧目录不清理会一直累积磁盘占用。
+        if let Some(previous) = previous_directory
+            && previous != directory
+        {
+            let stale = plugin_directory.join(&previous);
+            // 状态文件可能被外部改写，因此只删 versions 下的普通目录。
+            if stale.parent() == Some(versions.as_path())
+                && let Ok(stale) = checked_directory(&stale)
+            {
+                let _ = fs::remove_dir_all(stale);
+            }
+        }
         Ok(())
     }
 
@@ -1036,6 +1088,15 @@ fn checked_directory(path: &Path) -> Result<PathBuf, String> {
     let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("插件安装路径必须是普通目录，不能是符号链接".into());
+    }
+    path.canonicalize().map_err(|e| e.to_string())
+}
+
+/// 普通文件同样只接受非链接目标：卸载删除的是条目本身，不会跟随链接。
+fn checked_file(path: &Path) -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("插件安装路径包含符号链接或特殊文件".into());
     }
     path.canonicalize().map_err(|e| e.to_string())
 }

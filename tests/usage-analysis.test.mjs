@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+import {
+  autoStubModule,
+  collectElements,
+  createModuleGraph,
+  elementProps,
+  elementType,
+  textContent,
+} from "./helpers/jsx-tree.mjs";
 
 const { usageQuery, usageSlices, usageCoverage, formatUsageNumber, observeUsageRequest, usageTrend, usageHeatmap } = await loadTypeScriptModule(new URL("../src/usageAnalysis.ts", import.meta.url));
 const group = (key, tokens, total = 1) => ({ key, totalTokensSum: tokens, total });
@@ -111,6 +119,27 @@ test("趋势峰值区分未上报与已知零，空数据和无效区间安全�
   assert.deepEqual(usageTrend({ ...input, bucketMs: 0 }), { peak: null, bars: [] });
 });
 
+test("趋势把未上报用量的分桶标记为 unknown，不画成零用量", () => {
+  const result = usageTrend({
+    fromUnixMs: 0, toUnixMs: 300, bucketMs: 100,
+    trend: [
+      { timestampUnixMs: 0, total: 1, totalTokensSum: 10 },
+      { timestampUnixMs: 100, total: 3, totalTokensSum: null },
+      { timestampUnixMs: 200, total: 2, totalTokensSum: 0 },
+    ],
+  });
+  assert.equal(result.peak, 10, "峰值只按已知值计算");
+  assert.deepEqual(
+    result.bars.map(({ tokensUnknown, height }) => ({ tokensUnknown, height })),
+    [
+      { tokensUnknown: false, height: 128 },
+      { tokensUnknown: true, height: 0 },
+      { tokensUnknown: false, height: 0 },
+    ],
+    "有请求但未上报用量的分桶必须带 unknown 标记，与已知零用量区分",
+  );
+});
+
 test("同步异常与后端失败终止loading且可重新加载；不可查询保留reason", async () => {
   const events = [];
   observeUsageRequest(() => { throw new Error("统计失败"); }, (state) => events.push(state));
@@ -120,4 +149,94 @@ test("同步异常与后端失败终止loading且可重新加载；不可查询�
   await new Promise(setImmediate);
   assert.equal(events.at(-1).data.reason, "ndjson_not_queryable");
   assert.equal(events.at(-1).loading, false);
+});
+
+// 渲染层：未知用量的分桶必须与零用量区分，用低矮虚线柱加明确文案呈现。
+const panelHooks = { effects: [], hooks: [], cursor: 0 };
+const panelReact = {
+  useState(initial) {
+    const index = panelHooks.cursor++;
+    if (!(index in panelHooks.hooks))
+      panelHooks.hooks[index] = typeof initial === "function" ? initial() : initial;
+    return [panelHooks.hooks[index], (next) => {
+      panelHooks.hooks[index] = typeof next === "function" ? next(panelHooks.hooks[index]) : next;
+    }];
+  },
+  useRef(initial) {
+    const index = panelHooks.cursor++;
+    if (!(index in panelHooks.hooks)) panelHooks.hooks[index] = { current: initial };
+    return panelHooks.hooks[index];
+  },
+  useCallback(callback) { return callback; },
+  useEffect(effect, deps) {
+    const index = panelHooks.cursor++;
+    const previous = panelHooks.hooks[index];
+    if (previous && deps.every((value, i) => Object.is(value, previous.deps[i]))) return;
+    panelHooks.effects.push(() => { previous?.cleanup?.(); panelHooks.hooks[index] = { deps, cleanup: effect() }; });
+  },
+};
+
+const panelStats = {
+  queryable: true, fromUnixMs: 0, toUnixMs: 300, bucketMs: 100, total: 6,
+  succeededCount: 6, failedCount: 0, incompleteCount: 0, cancelledCount: 0, successRate: 1,
+  avgDuration: null, avgTtft: null, avgRouterPreUpstream: null, avgUpstreamHeader: null,
+  avgUpstreamFirstByte: null, avgDownstreamFirstContent: null, avgQueueDelay: null,
+  inputTokensSum: null, outputTokensSum: null, totalTokensSum: 10, cachedTokensSum: null,
+  usageReportedCount: 1, totalTokensKnownCount: 1, groupsTruncated: false,
+  groups: [{ ...group("gpt-5", 10, 1) }], dailyTrend: [], recordingHealth: null,
+  trend: [0, 100, 200].map((timestampUnixMs, index) => ({
+    timestampUnixMs, total: index + 1,
+    totalTokensSum: [10, null, 0][index],
+    avgDuration: null, avgTtft: null, avgDownstreamFirstContent: null,
+  })),
+};
+
+const uiStubs = autoStubModule("ui");
+const panelGraph = createModuleGraph(new URL("../src/UsageAnalysisPanel.tsx", import.meta.url), {
+  autoStub: true,
+  stubs: {
+    react: panelReact,
+    "./api": { invoke: async () => panelStats },
+    "./appUtils": { withTimeout: (promise) => promise },
+    "./components/ui": uiStubs,
+    "./UsageHeatmap": autoStubModule("heatmap"),
+  },
+});
+
+test("用量趋势渲染把未上报的分桶画成虚线标记并标注用量未上报", async () => {
+  panelHooks.cursor = 0;
+  panelHooks.effects.length = 0;
+  const props = { onBack: () => {} };
+  panelGraph.exports.UsageAnalysisPanel(props);
+  panelHooks.effects.splice(0).forEach((effect) => effect());
+  await new Promise(setImmediate);
+
+  const render = () => {
+    panelHooks.cursor = 0;
+    return panelGraph.exports.UsageAnalysisPanel(props);
+  };
+  let tree = render();
+  const [barsButton] = collectElements(
+    tree,
+    (element) => elementType(element) === uiStubs.Button && textContent(element) === "直方图",
+  );
+  assert.ok(barsButton, "必须能切到直方图");
+  elementProps(barsButton).onPress?.();
+  tree = render();
+
+  const bars = collectElements(tree, (element) => elementType(element) === "rect");
+  assert.equal(bars.length, 3);
+  const [known, unknown, zero] = bars.map((bar) => ({
+    height: elementProps(bar).height,
+    style: elementProps(bar).style,
+    title: textContent(bar),
+  }));
+  assert.equal(known.height > 0, true);
+  assert.match(known.title, /10 Token/);
+  assert.equal(unknown.height, 3, "未上报的分桶用低矮标记，不画成零高度");
+  assert.match(unknown.style.strokeDasharray, /2 2/);
+  assert.equal(unknown.style.fill, "none");
+  assert.match(unknown.title, /用量未上报/);
+  assert.equal(zero.height, 0, "真正的零用量保持空白");
+  assert.doesNotMatch(zero.title, /用量未上报/);
 });

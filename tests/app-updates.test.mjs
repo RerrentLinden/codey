@@ -111,3 +111,25 @@ test("detecting an update with an asset prompts the confirmation dialog", async 
   assert.equal(confirmation.action, "download-update");
   assert.match(confirmation.title, /1\.2\.0/);
 });
+
+test("发现更新后定时器链仍在，可用更新被清空后继续自动检查", async () => {
+  const h = harness(true);
+  h.requests[0].resolve({ ...available, updateAvailable: true });
+  await settle();
+  h.render();
+  // 暂停只影响本次检查：下一次 tick 必须仍然排程，否则手动清空状态后自动检查会永久失效。
+  assert.equal(h.timers.size, 1, "发现可用更新后仍要保留下一次检查");
+
+  const manual = h.render().checkForUpdates();
+  h.requests[1].resolve({ currentVersion: "1.1.1", latestVersion: "1.1.1", updateAvailable: false });
+  await manual;
+  await settle();
+  h.render();
+
+  const [tick] = [...h.timers.values()];
+  assert.ok(tick, "下一次检查必须已排程");
+  h.timers.clear();
+  tick();
+  await settle();
+  assert.equal(h.requests.length, 3, "状态清空后自动检查必须重新发起请求");
+});

@@ -730,7 +730,7 @@ function FeaturePolicyCardComponent({
       </section>
 
       {onAddChannel && onChannelChange && onRequestRemoveChannel && (
-        <section className="secondary-section notification-section" aria-labelledby="notification-section-title">
+        <section className="secondary-section notification-section" aria-labelledby="notification-title">
           <NotificationChannelsCard
             config={config}
             container={popupContainer ?? null}

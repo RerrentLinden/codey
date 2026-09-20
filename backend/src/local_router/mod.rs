@@ -86,6 +86,8 @@ const REQUEST_BODY_BUDGET_PERMITS: usize =
 const MAX_ROUTE_BINDINGS: usize = 4096;
 const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+// 插件回调是不可信的原生代码，可能阻塞或死锁；请求路径只在有限时间内等它。
+const PLUGIN_HEADER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 // A non-streaming upstream may not send response headers until generation is

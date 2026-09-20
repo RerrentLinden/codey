@@ -104,8 +104,21 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
     {
         let catalog = home.join(crate::model_catalog::relative_path());
         check_reference(&catalog, "model_catalog_json", ReferenceKind::Json)?;
-        document["model_catalog_json"] = value(catalog.to_string_lossy().into_owned());
-        corrected_catalog = true;
+        // 就地替换值以保留该行原有的注释与格式；路径含非 UTF-8 字节时无法安全
+        // 写回 TOML，此时跳过改写，不能写进一个不可用的路径。
+        let path_text = catalog.to_string_lossy();
+        if !path_text.contains(char::REPLACEMENT_CHARACTER) {
+            if let Some(existing) = document
+                .get_mut("model_catalog_json")
+                .and_then(Item::as_value_mut)
+            {
+                let decor = existing.decor().clone();
+                let mut replacement = toml_edit::Value::from(path_text.into_owned());
+                *replacement.decor_mut() = decor;
+                *existing = replacement;
+            }
+            corrected_catalog = true;
+        }
     }
 
     // Preflight user references before any repair. Generated agent documents

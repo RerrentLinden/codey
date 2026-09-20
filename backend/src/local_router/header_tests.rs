@@ -152,6 +152,45 @@ fn header_logs_hide_credentials_but_keep_other_values() {
 }
 
 #[test]
+fn route_specific_credential_headers_are_hidden_without_the_fixed_list() {
+    // 线路可以自定义任意请求头，名单外的凭证头同样不能明文落盘。
+    let mut headers = HeaderMap::new();
+    for name in [
+        "api-key",
+        "x-goog-api-key",
+        "x-auth-token",
+        "x-amz-security-token",
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static("route-secret"),
+        );
+    }
+    headers.insert(
+        HeaderName::from_static("x-client-request-id"),
+        HeaderValue::from_static("request-123"),
+    );
+    let text = super::responses::format_upstream_headers(&headers);
+    assert!(!text.contains("route-secret"));
+    assert_eq!(text.matches("[REDACTED]").count(), 4);
+    assert!(text.contains("x-client-request-id: request-123"));
+
+    // 粘性路由令牌是 Codex 依赖的端到端响应头，必须保留明文。
+    let mut response = HeaderMap::new();
+    response.insert(
+        HeaderName::from_static("x-codex-turn-state"),
+        HeaderValue::from_static("sticky-token"),
+    );
+    response.insert(
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderValue::from_static("route-secret"),
+    );
+    let text = super::responses::format_upstream_response_headers(&response);
+    assert!(text.contains("x-codex-turn-state: sticky-token"));
+    assert_eq!(text.matches("[REDACTED]").count(), 1);
+}
+
+#[test]
 fn response_header_logs_hide_credentials_but_keep_route_tokens() {
     let mut headers = HeaderMap::new();
     headers.insert(

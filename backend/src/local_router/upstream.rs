@@ -435,8 +435,12 @@ pub(crate) fn apply_upstream_headers(headers: &mut HeaderMap, overrides: &Header
 }
 
 pub(crate) fn is_sensitive_upstream_header(name: &str) -> bool {
+    // 线路可以自定义任意请求头，固定名单挡不住 `api-key`（Azure）、
+    // `x-goog-api-key`、`x-auth-token` 这类名单外的凭证头，因此除名单外再按
+    // 名称特征判断，避免密钥明文写入请求日志。
+    let name = name.to_ascii_lowercase();
     matches!(
-        name,
+        name.as_str(),
         "authorization"
             | "proxy-authorization"
             | "cookie"
@@ -445,7 +449,18 @@ pub(crate) fn is_sensitive_upstream_header(name: &str) -> bool {
             | "x-tenant"
             | "x-codey-router-token"
             | "sec-websocket-key"
-    )
+    ) || [
+        "key",
+        "token",
+        "secret",
+        "auth",
+        "cookie",
+        "password",
+        "credential",
+        "signature",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
 }
 
 pub(crate) fn has_version_suffix(segment: &str) -> bool {

@@ -105,12 +105,12 @@ function NotificationChannelsCardComponent({
         </div>
       </div>
 
-      <div className="notification-section-grid">
+      <ul className="notification-channel-list" aria-label="已配置通知渠道">
         {config.webhook.channels.length === 0 ? (
-          <div className="notification-empty-card codey-card">
+          <li className="notification-empty-card codey-card">
             <IconBell size={16} className="text-muted shrink-0" aria-hidden="true" />
             <span>还没有通知渠道，点击右上角添加渠道配置推送方式。</span>
-          </div>
+          </li>
         ) : (
           config.webhook.channels.map((channel) => {
             const definition = getNotificationChannelDefinition(channel.kind);
@@ -123,58 +123,57 @@ function NotificationChannelsCardComponent({
                   : "inactive";
             const ChannelIcon = definition.Icon;
             return (
-              <div
-                key={channel.id}
-                className={`notification-card codey-card ${cardState}`}
-              >
-                <div className="notification-card-header">
-                  <div className="notification-title">
-                    <span className={definition.iconClassName}>
-                      <ChannelIcon size={18} aria-hidden="true" />
-                    </span>
-                    <div>
-                      <strong>{definition.title}</strong>
+              <li key={channel.id}>
+                <div className={`notification-card codey-card ${cardState}`}>
+                  <div className="notification-card-header">
+                    <div className="notification-title">
+                      <span className={definition.iconClassName}>
+                        <ChannelIcon size={18} aria-hidden="true" />
+                      </span>
+                      <div>
+                        <strong>{definition.title}</strong>
+                      </div>
                     </div>
-                  </div>
-                  <div className="notification-channel-controls">
-                    <Badge
-                      className="operations-running-badge"
-                      variant={status.variant}
-                    >
-                      <span className="operations-status-dot" aria-hidden="true" />
-                      {status.label}
-                    </Badge>
-                    <div className="notification-item-actions">
-                      <Button
-                        variant="link"
-                        color="primary"
-                        size="icon-sm"
-                        disabled={isBusy}
-                        onClick={() => openEditDialog(channel.id)}
-                        aria-label={`编辑${definition.title}通知渠道`}
-                        title={`编辑${definition.title}`}
+                    <div className="notification-channel-controls">
+                      <Badge
+                        className="operations-running-badge"
+                        variant={status.variant}
                       >
-                        <IconEdit size={14} aria-hidden="true" />
-                      </Button>
-                      <Button
-                        variant="link"
-                        color="danger"
-                        size="icon-sm"
-                        disabled={isBusy}
-                        onClick={() => onRequestRemoveChannel(channel)}
-                        aria-label={`删除${definition.addLabel}通知渠道`}
-                        title={`删除${definition.title}`}
-                      >
-                        <IconTrash size={14} aria-hidden="true" />
-                      </Button>
+                        <span className="operations-status-dot" aria-hidden="true" />
+                        {status.label}
+                      </Badge>
+                      <div className="notification-item-actions">
+                        <Button
+                          variant="link"
+                          color="primary"
+                          size="icon-sm"
+                          disabled={isBusy}
+                          onClick={() => openEditDialog(channel.id)}
+                          aria-label={`编辑${definition.title}通知渠道`}
+                          title={`编辑${definition.title}`}
+                        >
+                          <IconEdit size={14} aria-hidden="true" />
+                        </Button>
+                        <Button
+                          variant="link"
+                          color="danger"
+                          size="icon-sm"
+                          disabled={isBusy}
+                          onClick={() => onRequestRemoveChannel(channel)}
+                          aria-label={`删除${definition.addLabel}通知渠道`}
+                          title={`删除${definition.title}`}
+                        >
+                          <IconTrash size={14} aria-hidden="true" />
+                        </Button>
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
+              </li>
             );
           })
         )}
-      </div>
+      </ul>
       <NotificationChannelDialog
         container={container ?? popupContainer}
         popupContainer={popupContainer}

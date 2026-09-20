@@ -598,6 +598,73 @@ fn imported_executable_modes_are_preserved_and_external_changes_block_uninstall(
     assert!(!target.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn linked_ancestor_directories_do_not_block_managed_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    // macOS 的 /tmp、/var、/etc 都是链接，祖先目录带链接是系统常态。
+    let real = root.join("real-root");
+    let link = root.join("linked-root");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    fs::write(real.join("config.json"), "{}").unwrap();
+
+    let file = link.join("config.json");
+    fsutil::safe_path(&file).unwrap();
+    assert_eq!(
+        fsutil::read(&file).unwrap().as_deref(),
+        Some(b"{}".as_slice())
+    );
+
+    // 目标自身仍然必须是普通文件，不能是链接。
+    let outside = root.join("outside.json");
+    fs::write(&outside, "{}").unwrap();
+    let linked_file = real.join("linked.json");
+    std::os::unix::fs::symlink(&outside, &linked_file).unwrap();
+    assert!(fsutil::safe_path(&linked_file).is_err());
+    assert!(fsutil::read(&linked_file).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_content_inside_managed_skill_keeps_list_and_uninstall_available() {
+    let f = Fixture::new("");
+    let installed = f
+        .mutate(json!({"action":"install_skill","sourcePath":f.source}))
+        .unwrap();
+    let id = installed["inventory"]["skills"][0]["id"].clone();
+    let directory = f.home.join("skills/demo");
+    let outside = f.home.join("outside.md");
+    fs::write(&outside, "external\n").unwrap();
+    std::os::unix::fs::symlink(&outside, directory.join("linked.md")).unwrap();
+
+    // 目录里一个链接不能让整页失效，也不能取消卸载入口。
+    let inventory = f.list();
+    let entry = inventory["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap();
+    assert_eq!(entry["canEdit"], false);
+    assert_eq!(entry["canToggle"], false);
+    assert_eq!(entry["canRemove"], true);
+    assert!(
+        inventory["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("无法完整校验"))
+    );
+
+    f.mutate(json!({"action":"uninstall_skill","id":id}))
+        .unwrap();
+    assert!(!directory.join("SKILL.md").exists());
+    assert!(outside.exists());
+    assert!(f.list()["skills"].as_array().unwrap().is_empty());
+}
+
 #[test]
 fn malformed_and_stale_configs_are_not_overwritten() {
     let f = Fixture::new("[mcp_servers.test]\ncommand = 'node'\n");

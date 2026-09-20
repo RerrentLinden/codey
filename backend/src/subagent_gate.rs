@@ -1790,6 +1790,10 @@ fn render_untrusted_tool_result(tool_response: Option<&Value>, tool_name: &str) 
     )
 }
 
+/// provider 错误消息是短的、单行的；更长的文本可能是子代理产出，不能用它
+/// 缩短恢复窗口。
+const MAX_UNAVAILABLE_STATUS_TEXT_CHARS: usize = 200;
+
 fn status_tool_is_unavailable(tool_name: &str, tool_response: Option<&Value>) -> bool {
     let Some(response) = tool_response else {
         return false;
@@ -1798,6 +1802,15 @@ fn status_tool_is_unavailable(tool_name: &str, tool_response: Option<&Value>) ->
         Value::String(text) => {
             if let Ok(decoded) = serde_json::from_str::<Value>(text) {
                 return status_tool_is_unavailable(tool_name, Some(&decoded));
+            }
+            // 对象分支用身份字段排除子代理内容，文本形态没有字段可用，只能按
+            // 「错误消息的形状」判定：provider 错误既短又不会带正文换行，而承载
+            // 子代理产出的文本通常更长。判定取窄，宁可等兜底窗口也不误伤。
+            let trimmed = text.trim();
+            if trimmed.lines().count() > 1
+                || trimmed.chars().count() > MAX_UNAVAILABLE_STATUS_TEXT_CHARS
+            {
+                return false;
             }
             let text = text.to_ascii_lowercase();
             text.contains(&normalized_collaboration_tool(tool_name))

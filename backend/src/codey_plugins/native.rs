@@ -114,8 +114,14 @@ fn decode(api: &PluginApiV1, status: i32, output: Buffer) -> Result<Value, Strin
         })
         .map_err(|e| format!("插件输出不是 JSON: {e}"))
     };
-    unsafe {
-        (api.free_buffer)(output);
+    // 长度为 0 却带非空指针违反 ABI：按 len 释放会以零长度 Layout 释放真实分配
+    // 并损坏堆。宿主无从得知真实大小，因此宁可保留这一份泄漏（插件进程退出即
+    // 回收），也不释放大小未知的指针。
+    let unknown_layout = output.len == 0 && !output.data.is_null();
+    if !unknown_layout {
+        unsafe {
+            (api.free_buffer)(output);
+        }
     }
     let value = result?;
     if status != 0 {

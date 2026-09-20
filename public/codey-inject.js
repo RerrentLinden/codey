@@ -9,6 +9,9 @@
   try {
   // Release a failed installation before publishing any replacement callbacks.
   window.__codeySessionToolsInstall?.dispose?.();
+  // 旧安装已销毁，先摘除引用：中途抛错时全局不会留下一个已销毁的安装对象，
+  // 下一轮加载也不会对着它重复销毁。
+  delete window.__codeySessionToolsInstall;
   let disposed = false;
   const rendererSettingsButtonSelector = "#codey-settings-button";
   const toolbarId = "codey-message-toolbar";
@@ -3646,6 +3649,8 @@
   } catch (error) {
     window.__codeySessionToolsInjectLoading = false;
     disposeInstall?.();
+    // 已销毁或尚未完成的安装都不该继续对外可见。
+    delete window.__codeySessionToolsInstall;
     throw error;
   }
 })();

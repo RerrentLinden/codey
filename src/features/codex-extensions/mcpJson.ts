@@ -9,8 +9,20 @@ export interface McpJsonService {
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-export function parseMcpJson(content: string): McpJsonService[] {
-  if (new TextEncoder().encode(content).length > 1024 * 1024)
+const CONTENT_BYTE_LIMIT = 1024 * 1024;
+const encoder = new TextEncoder();
+
+// 编辑器每次渲染都会校验草稿：纯 ASCII 内容的字节数等于长度，不必整串编码。
+function exceedsByteLimit(content: string) {
+  if (content.length > CONTENT_BYTE_LIMIT) return true;
+  return (
+    /[^\x00-\x7F]/.test(content) &&
+    encoder.encode(content).length > CONTENT_BYTE_LIMIT
+  );
+}
+
+function parseServices(content: string): McpJsonService[] {
+  if (exceedsByteLimit(content))
     throw new Error("JSON 内容不能超过 1 MB。");
   let value: unknown;
   try {
@@ -39,6 +51,31 @@ export function parseMcpJson(content: string): McpJsonService[] {
       throw new Error("每个服务至少需要非空的 command 或 url。");
     return { name, config };
   });
+}
+
+// 渲染与按键都会校验同一份草稿内容：按内容记忆化，避免每键重新解析整份 JSON。
+// 返回的是只读缓存结果，调用方不得就地修改。
+let cachedContent: string | null = null;
+let cachedServices: McpJsonService[] | null = null;
+let cachedError: Error | null = null;
+
+export function parseMcpJson(content: string): McpJsonService[] {
+  if (content === cachedContent) {
+    if (cachedError) throw cachedError;
+    if (cachedServices) return cachedServices;
+  }
+  try {
+    const services = parseServices(content);
+    cachedContent = content;
+    cachedServices = services;
+    cachedError = null;
+    return services;
+  } catch (cause) {
+    cachedContent = content;
+    cachedServices = null;
+    cachedError = cause instanceof Error ? cause : new Error(String(cause));
+    throw cachedError;
+  }
 }
 
 export function selectedMcpJson(

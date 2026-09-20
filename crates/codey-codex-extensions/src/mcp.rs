@@ -450,12 +450,28 @@ pub fn list(doc: &DocumentMut, source: &str) -> Result<Vec<Value>> {
         return Ok(vec![]);
     };
     let servers = servers.as_table_like().context("mcp_servers 必须为表")?;
-    Ok(servers.iter().map(|(id, value)| {
-        let command = value.get("command").and_then(Item::as_str);
-        let url = value.get("url").and_then(Item::as_str);
-        let transport = if command.is_some() { "stdio" } else if url.is_some() { "http" } else { "unknown" };
-        let checked = object(value).and_then(|v| validate_existing(&v));
-        let enabled_known = value.get("enabled").is_none_or(|v| v.as_bool().is_some());
-        json!({"id":id,"name":id,"enabled":value.get("enabled").and_then(Item::as_bool).unwrap_or(true),"enabledKnown":enabled_known,"configurationStatus":if checked.is_ok(){"valid"}else{"invalid"},"error":checked.err().map(|e|e.to_string()),"canEdit":true,"canToggle":enabled_known,"canRemove":true,"canCheck":true,"sourcePath":source,"transport":transport,"readOnly":false,"summary":if command.is_some(){"本地进程"}else if url.is_some(){"HTTP 连接"}else{"配置待检查"}})
-    }).collect())
+    Ok(servers
+        .iter()
+        .map(|(id, value)| {
+            let command = value.get("command").and_then(Item::as_str);
+            let url = value.get("url").and_then(Item::as_str);
+            let transport = if command.is_some() {
+                "stdio"
+            } else if url.is_some() {
+                "http"
+            } else {
+                "unknown"
+            };
+            let checked = object(value).and_then(|v| validate_existing(&v));
+            let enabled_known = value.get("enabled").is_none_or(|v| v.as_bool().is_some());
+            let mut entry = json!({"id":id,"name":id,"enabled":value.get("enabled").and_then(Item::as_bool).unwrap_or(true),"enabledKnown":enabled_known,"configurationStatus":if checked.is_ok(){"valid"}else{"invalid"},"error":checked.err().map(|e|e.to_string()),"canEdit":true,"canToggle":enabled_known,"canRemove":true,"canCheck":true,"sourcePath":source,"transport":transport,"readOnly":false,"summary":if command.is_some(){"本地进程"}else if url.is_some(){"HTTP 连接"}else{"配置待检查"}});
+            // 保存会重新校验标识，所以不能把保存必然失败的条目显示为可编辑；
+            // 删除入口保留，用户仍能清理这类历史配置。
+            if validate_id(id).is_err() {
+                entry["canEdit"] = json!(false);
+                entry["reason"] = json!("名称含不支持的字符，无法在此编辑；可删除后重新创建");
+            }
+            entry
+        })
+        .collect())
 }

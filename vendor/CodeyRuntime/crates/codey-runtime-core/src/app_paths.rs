@@ -570,9 +570,25 @@ pub fn codex_runtime_executable_missing(app_dir: &Path) -> String {
 }
 
 pub fn codex_runtime_executable(app_dir: &Path) -> Option<PathBuf> {
+    let gui_executable = build_codex_executable(app_dir);
     codex_runtime_executable_candidates(app_dir)
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| path.is_file() && !is_same_file(path, &gui_executable))
+}
+
+/// 大小写不敏感的文件系统上，候选 `Contents/MacOS/codex` 会命中同目录下的 GUI 主
+/// 二进制 `Codex`。把 GUI 程序当作内置 CLI 会让启动在缺少 code-mode 宿主时报错，
+/// 因此按文件身份排除；非 Unix 平台退回忽略大小写的路径比较。
+fn is_same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {

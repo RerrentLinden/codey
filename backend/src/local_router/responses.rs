@@ -1719,9 +1719,26 @@ impl RouterServer {
                         .map(|value| (name.as_str().to_owned(), value.to_owned()))
                 })
                 .collect();
-            let patches =
-                crate::codey_plugins::dispatch_request_headers(&metadata, &visible_headers);
-            apply_codey_plugin_header_patches(&mut headers, patches);
+            let route_id = resolved.provider_id.clone();
+            // 插件回调是不可信的原生代码，可能阻塞或死锁：移到阻塞池并限制等待
+            // 时间，否则仅两个 async worker 的运行时会被一次慢回调拖停。
+            let dispatched = tokio::time::timeout(
+                PLUGIN_HEADER_CALLBACK_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    crate::codey_plugins::dispatch_request_headers(&metadata, &visible_headers)
+                }),
+            )
+            .await;
+            match dispatched {
+                Ok(Ok(patches)) => apply_codey_plugin_header_patches(&mut headers, patches),
+                Ok(Err(error)) => {
+                    record_plugin_header_callback_failure(&route_id, &error.to_string())
+                }
+                Err(_) => record_plugin_header_callback_failure(
+                    &route_id,
+                    "插件请求回调超时，本次请求跳过头修改",
+                ),
+            }
         }
         // 请求体的模型名已还原为上游模型名，路由提示头里的模型名必须保持一致；
         // HTTP、WebSocket 握手和压缩请求共用这份头。
@@ -2306,6 +2323,16 @@ impl RouterServer {
         };
         Ok(Some(response))
     }
+}
+
+/// 插件回调失败或超时时，本次请求不带它的头修改继续，并留下脱敏诊断。
+fn record_plugin_header_callback_failure(route_id: &str, message: &str) {
+    crate::error_log::record_failure(
+        "plugin_callback_failed",
+        "codey_plugins.dispatch_request_headers",
+        message.to_owned(),
+        serde_json::json!({"routeId": route_id}),
+    );
 }
 
 pub(crate) fn apply_codey_plugin_header_patches(

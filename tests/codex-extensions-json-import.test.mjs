@@ -125,3 +125,17 @@ test("JSON exports round trip with service name and all configuration fields", (
   assert.equal(service.name, "round-trip");
   assert.deepEqual(service.config, config);
 });
+test("校验结果按内容记忆化，编辑器重渲染不再重复解析整份 JSON", () => {
+  const content = '{"mcpServers":{"demo":{"command":"npx"}}}';
+  assert.equal(parseMcpJson(content), parseMcpJson(content));
+  const invalid = '{"mcpServers":{"demo":null}}';
+  assert.throws(() => parseMcpJson(invalid));
+  assert.throws(() => parseMcpJson(invalid), "同一份无效内容也要记住结论");
+  assert.notEqual(parseMcpJson(content), parseMcpJson(content + "\n"));
+});
+test("超过 1 MB 的内容按字节数拒绝，非 ASCII 也不会漏判", () => {
+  assert.throws(() => parseMcpJson(" ".repeat(1024 * 1024 + 1)), /1 MB/);
+  // 40 万汉字只有 40 万个码元，但 UTF-8 超过 1 MB，必须靠精确字节数判定。
+  assert.throws(() => parseMcpJson("中".repeat(400_000)), /1 MB/);
+  assert.throws(() => parseMcpJson("\uFEFF" + " ".repeat(1024 * 1024 + 1)), /1 MB/);
+});

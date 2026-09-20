@@ -95,6 +95,8 @@ export function usageTrend(stats: Pick<LogAnalytics, "trend" | "fromUnixMs" | "t
       ...bucket,
       x: (start - stats.fromUnixMs) / span * 800,
       width: Math.max(width - 1, width / 2),
+      // 有请求但没有已知用量的桶高度为 0，但必须标记出来，不能与真正的零用量混同。
+      tokensUnknown: bucket.totalTokensSum == null,
       height: (bucket.totalTokensSum ?? 0) / Math.max(1, peak ?? 0) * 128,
     };
   });

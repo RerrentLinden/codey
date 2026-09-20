@@ -64,23 +64,24 @@ pub fn safe_path(path: &Path) -> Result<()> {
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
         "路径不能包含相对跳转"
     );
-    for parent in path.ancestors() {
-        match fs::symlink_metadata(parent) {
-            Ok(meta) => {
-                ensure!(
-                    !meta.file_type().is_symlink(),
-                    "拒绝符号链接目标: {}",
-                    parent.display()
-                );
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    ensure!(meta.file_attributes() & 0x400 == 0, "拒绝重解析点");
-                }
+    // 只拒绝目标自身的符号链接：它才是跳转到预期范围之外的载体，而祖先目录
+    // 带链接是系统常态（macOS 的 /tmp、/var、/etc 都是链接）。逐级拒绝会让
+    // CODEX_HOME 落在这些路径下时整个模块不可用，而它并不增加任何防护。
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            ensure!(
+                !meta.file_type().is_symlink(),
+                "拒绝符号链接目标: {}",
+                path.display()
+            );
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                ensure!(meta.file_attributes() & 0x400 == 0, "拒绝重解析点");
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
