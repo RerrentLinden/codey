@@ -806,22 +806,21 @@ fn managed_skill_install_toggle_edit_uninstall() {
 }
 
 #[test]
-fn external_and_modified_managed_skills_cannot_be_removed() {
+fn external_skills_can_be_removed_but_modified_managed_skills_are_preserved() {
     let f = Fixture::new("");
     let manual = f.home.join("skills/manual");
     fs::create_dir_all(&manual).unwrap();
     fs::copy(f.source.join("SKILL.md"), manual.join("SKILL.md")).unwrap();
     let id = f.list()["skills"][0]["id"].clone();
     assert!(
-        f.mutate(json!({"action":"uninstall_skill","id":id}))
-            .is_err()
-    );
-    assert!(
         f.mutate(json!({"action":"save_skill","id":id,"content":"anything"}))
             .is_err()
     );
     f.mutate(json!({"action":"set_skill_enabled","id":id,"enabled":false}))
         .unwrap();
+    f.mutate(json!({"action":"uninstall_skill","id":id}))
+        .unwrap();
+    assert!(!manual.exists());
     f.mutate(json!({"action":"install_skill","sourcePath":f.source}))
         .unwrap();
     let id = f.list()["skills"]
@@ -836,6 +835,132 @@ fn external_and_modified_managed_skills_cannot_be_removed() {
         f.mutate(json!({"action":"uninstall_skill","id":id}))
             .is_err()
     );
+}
+
+#[test]
+fn invalid_external_skills_can_be_removed_from_each_supported_root() {
+    for (project_scope, agents_root) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let f = Fixture::new("model='keep'\n");
+        let project = f.source.parent().unwrap().join("project");
+        fs::create_dir(&project).unwrap();
+        let scope = if project_scope {
+            json!({"kind":"project","projectPath":project})
+        } else {
+            json!({"kind":"user"})
+        };
+        let root = if project_scope {
+            project.join(if agents_root {
+                ".agents/skills"
+            } else {
+                ".codex/skills"
+            })
+        } else if agents_root {
+            f.service.user_home.join(".agents/skills")
+        } else {
+            f.home.join("skills")
+        };
+        let directory = root.join("broken");
+        fs::create_dir_all(directory.join("scripts")).unwrap();
+        fs::write(directory.join("SKILL.md"), "---\nname: [broken\n---\n").unwrap();
+        fs::write(directory.join("scripts/run.sh"), "echo example").unwrap();
+        let neighbor = root.join("neighbor");
+        fs::create_dir(&neighbor).unwrap();
+        fs::copy(f.source.join("SKILL.md"), neighbor.join("SKILL.md")).unwrap();
+        let inventory = f
+            .service
+            .dispatch(json!({"action":"list","scope":scope}))
+            .unwrap();
+        let id = skills::id(&directory.join("SKILL.md"));
+        let entry = inventory["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap();
+        assert_eq!(entry["configurationStatus"], "invalid");
+        assert_eq!(entry["canRemove"], true);
+        assert_eq!(entry["canEdit"], false);
+        let mut request = json!({"action":"uninstall_skill","scope":scope,"id":id,"revision":inventory["revision"]});
+        assert!(
+            f.service
+                .dispatch(request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("确认")
+        );
+        assert!(directory.join("SKILL.md").exists());
+        request["confirmed"] = json!(true);
+        let removed = f.service.dispatch(request).unwrap();
+        assert!(!directory.exists());
+        assert!(root.exists() && neighbor.join("SKILL.md").exists());
+        assert_eq!(removed["inventory"]["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(f.home.join("config.toml")).unwrap(),
+            "model='keep'\n"
+        );
+        assert!(!f.service.registry_path().exists());
+    }
+}
+
+#[test]
+fn external_skill_removal_rejects_changed_resources_and_protected_targets() {
+    let f = Fixture::new("");
+    let root = f.home.join("skills");
+    let directory = root.join("broken");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("SKILL.md"), "broken").unwrap();
+    fs::write(directory.join("asset.txt"), "original").unwrap();
+    let inventory = f.list();
+    let id = skills::id(&directory.join("SKILL.md"));
+    fs::write(directory.join("asset.txt"), "changed").unwrap();
+    assert!(f.service.dispatch(json!({"action":"uninstall_skill","id":id,"revision":inventory["revision"],"confirmed":true})).unwrap_err().to_string().contains("配置已变化"));
+    assert!(directory.join("SKILL.md").exists());
+
+    for target in [
+        root.clone(),
+        root.join(".system/protected"),
+        directory.join("nested"),
+    ] {
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "broken").unwrap();
+    }
+    for target in [&root, &root.join(".system/protected"), &directory] {
+        let id = skills::id(&target.join("SKILL.md"));
+        let inventory = f.list();
+        let entry = inventory["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap();
+        assert_eq!(entry["canRemove"], false);
+        assert!(
+            f.mutate(json!({"action":"uninstall_skill","id":id}))
+                .is_err()
+        );
+        assert!(target.join("SKILL.md").exists());
+    }
+    assert!(f.mutate(json!({"action":"uninstall_skill","id":skills::id(&f.source.join("SKILL.md")),"sourcePath":f.source})).is_err());
+    assert!(f.source.join("SKILL.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn external_skill_removal_rejects_linked_content() {
+    let f = Fixture::new("");
+    let directory = f.home.join("skills/broken");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("SKILL.md"), "broken").unwrap();
+    std::os::unix::fs::symlink(&f.source, directory.join("linked")).unwrap();
+    let inventory = f.list();
+    assert_eq!(inventory["skills"][0]["canRemove"], false);
+    assert!(
+        f.mutate(json!({"action":"uninstall_skill","id":inventory["skills"][0]["id"]}))
+            .is_err()
+    );
+    assert!(directory.join("SKILL.md").exists());
+    assert!(f.source.join("SKILL.md").exists());
 }
 
 #[test]

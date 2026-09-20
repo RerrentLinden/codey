@@ -327,8 +327,7 @@ export function ExtensionList({
                   disabled={
                     busy ||
                     entry.readOnly ||
-                    entry.canRemove === false ||
-                    ("ownership" in entry && !isManaged)
+                    entry.canRemove === false
                   }
                   title={kind === "mcp" ? "移除 MCP 服务" : "卸载 Skill"}
                   aria-label={kind === "mcp" ? `移除 ${entry.name}` : `卸载 ${entry.name}`}

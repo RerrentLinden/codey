@@ -177,6 +177,27 @@ impl ExtensionService {
                     }
                 }
             }
+            if entry["ownership"] == "external" && entry["canRemove"] == true {
+                let removal_fingerprints = (|| -> Result<Vec<_>> {
+                    skills::external_removal_files(manifest.parent().unwrap())?
+                        .into_iter()
+                        .map(|path| {
+                            let bytes = cache.read(&path)?.context("Skill 资源已消失")?;
+                            Ok((
+                                path.to_string_lossy().into_owned(),
+                                Some(format!("{}:{:?}", fsutil::digest(bytes), fsutil::file_mode(&path)?)),
+                            ))
+                        })
+                        .collect()
+                })();
+                match removal_fingerprints {
+                    Ok(values) => fingerprints.extend(values),
+                    Err(error) => {
+                        entry["canRemove"] = json!(false);
+                        entry["reason"] = json!(format!("目录内容无法安全删除：{error}"));
+                    }
+                }
+            }
         }
         let revision = fsutil::digest(&serde_json::to_vec(&fingerprints)?);
         let mut mcps = mcp::list(&doc, &config_path.to_string_lossy())?;
@@ -462,6 +483,18 @@ impl ExtensionService {
                 }
                 changes.push(Change::new(config, Some(doc.to_string().into_bytes()))?);
             }
+            "uninstall_skill"
+                if self.entry(&inventory, Self::required(&request, "id")?)?["ownership"]
+                    == "external" =>
+            {
+                let entry = self.entry(&inventory, Self::required(&request, "id")?)?;
+                ensure!(entry["canRemove"] == true, "Skill 当前不允许删除，请检查目录或冲突规则");
+                let path = PathBuf::from(entry["sourcePath"].as_str().unwrap());
+                for target in skills::external_removal_files(&path)? {
+                    ensure!(fsutil::writable(&target), "Skill 文件或所在目录不可写");
+                    changes.push(Change::new(target, None)?);
+                }
+            }
             "save_skill" | "uninstall_skill" => {
                 let entry = self.entry(&inventory, Self::required(&request, "id")?)?;
                 ensure!(
@@ -679,11 +712,14 @@ impl ExtensionService {
     }
 
     fn clean_empty_skill_dirs(&self, scope: &Scope, removed: &[PathBuf]) {
-        let root = match scope {
-            Scope::User => self.codex_home.join("skills"),
-            Scope::Project { project_path } => project_path.join(".agents/skills"),
+        let roots = match scope {
+            Scope::User => vec![self.codex_home.join("skills"), self.user_home.join(".agents/skills")],
+            Scope::Project { project_path } => vec![project_path.join(".agents/skills"), project_path.join(".codex/skills")],
         };
         for file in removed {
+            let Some(root) = roots.iter().find(|root| file.starts_with(root)) else {
+                continue;
+            };
             let mut dir = file.parent();
             while let Some(path) = dir {
                 if path == root || !path.starts_with(&root) || fsutil::safe_path(path).is_err() {
