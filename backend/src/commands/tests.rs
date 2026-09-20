@@ -1364,6 +1364,40 @@ async fn native_model_cache_without_saved_route_does_not_block_settings_or_reena
 }
 
 #[tokio::test]
+async fn auto_check_codey_updates_save_persists_explicit_and_legacy_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        ..AppState::default()
+    });
+
+    for enabled in [false, true] {
+        let mut payload = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        payload["autoCheckCodeyUpdates"] = json!(enabled);
+        let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
+        save_codey_config_locked(&state, input).await.unwrap();
+        assert_eq!(state.config.read().await.auto_check_codey_updates, enabled);
+        assert_eq!(
+            state.store.load().unwrap().auto_check_codey_updates,
+            enabled
+        );
+
+        let mut legacy = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("autoCheckCodeyUpdates");
+        legacy["slimCodexPet"] = json!(false);
+        let input = codey_config_save_input(&json!({ "config": legacy })).unwrap();
+        save_codey_config_locked(&state, input).await.unwrap();
+        let saved = state.config.read().await.clone();
+        assert_eq!(saved.auto_check_codey_updates, enabled);
+        assert!(!saved.slim_codex_pet);
+        assert_eq!(state.store.load().unwrap(), saved);
+    }
+}
+
+#[tokio::test]
 async fn legacy_save_without_local_router_field_preserves_disabled_state() {
     let directory = tempfile::tempdir().unwrap();
     let initial = CodeyConfig {

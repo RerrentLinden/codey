@@ -13,12 +13,41 @@ async fn pet_state_failure_does_not_abort_startup_or_replace_state() {
             ..CodeyConfig::default()
         };
 
-        let patch = prepare_startup_patches(temp.path(), &config).await;
+        let patch = prepare_startup_patches(temp.path(), &config).await.unwrap();
 
         assert_ne!(patch.debug_port, 0);
         assert_eq!(std::fs::read(&primary).unwrap(), b"{broken");
         assert_eq!(std::fs::read(&backup).unwrap(), b"{also broken");
     }
+}
+
+#[tokio::test]
+async fn debug_port_failure_aborts_before_startup_patches() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = CodeyConfig::default();
+    let result = prepare_startup_patches_with_port_selector(temp.path(), &config, || {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "loopback binding denied",
+        ))
+    })
+    .await;
+    let error = match result {
+        Ok(_) => panic!("startup should fail without a debug port"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("loopback binding denied"));
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn debug_port_zero_never_reaches_startup_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let result =
+        prepare_startup_patches_with_port_selector(temp.path(), &CodeyConfig::default(), || Ok(0))
+            .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
 #[test]

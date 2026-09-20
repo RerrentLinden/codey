@@ -9,6 +9,7 @@ import { estimateQuota, loadQuotaUsage, periodRows, PRICING_CHECKED, PRICING_SOU
 import type { AccountUsageSnapshot, QuotaEstimate, QuotaPage, QuotaRow } from "./quotaEstimate";
 import type { OfficialAccount, OfficialAccountsResult } from "./App.types";
 import { maskEmail } from "./sensitiveText";
+import { createAccountUsageReader } from "./accountUsageRequests";
 
 declare global {
   interface Window {
@@ -16,21 +17,14 @@ declare global {
   }
 }
 // 只合并同一账号正在进行的读取，包含 React 开发模式下的重复挂载。
-const usageRequests = new Map<string, Promise<AccountUsageSnapshot>>();
-function readAccountUsage(accountId: string | undefined, forceRefresh: boolean) {
-  const key = accountId ?? "";
-  const pending = usageRequests.get(key);
-  if (pending) return pending;
+const readAccountUsage = createAccountUsageReader((accountId, forceRefresh) => {
   const bridge = accountId ? undefined : window.__codeyReadQuotaAccountUsage;
-  const request = (bridge
+  return bridge
     ? bridge({ forceRefresh })
     : invoke<AccountUsageSnapshot>("query_official_account_usage", {
       ...(accountId ? { accountId } : {}), forceRefresh,
-    }))
-    .finally(() => { usageRequests.delete(key); });
-  usageRequests.set(key, request);
-  return request;
-}
+    });
+});
 
 // 每个官方账号单独读取额度、单独统计自己的请求，任何一层都不能跨账号合并。
 type EstimateTarget = {
@@ -140,8 +134,9 @@ export function QuotaEstimateDialog({ container, onClose }: {
             : loaded.filter((item) => !item.officialAccountId);
           // 未记录账号的历史记录只在确实存在时展示，也不消耗官方额度请求。
           if (!target.projectable && items.length === 0) continue;
+          const rows = quotaRows(items);
           const group: EstimateGroup = {
-            ...target, rows: quotaRows(items), total: sumQuotaRows(quotaRows(items)),
+            ...target, rows, total: sumQuotaRows(rows),
             estimate: null, usage: null, usageWarning: "", error: "",
           };
           if (target.projectable && items.length > 0) {

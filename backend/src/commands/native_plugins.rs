@@ -9,9 +9,9 @@ use crate::codey_plugins;
 pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String> {
     match command {
         "list_codey_plugins" => blocking(codey_plugins::list).await,
-        "get_codey_plugin_config_ui" => {
+        "get_codey_plugin_config_file" => {
             let id = string_argument(args, "pluginId")?;
-            blocking(move || codey_plugins::get_config_ui(&id)).await
+            blocking(move || codey_plugins::get_config_file(&id)).await
         }
         "select_codey_plugin_package" => select_package().await,
         "inspect_codey_plugin" => {
@@ -28,10 +28,11 @@ pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String>
             let enabled = argument::<bool>(args, "enabled")?;
             blocking(move || codey_plugins::set_enabled(&id, enabled)).await
         }
-        "configure_codey_plugin" => {
+        "save_codey_plugin_config_file" => {
             let id = string_argument(args, "pluginId")?;
-            let config = argument::<Value>(args, "config")?;
-            blocking(move || codey_plugins::configure(&id, config)).await
+            let content = string_argument(args, "content")?;
+            let expected_sha256 = string_argument(args, "expectedSha256")?;
+            blocking(move || codey_plugins::save_config_file(&id, &content, &expected_sha256)).await
         }
         "uninstall_codey_plugin" => {
             let id = string_argument(args, "pluginId")?;
@@ -92,8 +93,8 @@ mod tests {
                 "install_codey_plugin",
                 json!({"path":"/tmp/demo.codey-plugin"}),
             ),
-            ("configure_codey_plugin", json!({"pluginId":"demo"})),
-            ("get_codey_plugin_config_ui", json!({"pluginId":42})),
+            ("save_codey_plugin_config_file", json!({"pluginId":"demo"})),
+            ("get_codey_plugin_config_file", json!({"pluginId":42})),
             (
                 "uninstall_codey_plugin",
                 json!({"pluginId":"demo","removeData":1}),

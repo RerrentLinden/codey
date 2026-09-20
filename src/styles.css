@@ -5,40 +5,102 @@
     -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
     "PingFang SC", "Hiragino Sans GB", "Helvetica Neue", Arial, sans-serif;
   font-synthesis: none;
-  --mac-blue: var(--codey-blue, #007aff);
-  --mac-gray-bg: var(--codey-surface-sunken, #f5f5f7);
-  --mac-text-primary: var(--codey-text, #1d1d1f);
-  --mac-text-secondary: var(--codey-muted, #6e6e73);
-  --mac-text-tertiary: var(--codey-subtle, #8e8e93);
+
+  /* Text colors */
+  --codey-text: #1d1d1f;
+  --codey-text-soft: #3a3a3c;
+  --codey-muted: #6e6e73;
+  --codey-subtle: #8e8e93;
+
+  /* Surfaces & Backgrounds */
+  --codey-surface: #ffffff;
+  --codey-surface-muted: #fafafc;
+  --codey-surface-sunken: #f2f2f5;
+  --codey-surface-elevated: #ffffff;
+  --codey-surface-rgb: 255, 255, 255;
+  --codey-ink-rgb: 0, 0, 0;
+
+  /* Borders & Dividers */
+  --codey-border: rgba(0, 0, 0, 0.08);
+  --codey-border-subtle: rgba(0, 0, 0, 0.05);
+  --codey-border-strong: rgba(0, 0, 0, 0.15);
+
+  /* Semantic Accents */
+  --codey-blue: #007aff;
+  --codey-blue-hover: #0066d6;
+  --codey-blue-soft: #eaf3ff;
+  --codey-blue-border: #bfdbfe;
+
+  --codey-green: #34c759;
+  --codey-green-hover: #2db34f;
+  --codey-green-soft: #eafaf1;
+  --codey-green-border: #bbf7d0;
+
+  --codey-red: #ff3b30;
+  --codey-red-hover: #e02d23;
+  --codey-red-soft: #ffeded;
+  --codey-red-border: #fecaca;
+
+  --codey-amber: #ff9500;
+  --codey-amber-hover: #e08300;
+  --codey-amber-soft: #fff8eb;
+  --codey-amber-border: #fed7aa;
+
+  --codey-purple: #af52de;
+  --codey-purple-soft: #fbf2ff;
+  --codey-purple-border: #e9d5ff;
+
+  /* Legacy Mac Tokens mapped */
+  --mac-blue: var(--codey-blue);
+  --mac-gray-bg: var(--codey-surface-sunken);
+  --mac-text-primary: var(--codey-text);
+  --mac-text-secondary: var(--codey-muted);
+  --mac-text-tertiary: var(--codey-subtle);
 }
 
-/* 浅色沿用各组件的原值；深色在配置页及独立弹层挂载点共享语义颜色。 */
+/* 深色模式：高对比度微光与层次感 */
 [data-theme="dark"] {
   color-scheme: dark;
-  --codey-text: #f2f2f4;
+  --codey-text: #f5f5f7;
   --codey-text-soft: #d5d5da;
-  --codey-muted: #b1b1ba;
-  --codey-subtle: #9999a4;
-  --codey-surface: #252529;
-  --codey-surface-muted: #29292e;
-  --codey-surface-sunken: #202024;
-  --codey-surface-rgb: 37, 37, 41;
+  --codey-muted: #a1a1aa;
+  --codey-subtle: #71717a;
+
+  --codey-surface: #1e1e22;
+  --codey-surface-muted: #242429;
+  --codey-surface-sunken: #18181b;
+  --codey-surface-elevated: #28282e;
+  --codey-surface-rgb: 30, 30, 34;
   --codey-ink-rgb: 255, 255, 255;
-  --codey-border: #414147;
-  --codey-blue: #66adff;
-  --codey-blue-hover: #4098ff;
-  --codey-blue-soft: #20344e;
-  --codey-blue-border: #395e89;
-  --codey-green: #6ed78e;
-  --codey-green-soft: #203b30;
-  --codey-green-border: #35654b;
-  --codey-red: #ff858a;
-  --codey-amber: #f4bb69;
-  --codey-amber-soft: #3c3020;
-  --codey-amber-border: #73542e;
-  --codey-purple: #c5a0ff;
-  --codey-purple-soft: #372a48;
-  --codey-purple-border: #654880;
+
+  --codey-border: rgba(255, 255, 255, 0.1);
+  --codey-border-subtle: rgba(255, 255, 255, 0.06);
+  --codey-border-strong: rgba(255, 255, 255, 0.18);
+
+  --codey-blue: #3b82f6;
+  --codey-blue-hover: #60a5fa;
+  --codey-blue-soft: rgba(59, 130, 246, 0.14);
+  --codey-blue-border: rgba(59, 130, 246, 0.28);
+
+  --codey-green: #22c55e;
+  --codey-green-hover: #4ade80;
+  --codey-green-soft: rgba(34, 197, 94, 0.14);
+  --codey-green-border: rgba(34, 197, 94, 0.28);
+
+  --codey-red: #ef4444;
+  --codey-red-hover: #f87171;
+  --codey-red-soft: rgba(239, 68, 68, 0.14);
+  --codey-red-border: rgba(239, 68, 68, 0.28);
+
+  --codey-amber: #f59e0b;
+  --codey-amber-hover: #fbbf24;
+  --codey-amber-soft: rgba(245, 158, 11, 0.14);
+  --codey-amber-border: rgba(245, 158, 11, 0.28);
+
+  --codey-purple: #a855f7;
+  --codey-purple-soft: rgba(168, 85, 247, 0.14);
+  --codey-purple-border: rgba(168, 85, 247, 0.28);
+
   --mac-blue: var(--codey-blue);
   --mac-gray-bg: var(--codey-surface-sunken);
   --mac-text-primary: var(--codey-text);
@@ -352,12 +414,462 @@ button,
   overscroll-behavior: contain;
   scrollbar-color: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.18) transparent;
   scrollbar-width: thin;
+  scrollbar-gutter: stable;
 }
 
 .page {
   width: min(100%, 1360px);
   margin: 0 auto;
-  padding: 18px 22px 36px;
+  padding: 0 28px 36px;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.settings-sidebar {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+  overscroll-behavior: contain;
+  border-right: 1px solid var(--codey-border);
+  background: var(--codey-surface-muted);
+  padding: 16px 8px;
+  scrollbar-width: thin;
+}
+
+.settings-sidebar-menu {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.settings-sidebar-footer {
+  flex: none;
+  margin-top: 16px;
+  padding: 14px 6px 0;
+  border-top: 1px solid var(--codey-border-subtle);
+}
+
+.sidebar-updates {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-update-version,
+.sidebar-auto-update {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--codey-muted);
+}
+
+.sidebar-update-version {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--codey-text);
+}
+
+.sidebar-update-button {
+  width: 100%;
+  min-height: 30px;
+}
+
+.sidebar-update-status {
+  color: var(--codey-blue);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.sidebar-auto-update > :last-child {
+  flex: none;
+}
+
+.settings-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-group + .settings-nav-group {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--codey-border-subtle);
+}
+
+.settings-nav-group-title {
+  padding: 0 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--codey-subtle);
+  user-select: none;
+}
+
+.settings-nav-item {
+  position: relative;
+  display: flex;
+  min-height: 38px;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  padding: 8px 10px;
+  color: var(--codey-text-soft);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.settings-nav-item svg {
+  flex-shrink: 0;
+  color: var(--codey-muted);
+  transition: color 120ms ease;
+}
+
+.settings-nav-item:hover {
+  background: rgba(var(--codey-ink-rgb), 0.05);
+  color: var(--codey-text);
+}
+
+.settings-nav-item:hover svg {
+  color: var(--codey-text);
+}
+
+.settings-nav-item[aria-current="page"] {
+  border-color: var(--codey-blue-border);
+  background: var(--codey-blue-soft);
+  color: var(--codey-blue);
+  font-weight: 600;
+}
+
+.settings-nav-item[aria-current="page"] svg {
+  color: var(--codey-blue);
+}
+
+.settings-nav-item:focus-visible {
+  outline: 2px solid var(--mac-blue);
+  outline-offset: 2px;
+}
+
+.settings-content {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  container: settings-content / inline-size;
+  background: var(--codey-surface, #ffffff);
+}
+
+.settings-content:focus-visible,
+.settings-page:focus-visible {
+  outline: 2px solid var(--mac-blue);
+  outline-offset: -2px;
+}
+
+.settings-page {
+  min-width: 0;
+  width: 100%;
+}
+
+.settings-page[hidden] {
+  display: none;
+}
+
+.settings-page-header {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  margin: 0 -28px 18px;
+  padding: 10px 28px;
+  min-height: 52px;
+  background: color-mix(in srgb, var(--codey-surface, #ffffff) 84%, transparent);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border-bottom: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+[data-theme="dark"] .settings-page-header {
+  background: color-mix(in srgb, var(--codey-surface, #202024) 84%, transparent);
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
+.settings-page-header-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.settings-page-icon-pill {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.05);
+  color: var(--mac-text-primary);
+  flex-shrink: 0;
+  transition: background-color 130ms ease, color 130ms ease;
+}
+
+[data-theme="dark"] .settings-page-icon-pill {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.settings-page-heading {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  gap: 1px;
+}
+
+.settings-page-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-page-heading h2 {
+  margin: 0;
+  color: var(--mac-text-primary);
+  font-size: 14.5px;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.015em;
+  overflow-wrap: anywhere;
+}
+
+.settings-page-description,
+.settings-page-heading p {
+  margin: 0;
+  color: var(--mac-text-secondary);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.settings-page-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+  flex-shrink: 0;
+}
+
+.settings-section-heading {
+  margin: 0;
+  color: var(--mac-text-primary);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.settings-page-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: var(--mac-text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* ==========================================================================
+   Modern Production Card & Segmented Control System
+   ========================================================================== */
+
+.codey-card {
+  border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
+  border-radius: 14px;
+  background: var(--codey-surface, #ffffff);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03), 0 0 0 1px rgba(0, 0, 0, 0.01);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+  overflow: hidden;
+}
+
+[data-theme="dark"] .codey-card {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: var(--codey-surface, #252529);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.codey-card:hover {
+  border-color: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.14);
+}
+
+[data-theme="dark"] .codey-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.codey-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
+}
+
+[data-theme="dark"] .codey-card-header {
+  border-bottom-color: rgba(255, 255, 255, 0.06);
+}
+
+.codey-card-body {
+  padding: 16px 18px;
+}
+
+.codey-segmented-control {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.05);
+  border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
+  border-radius: 9px;
+  padding: 3px;
+  gap: 2px;
+}
+
+[data-theme="dark"] .codey-segmented-control {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.codey-segmented-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--codey-muted, #6e6e73);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 140ms cubic-bezier(0.16, 1, 0.3, 1);
+  white-space: nowrap;
+}
+
+.codey-segmented-item:hover:not(:disabled) {
+  color: var(--codey-text, #1d1d1f);
+}
+
+.codey-segmented-item.active {
+  background: var(--codey-surface, #ffffff);
+  color: var(--codey-text, #1d1d1f);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.02);
+}
+
+[data-theme="dark"] .codey-segmented-item.active {
+  background: #323238;
+  color: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.codey-segmented-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (max-width: 760px) {
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .settings-sidebar {
+    flex-direction: column;
+    border-right: 0;
+    border-bottom: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
+    padding: 10px 12px;
+  }
+
+  .settings-sidebar-menu {
+    display: flex;
+    flex: none;
+    overflow-x: auto;
+  }
+
+  .settings-sidebar-menu .settings-nav-group {
+    flex-direction: row;
+    flex: none;
+  }
+
+  .settings-sidebar-menu .settings-nav-group + .settings-nav-group {
+    margin: 0 0 0 8px;
+    padding: 0 0 0 8px;
+    border-top: 0;
+    border-left: 1px solid var(--codey-border-subtle);
+  }
+
+  .settings-sidebar-menu .settings-nav-group-title {
+    display: none;
+  }
+
+  .settings-sidebar-footer {
+    margin-top: 8px;
+    padding: 8px 0 0;
+  }
+
+  .sidebar-updates {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px 12px;
+  }
+
+  .sidebar-update-version {
+    justify-content: flex-start;
+  }
+
+  .sidebar-auto-update {
+    grid-column: 1 / -1;
+  }
+
+  .sidebar-update-status {
+    grid-column: 1 / -1;
+  }
+
+  .settings-nav-item {
+    min-height: 40px;
+    white-space: nowrap;
+  }
+
+  .settings-page .page {
+    padding: 16px 14px 28px;
+  }
 }
 
 .section-title {

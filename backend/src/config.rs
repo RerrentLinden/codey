@@ -724,6 +724,9 @@ impl RouteRequestLogConfig {
 pub struct CodeyConfig {
     #[serde(default)]
     pub settings_revision: u64,
+    /// 控制启动和运行期间的自动更新检查，包括 Codex 启动失败后的检查。
+    #[serde(default = "default_true")]
+    pub auto_check_codey_updates: bool,
     /// Controls whether Codey installs and uses its process-local multi-route
     /// gateway. Missing values default to enabled so existing installations
     /// keep their current behavior after upgrading.
@@ -926,6 +929,7 @@ impl Default for CodeyConfig {
         let profile = ProviderProfile::new("默认配置");
         Self {
             settings_revision: 0,
+            auto_check_codey_updates: true,
             local_router_enabled: true,
             route_request_log: RouteRequestLogConfig::default(),
             stream_max_retries: default_stream_max_retries(),
@@ -3965,6 +3969,28 @@ mod tests {
             serde_json::to_value(disabled).unwrap()["localRouterEnabled"],
             serde_json::json!(false)
         );
+    }
+
+    #[test]
+    fn auto_check_codey_updates_defaults_to_enabled_and_preserves_explicit_value() {
+        assert!(CodeyConfig::default().auto_check_codey_updates);
+        let legacy = serde_json::from_str::<CodeyConfig>(r#"{}"#)
+            .unwrap()
+            .normalize();
+        assert!(legacy.auto_check_codey_updates);
+
+        for enabled in [false, true] {
+            let config = serde_json::from_value::<CodeyConfig>(serde_json::json!({
+                "autoCheckCodeyUpdates": enabled,
+            }))
+            .unwrap()
+            .normalize();
+            assert_eq!(config.auto_check_codey_updates, enabled);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["autoCheckCodeyUpdates"],
+                enabled
+            );
+        }
     }
 
     #[test]

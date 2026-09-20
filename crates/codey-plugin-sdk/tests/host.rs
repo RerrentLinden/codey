@@ -6,6 +6,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 
+const INITIAL_CONFIG: &str = concat!(
+    "{\n  \"_comments\": {\"value\": \"用于请求头\"},\n",
+    "  \"value\": \"hello-codey\",\n",
+    "  \"nested\": {\"_comments\": {\"enabled\": \"是否启用\"}, \"enabled\": true},\n",
+    "  \"rules\": [{\"_comments\": {\"model\": \"模型\"}, \"model\": \"gpt6\"}],\n",
+    "  \"_business\": 42, \"_commentsLike\": \"原样保留\"\n}\n",
+);
+
 fn package(path: &Path, library: &[u8], version: &str) {
     package_with_header(path, library, version, "x-plugin-demo");
 }
@@ -22,19 +30,16 @@ fn package_with_header(path: &Path, library: &[u8], version: &str, header: &str)
         "id":"dev.codey.header-demo","name":"Demo","version":version,
         "abiVersion":1,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,
         "entry":format!("lib/{filename}"),"librarySha256":format!("{:x}",Sha256::digest(library)),
-        "capabilities":["request.beforeSend"],"headerNames":[header],"configSchema":"config.schema.json"
+        "capabilities":["request.beforeSend"],"headerNames":[header]
     });
-    let schema = json!({"type":"object","properties":{"value":{"type":"string","default":"hello-codey","minLength":1,"maxLength":128}},"required":["value"],"additionalProperties":false});
+    let config = INITIAL_CONFIG;
     let mut archive = zip::ZipWriter::new(fs::File::create(path).unwrap());
     for (name, bytes) in [
         (
             "manifest.json".to_owned(),
             serde_json::to_vec(&manifest).unwrap(),
         ),
-        (
-            "config.schema.json".to_owned(),
-            serde_json::to_vec(&schema).unwrap(),
-        ),
+        ("config.json".to_owned(), config.as_bytes().to_vec()),
         (format!("lib/{filename}"), library.to_vec()),
     ] {
         archive
@@ -106,11 +111,31 @@ fn complete_native_plugin_lifecycle() {
     // Compile a separate consumer project, with no Codey workspace membership.
     let project = temp.path().join("standalone-plugin");
     fs::create_dir_all(project.join("src")).unwrap();
-    fs::copy(
-        workspace.join("examples/plugins/header-demo/src/lib.rs"),
-        project.join("src/lib.rs"),
-    )
-    .unwrap();
+    let mut source =
+        fs::read_to_string(workspace.join("examples/plugins/header-demo/src/lib.rs")).unwrap();
+    // Only the temporary fixture exposes the exact configuration received at create.
+    for (before, after) in [
+        (
+            "value: String,",
+            "value: String,\n    received_config: Value,",
+        ),
+        (
+            "value: value.into(),",
+            "value: value.into(),\n            received_config: config.clone(),",
+        ),
+        (
+            "match method {",
+            "match method {\n            \"config.received\" => Ok(self.received_config.clone()),",
+        ),
+    ] {
+        assert_eq!(
+            source.matches(before).count(),
+            1,
+            "fixture source changed: {before}"
+        );
+        source = source.replace(before, after);
+    }
+    fs::write(project.join("src/lib.rs"), source).unwrap();
     let sdk_path = serde_json::to_string(env!("CARGO_MANIFEST_DIR")).unwrap();
     fs::write(project.join("Cargo.toml"), format!(
         "[package]\nname = \"codey-plugin-header-demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\ncrate-type = [\"cdylib\"]\n[dependencies]\ncodey-plugin-sdk = {{ path = {sdk_path} }}\n[workspace]\n"
@@ -151,11 +176,14 @@ fn complete_native_plugin_lifecycle() {
     assert!(host::list().unwrap().plugins.is_empty());
     let installed = host::install(&path, &inspection.sha256).unwrap();
     assert!(!installed.plugins[0].enabled);
-    assert!(installed.plugins[0].config_ui.is_none());
-    assert!(
-        host::get_config_ui("dev.codey.header-demo")
-            .unwrap()
-            .is_none()
+    let initial_config = host::get_config_file("dev.codey.header-demo").unwrap();
+    assert_eq!(initial_config.content, INITIAL_CONFIG);
+    assert_eq!(initial_config.plugin_id, "dev.codey.header-demo");
+    assert_eq!(initial_config.version, "1.0.0");
+    assert_eq!(initial_config.path, installed.plugins[0].config_path);
+    assert_eq!(
+        fs::read_to_string(&initial_config.path).unwrap(),
+        initial_config.content
     );
     assert!(host::invoke("dev.codey.header-demo", "ping", json!(null)).is_err());
     // A failed consent persistence must not publish a newly loaded instance.
@@ -171,6 +199,16 @@ fn complete_native_plugin_lifecycle() {
     fs::remove_dir(&state_path).unwrap();
     fs::rename(&saved_state, &state_path).unwrap();
     host::set_enabled("dev.codey.header-demo", true).unwrap();
+    assert_eq!(
+        host::invoke("dev.codey.header-demo", "config.received", json!(null)).unwrap(),
+        json!({
+            "value": "hello-codey",
+            "nested": {"enabled": true},
+            "rules": [{"model": "gpt6"}],
+            "_business": 42,
+            "_commentsLike": "原样保留"
+        })
+    );
     let context = host::invoke("dev.codey.header-demo", "storage.context", json!(null)).unwrap();
     let plugin_dir = temp
         .path()
@@ -196,7 +234,18 @@ fn complete_native_plugin_lifecycle() {
         host::invoke("dev.codey.header-demo", "ping", json!({"echo":1})).unwrap()["value"],
         "hello-codey"
     );
-    assert!(host::configure("dev.codey.header-demo", json!({"value":false})).is_err());
+    for invalid in [
+        "{",
+        "[]",
+        "null",
+        "{\"_comments\":null}",
+        "{\"rules\":[{\"_comments\":{\"model\":42}}]}",
+    ] {
+        assert!(
+            host::save_config_file("dev.codey.header-demo", invalid, &initial_config.sha256)
+                .is_err()
+        );
+    }
     let patched = host::dispatch_request_headers(
         &json!({"accountId":"account-handle"}),
         &BTreeMap::from([("authorization".into(), "Bearer secret".into())]),
@@ -204,8 +253,64 @@ fn complete_native_plugin_lifecycle() {
     assert_eq!(patched.len(), 1);
     assert_eq!(patched[0].name, "x-plugin-demo");
     assert_eq!(patched[0].value.as_deref(), Some("hello-codey"));
-    let configured =
-        host::configure("dev.codey.header-demo", json!({"value":"new-value"})).unwrap();
+    let comment_edit = INITIAL_CONFIG.replace("用于请求头", "更新说明");
+    let configured = host::save_config_file(
+        "dev.codey.header-demo",
+        &comment_edit,
+        &initial_config.sha256,
+    )
+    .unwrap();
+    assert!(!configured.plugins[0].restart_required);
+    let comment_config = host::get_config_file("dev.codey.header-demo").unwrap();
+    assert_eq!(comment_config.content, comment_edit);
+    assert_ne!(comment_config.sha256, initial_config.sha256);
+    assert!(
+        host::save_config_file(
+            "dev.codey.header-demo",
+            INITIAL_CONFIG,
+            &initial_config.sha256
+        )
+        .err()
+        .unwrap()
+        .contains("外部修改")
+    );
+    assert_eq!(
+        fs::read_to_string(&initial_config.path).unwrap(),
+        comment_edit
+    );
+    // External comment edits also change the file hash, but not effective runtime config.
+    let external_comment_edit = comment_edit.replace("是否启用", "外部编辑说明");
+    fs::write(&initial_config.path, &external_comment_edit).unwrap();
+    assert!(!host::list().unwrap().plugins[0].restart_required);
+    assert!(
+        host::save_config_file(
+            "dev.codey.header-demo",
+            &comment_edit,
+            &comment_config.sha256
+        )
+        .err()
+        .unwrap()
+        .contains("外部修改")
+    );
+    let current_config = host::get_config_file("dev.codey.header-demo").unwrap();
+    let edited_config = "{\n    \"value\": \"new-value\"\n}\n";
+    let configured = host::save_config_file(
+        "dev.codey.header-demo",
+        edited_config,
+        &current_config.sha256,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&initial_config.path).unwrap(),
+        edited_config
+    );
+    assert!(host::save_config_file("dev.codey.header-demo", "{}", &initial_config.sha256).is_err());
+    assert_eq!(
+        host::get_config_file("dev.codey.header-demo")
+            .unwrap()
+            .content,
+        edited_config
+    );
     assert!(configured.plugins[0].restart_required);
     assert_eq!(
         host::invoke("dev.codey.header-demo", "ping", json!(null)).unwrap()["value"],
@@ -249,8 +354,13 @@ fn complete_native_plugin_lifecycle() {
     assert!(plugin_dir.join("logs/plugin.log").exists());
     assert!(!plugin_dir.join("versions").exists());
     assert!(host::list().unwrap().plugins.is_empty());
-    let restored = host::install(&path, &inspection.sha256).unwrap();
-    assert_eq!(restored.plugins[0].config["value"], "new-value");
+    host::install(&path, &inspection.sha256).unwrap();
+    assert_eq!(
+        host::get_config_file("dev.codey.header-demo")
+            .unwrap()
+            .content,
+        edited_config
+    );
     host::set_enabled("dev.codey.header-demo", true).unwrap();
     assert_eq!(
         host::invoke("dev.codey.header-demo", "storage.read", json!(null)).unwrap(),
@@ -259,8 +369,13 @@ fn complete_native_plugin_lifecycle() {
     host::set_enabled("dev.codey.header-demo", false).unwrap();
     uninstall_loaded_plugin(&temp.path().join("host"), true);
     assert!(!plugin_dir.exists());
-    let reset = host::install(&path, &inspection.sha256).unwrap();
-    assert_eq!(reset.plugins[0].config["value"], "hello-codey");
+    host::install(&path, &inspection.sha256).unwrap();
+    assert_eq!(
+        host::get_config_file("dev.codey.header-demo")
+            .unwrap()
+            .content,
+        initial_config.content
+    );
     package_with_header(&path, &library, "1.2.0", "x-different-header");
     let inspection = host::inspect(&path).unwrap();
     host::install(&path, &inspection.sha256).unwrap();
@@ -273,7 +388,13 @@ fn complete_native_plugin_lifecycle() {
     package(&path, &library, "1.3.0");
     let inspection = host::inspect(&path).unwrap();
     host::install(&path, &inspection.sha256).unwrap();
-    host::configure("dev.codey.header-demo", json!({"value":"recovered"})).unwrap();
+    let config_file = host::get_config_file("dev.codey.header-demo").unwrap();
+    host::save_config_file(
+        "dev.codey.header-demo",
+        "{\"value\":\"recovered\"}",
+        &config_file.sha256,
+    )
+    .unwrap();
     host::set_enabled("dev.codey.header-demo", true).unwrap();
     // Build a library exporting only the original entry, proving host fallback
     // passes the original config rather than the new context envelope.

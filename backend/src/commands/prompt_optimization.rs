@@ -183,7 +183,7 @@ pub async fn fetch_prompt_optimization_models_command(
     let config = state.config.read().await.clone();
     let mut optimization = draft.unwrap_or_else(|| config.prompt_optimization.clone());
     optimization.merge_redacted_secrets(&config.prompt_optimization);
-    optimization.validate()?;
+    // 获取列表不需要预先选择模型，连接参数由后续请求流程校验。
     let uses_codey_route = optimization.uses_codey_route();
     let request_config = resolve_request_config(state, &optimization).await?;
     let client = optimizer_client(uses_codey_route)?;
@@ -236,6 +236,78 @@ pub async fn test_prompt_optimization_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fetch_prompt_optimization_models_accepts_drafts_without_a_selected_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0_u8; 1024];
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "模型列表请求不完整");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+                assert!(request.contains("Bearer sk-test-model-list"));
+                let body = r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let saved = PromptOptimizationConfig {
+            base_url: format!("http://{address}/v1"),
+            api_key: "sk-test-model-list".to_string(),
+            api_key_configured: true,
+            model: "saved-model".to_string(),
+            upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string(),
+            ..PromptOptimizationConfig::default()
+        };
+        let state = Arc::new(AppState {
+            config: tokio::sync::RwLock::new(crate::config::CodeyConfig {
+                prompt_optimization: saved.clone(),
+                ..crate::config::CodeyConfig::default()
+            }),
+            ..AppState::default()
+        });
+
+        for enabled in [true, false] {
+            let draft = PromptOptimizationConfig {
+                enabled,
+                api_key: String::new(),
+                model: String::new(),
+                ..saved.clone()
+            };
+            let result = timeout(
+                Duration::from_secs(5),
+                fetch_prompt_optimization_models_command(&state, Some(draft)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(result, json!({"models": ["model-a", "model-b"]}));
+            assert_eq!(state.config.read().await.prompt_optimization, saved);
+        }
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn disabled_local_router_rejects_codey_route_optimization_before_runtime_lookup() {

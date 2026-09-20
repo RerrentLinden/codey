@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 
+[package.metadata.cargo-machete]
+# tests/host.rs 通过 #[path] 引入 backend 的插件宿主，这些依赖用于宿主测试。
+ignored = ["arc-swap", "libloading", "semver", "uuid"]
+
 [dependencies]
 fs2 = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -18,3 +22,6 @@ sha2 = "0.10"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

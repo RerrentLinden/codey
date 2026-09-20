@@ -84,6 +84,7 @@ pub(super) async fn runtime_status_with_options(
         .map(|profile| profile.name.clone())
         .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
+    let auto_check_codey_updates = config.auto_check_codey_updates;
     let official_account_available = config.official_account_available_this_launch;
     let official_account_status = config.official_account_status_this_launch;
     let runtime_codex_app_path = runtime
@@ -131,6 +132,7 @@ pub(super) async fn runtime_status_with_options(
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
+        "autoCheckCodeyUpdates": auto_check_codey_updates,
         "clientPlatform": current_update_platform(),
         "activeProfileId": active_profile_id,
         "activeProfileName": active_profile_name,

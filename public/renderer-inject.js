@@ -44,6 +44,8 @@
   let scanTimer = 0;
   let updateCheckTimer = 0;
   let updateCheckInFlight = false;
+  let autoUpdateChecksEnabled = null;
+  let updateCheckGeneration = 0;
   let runtimeHealthTimer = 0;
   let runtimeHealthCheckInFlight = false;
   let runtimeHealthFailures = 0;
@@ -299,23 +301,36 @@
     }
   };
 
-  const scheduleUpdateCheck = (delayMs = updateCheckIntervalMs) => {
-    if (hasDetectedUpdate()) return;
+  const setAutomaticUpdateChecks = (enabled) => {
+    if (autoUpdateChecksEnabled === enabled) return;
+    autoUpdateChecksEnabled = enabled;
+    updateCheckGeneration += 1;
     window.clearTimeout(updateCheckTimer);
+    updateCheckTimer = 0;
+  };
+
+  const scheduleUpdateCheck = (delayMs = updateCheckIntervalMs) => {
+    window.clearTimeout(updateCheckTimer);
+    updateCheckTimer = 0;
+    if (autoUpdateChecksEnabled === false || hasDetectedUpdate()) return;
     updateCheckTimer = window.setTimeout(() => {
       updateCheckTimer = 0;
-      void checkForUpdatesSilently();
+      // 尚未读取到设置时先重试状态查询，避免关闭后仍发起更新请求。
+      if (autoUpdateChecksEnabled === null) void hydrateUpdateAvailability();
+      else void checkForUpdatesSilently();
     }, delayMs);
   };
 
   const checkForUpdatesSilently = async () => {
-    if (updateCheckInFlight || hasDetectedUpdate()) return;
+    if (autoUpdateChecksEnabled !== true || updateCheckInFlight || hasDetectedUpdate()) return;
     updateCheckInFlight = true;
+    const generation = updateCheckGeneration;
     try {
       const result = await withTimeout(
         callBridge(updateCheckPath, {}, { timeoutMs: updateCheckTimeoutMs }),
         updateCheckTimeoutMs,
       );
+      if (autoUpdateChecksEnabled !== true || generation !== updateCheckGeneration) return;
       if (result?.status !== "failed" && result?.updateAvailable === true) {
         setUpdateAvailability(result);
         return;
@@ -329,15 +344,18 @@
   };
 
   const hydrateUpdateAvailability = async () => {
+    const generation = updateCheckGeneration;
     try {
       const status = await withTimeout(
         callBridge(backendStatusPath, {}, { timeoutMs: updateCheckTimeoutMs }),
         updateCheckTimeoutMs,
         "读取更新状态超时",
       );
+      if (generation !== updateCheckGeneration || !status || status.status === "failed") return;
+      setAutomaticUpdateChecks(status.autoCheckCodeyUpdates !== false);
       setUpdateAvailability(status?.availableUpdate || null);
     } catch {
-      setUpdateAvailability(null);
+      if (generation === updateCheckGeneration) setUpdateAvailability(null);
     } finally {
       if (!hasDetectedUpdate()) scheduleUpdateCheck();
     }
@@ -1146,7 +1164,12 @@
     setUpdateAvailability(result, { dispatch: false });
     if (!hasDetectedUpdate()) scheduleUpdateCheck();
   });
-  window.addEventListener?.(configChangedEvent, () => {
+  window.addEventListener?.(configChangedEvent, (event) => {
+    const enabled = event.detail?.config?.autoCheckCodeyUpdates;
+    if (typeof enabled === "boolean" && autoUpdateChecksEnabled !== enabled) {
+      setAutomaticUpdateChecks(enabled);
+      if (enabled) scheduleUpdateCheck(0);
+    }
     accountUsageLastResult = null;
     accountUsagePollingEnabled = true;
     scheduleAccountUsageCheck(0);

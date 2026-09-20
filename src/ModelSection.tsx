@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   IconCheck as Check,
+  IconChartDonut,
   IconCpu,
   IconEdit as Edit,
   IconEye,
@@ -11,6 +12,7 @@ import {
   IconListDetails,
   IconPlus as Plus,
   IconRefresh as RefreshCw,
+  IconRoute,
   IconServer as Server,
   IconShieldCheck,
   IconSparkles,
@@ -19,7 +21,7 @@ import {
 
 import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
-import { Card } from "@heroui/react";
+import { SettingsPageHeader } from "./SettingsPageHeader";
 import { ModelCombobox } from "./components/ModelCombobox";
 import type { SubagentModelOption } from "./subagentModels";
 import {
@@ -33,6 +35,7 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
+  Link,
   NumberInput,
   PasswordInput,
   Select,
@@ -52,7 +55,6 @@ import {
   MAX_ROUTE_SHORT_NAME_CHARACTERS,
   validateThirdPartyRouteShortName,
 } from "./routeShortNames";
-import { flushCardClass } from "./uiClasses";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
 import { invoke } from "./api";
 import { readHostTheme } from "./overlayTheme";
@@ -71,6 +73,7 @@ type ModelSectionProps = {
   subagentModelOptions?: SubagentModelOption[];
   onToggleLocalRouter: (checked: boolean) => void;
   onToggleRouteRequestLog: (checked: boolean) => void;
+  onOpenUsageAnalysis: (trigger: HTMLElement) => void;
   onSaveRoute: (route: Profile) => Promise<boolean>;
   onSetRouteEnabled: (routeId: string, enabled: boolean) => Promise<boolean>;
   onReorderRoute: (sourceId: string, targetId: string) => Promise<void>;
@@ -218,6 +221,7 @@ function ModelSectionComponent({
   subagentModelOptions = [],
   onToggleLocalRouter,
   onToggleRouteRequestLog,
+  onOpenUsageAnalysis,
   onSaveRoute,
   onSetRouteEnabled,
   onReorderRoute,
@@ -271,10 +275,6 @@ function ModelSectionComponent({
       setOfficialAccounts(null);
     }
   }, []);
-
-  useEffect(() => {
-    void refreshOfficialAccounts();
-  }, [refreshOfficialAccounts]);
 
   const handleOfficialAccountsChanged = useCallback(
     (result: OfficialAccountsResult) => {
@@ -659,39 +659,43 @@ function ModelSectionComponent({
 
   return (
     <section className="route-section" aria-labelledby="route-title">
-      <div className="section-title">
-        <div className="section-heading">
-          <span className="section-icon" aria-hidden="true">
-            <Server size={15} />
-          </span>
-          <div>
-            <div className="route-title-line">
-              <h2 id="route-title">线路与模型</h2>
-              <Button
-                variant="link"
-                size="icon-sm"
-                aria-label={maskSensitive ? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"}
-                title={maskSensitive ? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"}
-                onClick={() => setMaskSensitive((previous) => !previous)}
-              >
-                {maskSensitive ? (
-                  <IconEyeOff size={15} aria-hidden="true" />
-                ) : (
-                  <IconEye size={15} aria-hidden="true" />
-                )}
-              </Button>
-            </div>
-            <p>
-              {routeConfigReadOnly
-                ? "查看 Codex 当前线路并同步原始模型目录"
-                : "统一管理供应商线路与模型目录"}
-            </p>
-          </div>
-        </div>
-        <div className="route-heading-actions">
-          <div className="local-router-toggle local-router-toggle-group">
-            <div className="local-router-toggle-item">
-              <strong>本地路由</strong>
+      <SettingsPageHeader
+        id="route-title"
+        title="线路与模型"
+        icon={<IconRoute size={15} />}
+        badge={
+          <button
+            type="button"
+            className="route-mask-toggle-btn"
+            aria-label={maskSensitive ? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"}
+            title={maskSensitive ? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"}
+            onClick={() => setMaskSensitive((previous) => !previous)}
+          >
+            {maskSensitive ? (
+              <IconEyeOff size={16} aria-hidden="true" />
+            ) : (
+              <IconEye size={16} aria-hidden="true" />
+            )}
+          </button>
+        }
+        description={routeConfigReadOnly
+          ? "查看 Codex 当前线路并同步原始模型目录"
+          : "统一管理供应商线路与模型目录"}
+        actions={
+          <div className="route-header-controls">
+            <Button
+              color="primary"
+              variant="filled"
+              size="sm"
+              onClick={(event) => {
+                if (event.currentTarget instanceof HTMLElement) onOpenUsageAnalysis(event.currentTarget);
+              }}
+            >
+              <IconChartDonut size={14} aria-hidden="true" />
+              <span>用量分析</span>
+            </Button>
+            <div className="route-header-switch-item">
+              <span className="route-header-switch-label">本地路由</span>
               <Switch
                 size="sm"
                 checked={config.localRouterEnabled}
@@ -702,36 +706,44 @@ function ModelSectionComponent({
             </div>
             {config.localRouterEnabled && (
               <>
-                <span className="local-router-toggle-divider" aria-hidden="true" />
-                <div className="local-router-toggle-item route-request-log-toggle">
-                  <strong>开启日志记录</strong>
-                  <Switch
-                    size="sm"
-                    checked={config.routeRequestLog.enabled}
-                    disabled={isBusy}
-                    onCheckedChange={onToggleRouteRequestLog}
-                    aria-label="开启请求日志记录"
-                  />
+                <span className="route-header-divider" aria-hidden="true" />
+                <div className="route-header-log-col">
+                  <div className="route-header-switch-item">
+                    <span className="route-header-switch-label">开启日志记录</span>
+                    <Switch
+                      size="sm"
+                      checked={config.routeRequestLog.enabled}
+                      disabled={isBusy}
+                      onCheckedChange={onToggleRouteRequestLog}
+                      aria-label="开启请求日志记录"
+                    />
+                  </div>
+                  <Link
+                    onPress={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
+                  >
+                    查看请求日志
+                  </Link>
                 </div>
               </>
             )}
           </div>
-          {config.localRouterEnabled && (
-            <Button
-              color="primary"
-              variant="filled"
-              onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
-            >
-              <IconListDetails size={14} aria-hidden="true" />
-              <span>查看请求日志</span>
-            </Button>
-          )}
-        </div>
-      </div>
+        }
+      />
 
-      <Card className={`route-card ${flushCardClass}`}>
+      <div className="route-content">
         <div className={`route-manager${routeConfigReadOnly ? " route-manager-current" : ""}`}>
           <div className="route-catalog-pane">
+            <OfficialAccountsPanel
+              officialAccountAvailable={officialAccountAvailable}
+              isBusy={isBusy}
+              maskSensitive={maskSensitive}
+              popupContainer={popupContainer}
+              onAccountsLoaded={setOfficialAccounts}
+              onAccountsChanged={handleOfficialAccountsChanged}
+              onNotice={onNotice}
+              onRequestConfirmation={onRequestConfirmation}
+            />
+
             <div className="catalog-aggregate-heading">
               <div className="catalog-aggregate-title-wrap">
                 <div className="catalog-aggregate-title">
@@ -758,16 +770,6 @@ function ModelSectionComponent({
                 </Button>
               )}
             </div>
-
-            <OfficialAccountsPanel
-              officialAccountAvailable={officialAccountAvailable}
-              isBusy={isBusy}
-              maskSensitive={maskSensitive}
-              popupContainer={popupContainer}
-              onAccountsChanged={handleOfficialAccountsChanged}
-              onNotice={onNotice}
-              onRequestConfirmation={onRequestConfirmation}
-            />
 
             <div id="provider-model-groups" className="provider-model-groups" role="region" aria-label="供应商与模型列表" tabIndex={0}>
               {visibleProfiles.length === 0 && (
@@ -812,7 +814,7 @@ function ModelSectionComponent({
                       setDropRouteId(null);
                     }}
                   >
-                    <div className="provider-model-group-left">
+                    <div className="provider-card-header">
                       <div className="provider-heading-main">
                         {!routeConfigReadOnly && (
                           <button
@@ -847,22 +849,6 @@ function ModelSectionComponent({
                         </div>
                         <div className="provider-heading-text">
                           <div className="provider-heading-title-row">
-                            {!routeConfigReadOnly && (
-                              <span
-                                title={disabled ? `点击启用线路「${profile.name}」` : `点击停用线路「${profile.name}」`}
-                                className="flex items-center"
-                              >
-                                <Switch
-                                  size="xs"
-                                  checked={!disabled}
-                                  disabled={isBusy || dirty || pendingRouteToggle !== null}
-                                  aria-busy={pendingRouteToggle?.id === profile.id}
-                                  onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
-                                  aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
-                                  className="route-status-switch"
-                                />
-                              </span>
-                            )}
                             <strong id={`provider-model-${profile.id}`} title={profile.name}>{profile.name || "未命名线路"}</strong>
                             <div className="route-item-badges">
                               {pendingRouteToggle?.id === profile.id && <Badge variant="secondary">保存中…</Badge>}
@@ -889,6 +875,82 @@ function ModelSectionComponent({
                           </small>
                         </div>
                       </div>
+
+                      <div className="provider-card-toolbar">
+                        {!routeConfigReadOnly && (
+                          <span
+                            title={disabled ? `点击启用线路「${profile.name}」` : `点击停用线路「${profile.name}」`}
+                            className="provider-route-toggle-wrap"
+                          >
+                            <Switch
+                              size="xs"
+                              checked={!disabled}
+                              disabled={isBusy || dirty || pendingRouteToggle !== null}
+                              aria-busy={pendingRouteToggle?.id === profile.id}
+                              onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
+                              aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
+                              className="route-status-switch"
+                            />
+                          </span>
+                        )}
+                        {!disabled && (
+                          <Button
+                            color="primary"
+                            variant="filled"
+                            size="xs"
+                            disabled={!canSyncCurrentProvider || isBusy}
+                            onClick={syncModels}
+                            aria-label={`同步 ${profile.name} 模型`}
+                            title={`同步 ${profile.name} 模型`}
+                          >
+                            <RefreshCw size={12} className={busy === "fetch-route-models" && (routeConfigReadOnly || profile.id === config.activeProfileId) ? "animate-spin" : ""} aria-hidden="true" />
+                            <span>同步</span>
+                          </Button>
+                        )}
+                        {!routeConfigReadOnly && (
+                          <div className="route-item-manage-actions">
+                            <Button
+                              variant="link"
+                              color="primary"
+                              size="icon-sm"
+                              disabled={isBusy || dirty}
+                              onClick={() => openHeadersDialog(profile)}
+                              aria-label={`编辑线路 ${profile.name} 的请求头`}
+                              title="编辑上游请求头"
+                            >
+                              <IconListDetails size={14} aria-hidden="true" />
+                            </Button>
+                            <Button
+                              variant="link"
+                              color="primary"
+                              size="icon-sm"
+                              disabled={isBusy || dirty}
+                              onClick={() =>
+                                openRouteDialog(profile, isOfficial ? "settings" : null)}
+                              aria-label={`编辑线路 ${profile.name}`}
+                              title={`编辑线路 ${profile.name}`}
+                            >
+                              <Edit size={14} aria-hidden="true" />
+                            </Button>
+                            {!isOfficial && (
+                              <Button
+                                variant="link"
+                                color="danger"
+                                size="icon-sm"
+                                disabled={routeConfigReadOnly || isBusy || dirty || config.profiles.length <= 1}
+                                onClick={() => onDeleteRoute(profile.id)}
+                                aria-label={`删除线路 ${profile.name}`}
+                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${profile.name}`}
+                              >
+                                <Trash size={14} aria-hidden="true" />
+                              </Button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="provider-card-body">
                       {group && (group.models.length > 0 ? (
                         <div className="provider-model-tags">
                           {group.models.map((model) => {
@@ -931,66 +993,6 @@ function ModelSectionComponent({
                         </div>
                       ))}
                     </div>
-                    <div className="provider-model-group-actions">
-                      <div className="provider-model-group-actions-top">
-                        {!routeConfigReadOnly && (
-                          <div className="route-item-manage-actions">
-                            <Button
-                              variant="link"
-                              color="primary"
-                              size="icon-sm"
-                              disabled={isBusy || dirty}
-                              onClick={() => openHeadersDialog(profile)}
-                              aria-label={`编辑线路 ${profile.name} 的请求头`}
-                              title="编辑上游请求头"
-                            >
-                              <IconListDetails size={14} aria-hidden="true" />
-                            </Button>
-                            <Button
-                              variant="link"
-                              color="primary"
-                              size="icon-sm"
-                              disabled={isBusy || dirty}
-                              onClick={() =>
-                                openRouteDialog(profile, isOfficial ? "settings" : null)}
-                              aria-label={`编辑线路 ${profile.name}`}
-                              title={`编辑线路 ${profile.name}`}
-                            >
-                              <Edit size={14} aria-hidden="true" />
-                            </Button>
-                            {!isOfficial && (
-                              <Button
-                                variant="link"
-                                color="danger"
-                                size="icon-sm"
-                                disabled={routeConfigReadOnly || isBusy || dirty || config.profiles.length <= 1}
-                                onClick={() => onDeleteRoute(profile.id)}
-                                aria-label={`删除线路 ${profile.name}`}
-                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${profile.name}`}
-                              >
-                                <Trash size={14} aria-hidden="true" />
-                              </Button>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                      <div className="provider-model-group-actions-bottom">
-                        {!disabled && (
-                          <Button
-                            color="primary"
-                            variant="filled"
-                            size="xs"
-                            disabled={!canSyncCurrentProvider || isBusy}
-                            onClick={syncModels}
-                            aria-label={`同步 ${profile.name} 模型`}
-                            title={`同步 ${profile.name} 模型`}
-                          >
-                            <RefreshCw size={12} className={busy === "fetch-route-models" && (routeConfigReadOnly || profile.id === config.activeProfileId) ? "animate-spin" : ""} aria-hidden="true" />
-                            <span>同步</span>
-                          </Button>
-                        )}
-                      </div>
-                    </div>
                   </section>
                 );
               })}
@@ -999,66 +1001,74 @@ function ModelSectionComponent({
         </div>
 
         <div className="route-auxiliary-bar">
-          <div className="route-auxiliary-misc">
-            <Tooltip content={miscModelTooltip} position="top">
-              <span className="route-auxiliary-label cursor-help">
-                <IconSparkles size={14} className="route-auxiliary-icon" aria-hidden="true" />
-                <strong>杂事模型</strong>
-                <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
-              </span>
-            </Tooltip>
-            <div className="route-auxiliary-combobox">
-              <ModelCombobox
-                aria-label="杂事模型"
-                value={config.miscModel}
-                placeholder={
-                  subagentModelOptions.length === 0
-                    ? "所有线路均暂无模型"
-                    : "请选择模型"
-                }
-                disabled={miscModelDisabled}
-                options={subagentModelOptions}
-                preferredProviderId={preferredProviderId}
-                onChange={(value) => {
-                  if (!subagentModelOptions.some((option) => option.value === value)) {
-                    return;
-                  }
-                  onConfigChange?.({ ...config, miscModel: value });
-                }}
-              />
+          <div className="route-auxiliary-header">
+            <div className="route-auxiliary-title-wrap">
+              <span className="route-auxiliary-title">高级路由与重试设置</span>
+              <small className="route-auxiliary-subtitle">配置辅助任务专用模型与长会话中断后的自动恢复策略</small>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={isBusy || config.miscModel.trim() === ""}
-              onClick={() => onConfigChange?.({ ...config, miscModel: "" })}
-              className="route-misc-model-reset"
-            >
-              恢复默认
-            </Button>
           </div>
-
-          <div className="route-auxiliary-retry">
-            <div className="local-router-toggle route-retry-toggle">
-              <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效" position="top">
-                <span className="route-retry-label cursor-help">
-                  <strong>会话重试</strong>
+          <div className="route-auxiliary-grid">
+            <div className="route-auxiliary-misc">
+              <Tooltip content={miscModelTooltip} position="top">
+                <span className="route-auxiliary-label cursor-help">
+                  <IconSparkles size={14} className="route-auxiliary-icon" aria-hidden="true" />
+                  <strong>杂事模型</strong>
                   <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
                 </span>
               </Tooltip>
-              <NumberInput
-                size="sm"
-                value={config.streamMaxRetries}
-                minValue={0}
-                maxValue={100}
-                disabled={isBusy}
-                onChange={(value) => {
-                  if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
-                    onConfigChange?.({ ...config, streamMaxRetries: value });
+              <div className="route-auxiliary-combobox">
+                <ModelCombobox
+                  aria-label="杂事模型"
+                  value={config.miscModel}
+                  placeholder={
+                    subagentModelOptions.length === 0
+                      ? "所有线路均暂无模型"
+                      : "请选择模型"
                   }
-                }}
-                aria-label="会话错误重试次数"
-              />
+                  disabled={miscModelDisabled}
+                  options={subagentModelOptions}
+                  preferredProviderId={preferredProviderId}
+                  onChange={(value) => {
+                    if (!subagentModelOptions.some((option) => option.value === value)) {
+                      return;
+                    }
+                    onConfigChange?.({ ...config, miscModel: value });
+                  }}
+                />
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={isBusy || config.miscModel.trim() === ""}
+                onClick={() => onConfigChange?.({ ...config, miscModel: "" })}
+                className="route-misc-model-reset"
+              >
+                恢复默认
+              </Button>
+            </div>
+
+            <div className="route-auxiliary-retry">
+              <div className="local-router-toggle route-retry-toggle">
+                <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效" position="top">
+                  <span className="route-retry-label cursor-help">
+                    <strong>会话重试</strong>
+                    <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+                  </span>
+                </Tooltip>
+                <NumberInput
+                  size="sm"
+                  value={config.streamMaxRetries}
+                  minValue={0}
+                  maxValue={100}
+                  disabled={isBusy}
+                  onChange={(value) => {
+                    if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
+                      onConfigChange?.({ ...config, streamMaxRetries: value });
+                    }
+                  }}
+                  aria-label="会话错误重试次数"
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -1077,7 +1087,7 @@ function ModelSectionComponent({
             {routeConfigReadOnly ? "当前线路" : "统一路由"}
           </Badge>
         </div>
-      </Card>
+      </div>
 
       <Dialog
         open={routeDialogOpen}

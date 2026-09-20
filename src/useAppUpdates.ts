@@ -31,6 +31,7 @@ declare global {
 type UseAppUpdatesOptions = {
   embedded: boolean;
   configLoaded: boolean;
+  autoCheckCodeyUpdates: boolean;
   isBusy: boolean;
   setBusy: Dispatch<SetStateAction<string | null>>;
   setNotice: Dispatch<SetStateAction<Notice>>;
@@ -68,6 +69,7 @@ function publishUpdateAvailability(result: UpdateCheck | null) {
 export function useAppUpdates({
   embedded,
   configLoaded,
+  autoCheckCodeyUpdates,
   isBusy,
   setBusy,
   setNotice,
@@ -82,6 +84,8 @@ export function useAppUpdates({
   const [downloadedUpdate, setDownloadedUpdate] =
     useState<UpdateDownload | null>(null);
   const updateCheckRef = useRef<UpdateCheck | null>(null);
+  const [automaticallyChecking, setAutomaticallyChecking] = useState(false);
+  const manualCheckVersion = useRef(0);
   const updateCheckInFlightRef = useRef<Promise<UpdateCheck> | null>(null);
   const requestUpdateCheck = useCallback(() => {
     const current = updateCheckInFlightRef.current;
@@ -133,7 +137,7 @@ export function useAppUpdates({
   }, []);
 
   useEffect(() => {
-    if (embedded || !configLoaded) return;
+    if (embedded || !configLoaded || !autoCheckCodeyUpdates) return;
     let cancelled = false;
     let timer = 0;
 
@@ -151,10 +155,11 @@ export function useAppUpdates({
 
     const checkForUpdatesSilently = async () => {
       if (cancelled || shouldPause()) return;
-      setUpdateResult({ tone: "pending", text: "正在检查更新…" });
+      const manualVersion = manualCheckVersion.current;
+      setAutomaticallyChecking(true);
       try {
         const result = await requestUpdateCheck();
-        if (cancelled) return;
+        if (cancelled || manualVersion !== manualCheckVersion.current) return;
         if (result.updateAvailable) {
           setUpdateCheck(result);
           setDownloadedUpdate(null);
@@ -170,9 +175,12 @@ export function useAppUpdates({
           text: updateCheckText(result),
         });
       } catch {
-        if (!cancelled) setUpdateResult({ tone: "idle", text: "" });
+        if (!cancelled && manualVersion === manualCheckVersion.current) {
+          setUpdateResult({ tone: "idle", text: "" });
+        }
         // 更新地址不可达或检查超时时直接跳过；手动检查仍会展示具体错误。
       } finally {
+        if (!cancelled) setAutomaticallyChecking(false);
         if (!cancelled && !shouldPause()) schedule();
       }
     };
@@ -181,11 +189,13 @@ export function useAppUpdates({
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      setAutomaticallyChecking(false);
     };
-  }, [configLoaded, embedded, requestUpdateCheck]);
+  }, [autoCheckCodeyUpdates, configLoaded, embedded, requestUpdateCheck]);
 
   async function checkForUpdates() {
     if (!configLoaded || isBusy) return;
+    manualCheckVersion.current += 1;
     setBusy("check-update");
     setUpdateResult({ tone: "pending", text: "正在检查更新…" });
     setUpdateCheck(null);
@@ -279,6 +289,7 @@ export function useAppUpdates({
   }
 
   return {
+    automaticallyChecking,
     updateResult,
     updateCheck,
     downloadedUpdate,

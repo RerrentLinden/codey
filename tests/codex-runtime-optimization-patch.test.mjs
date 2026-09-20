@@ -24,6 +24,7 @@ async function loadPatchInIsolatedContext(
   contextOverrides = {},
   installMessagePatch = true,
   miscModel = null,
+  spawnImplementation = () => ({ pid: 4242 }),
 ) {
   const Module = process.getBuiltinModule("module");
   const originalLoad = Module._load;
@@ -35,7 +36,7 @@ async function loadPatchInIsolatedContext(
   const spawnCalls = [];
   childProcess.spawn = (...args) => {
     spawnCalls.push(args);
-    return { pid: 4242 };
+    return spawnImplementation(...args);
   };
   const context = {
     clearTimeout,
@@ -43,6 +44,7 @@ async function loadPatchInIsolatedContext(
     process: { ...process, env: {
       ...process.env,
       CODEY_DISABLE_MACOS_CHILD_PROCESS_SAMPLER: "false",
+      CODEY_CODEX_CLI_STDIN_RELAY: "",
     } },
     Promise,
     setImmediate,
@@ -80,6 +82,18 @@ async function loadPatchInIsolatedContext(
     throw error;
   }
 }
+
+const relayWrapper = join(tmpdir(), "codey-cli-wrapper");
+const relayContext = (configs) => ({
+  process: { ...process, env: {
+    ...process.env,
+    CODEY_DISABLE_MACOS_CHILD_PROCESS_SAMPLER: "false",
+    CODEX_CLI_PATH: relayWrapper,
+    CODEY_CODEX_CLI_STDIN_RELAY: relayWrapper,
+    CODEY_CODEX_CLI_WRAPPER_TARGET: join(tmpdir(), "codex"),
+    CODEY_CODEX_CLI_WRAPPER_OVERRIDES: JSON.stringify(configs),
+  } },
+});
 
 test("shared app-server chunk routes native thread requests after Desktop's transform", async () => {
   const directory = await mkdtemp(join(tmpdir(), "codey-message-patch-"));
@@ -143,7 +157,7 @@ test("shared app-server chunk routes native thread requests after Desktop's tran
   } finally { native.restore(); }
 });
 
-test("app-server transport drift reports the anchor shape before failing closed", async () => {
+test("app-server transport drift reports the anchor shape for diagnostics", async () => {
   const runtime = await loadPatchInIsolatedContext(['model_provider="codey_router"'], {}, false);
   try {
     const patch = runtime.context.__CODEY_PATCH_CODEX_APP_SERVER_MESSAGES__;
@@ -344,13 +358,75 @@ test("build chunks use one native source read and retain CommonJS loading semant
   }
 });
 
-test("router mode refuses to spawn when the shared request patch is missing", async () => {
-  const runtime = await loadPatchInIsolatedContext(['model_provider="codey_router"'], {}, false);
+test("router mode degrades consistently before and after a verified wrapper spawn", async () => {
+  const configs = ['model_provider="codey_router"'];
+  for (const waitBeforeSpawn of [true, false]) {
+    const warnings = [];
+    const runtime = await loadPatchInIsolatedContext(configs, {
+      ...relayContext(configs),
+      console: { ...console, warn: (...args) => warnings.push(args.join(" ")) },
+    }, false);
+    try {
+      const wait = runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__;
+      const pending = waitBeforeSpawn ? wait() : null;
+      process.getBuiltinModule("child_process").spawn(relayWrapper, ["app-server"]);
+      assert.equal(runtime.spawnCalls.length, 1);
+      assert.deepEqual(Array.from(runtime.spawnCalls[0][1]), [
+        "app-server", "-c", "analytics.enabled=false", "-c", configs[0],
+      ]);
+      assert.equal(await (pending ?? wait()), "codey-app-server-runtime-overrides-degraded");
+      assert.equal(await wait(), "codey-app-server-runtime-overrides-degraded");
+      assert.equal(warnings.length, 1, "repeat validation should not duplicate warnings");
+      assert.match(warnings[0], /运行时配置已验证.*stdin relay/);
+      assert.doesNotMatch(warnings[0], /已停止启动|不兼容|缺失/);
+    } finally { runtime.restore(); }
+  }
+});
+
+test("router mode refuses transport drift without the actual relay wrapper and config", async () => {
+  const configs = ['model_provider="codey_router"'];
+  const cases = [
+    { context: {}, command: "codex" },
+    { context: relayContext(configs), command: "codex" },
+    { context: relayContext(configs), command: relayWrapper, options: { env: {} } },
+    { context: relayContext([]), command: relayWrapper },
+    { context: relayContext([...configs, 'model_provider="openai"']), command: relayWrapper },
+  ];
+  for (const { context, command, options } of cases) {
+    const runtime = await loadPatchInIsolatedContext(configs, context, false);
+    try {
+      const pending = runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
+      assert.throws(() => process.getBuiltinModule("child_process").spawn(command, ["app-server"], options), /未确认使用 Codey 标准输入转发入口/);
+      await assert.rejects(pending, /未确认使用 Codey 标准输入转发入口/);
+      assert.equal(runtime.spawnCalls.length, 0);
+    } finally { runtime.restore(); }
+  }
+});
+
+test("relay fallback cannot bypass missing runtime config validation", async () => {
+  const configs = ['model_provider="codey_router"'];
+  const runtime = await loadPatchInIsolatedContext(configs, relayContext(configs), false);
   try {
     const pending = runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
-    assert.throws(() => process.getBuiltinModule("child_process").spawn("codex", ["app-server"]), /未能启用本地路由请求处理/);
+    const args = ["app-server", "-c", "analytics.enabled=false", "-c", configs[0]];
+    // 模拟参数解析无法定位 app-server 配置层；转发入口存在也不能放行。
+    args.indexOf = () => -1;
+    assert.throws(() => process.getBuiltinModule("child_process").spawn(relayWrapper, args), /缺失：.*model_provider/);
+    await assert.rejects(pending, /缺失：.*model_provider/);
+    await assert.rejects(runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(), /缺失：.*model_provider/);
     assert.equal(runtime.spawnCalls.length, 0);
-    await assert.rejects(pending, /未能启用本地路由请求处理/);
+  } finally { runtime.restore(); }
+});
+
+test("a synchronous spawn failure cannot report verified runtime overrides", async () => {
+  const configs = ['model_provider="codey_router"'];
+  const runtime = await loadPatchInIsolatedContext(configs, {}, true, null, () => {
+    throw new Error("spawn failed");
+  });
+  try {
+    const pending = runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
+    assert.throws(() => process.getBuiltinModule("child_process").spawn("codex", ["app-server"]), /spawn failed/);
+    await assert.rejects(pending, /无法创建 app-server 进程/);
   } finally { runtime.restore(); }
 });
 
@@ -1218,20 +1294,27 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
   }
 });
 
-test("startup patch fails closed when app-server runtime override injection is never observed", async () => {
+test("startup patch rejects unobserved runtime overrides on timeout without exposing tokens", async () => {
   const runtimeConfigOverrides = [
     'model_provider="codey_router"',
     'model_providers.codey_router.name="Codey Local Router"',
     'model_providers.codey_router.base_url="http://127.0.0.1:61818/v1"',
     'model_providers.codey_router.http_headers={ x-codey-router-token = "codey-router-secret-token-1234" }',
   ];
+  const warnings = [];
+  let expire;
+  let timeoutMs;
+  let cleared = false;
   const runtime = await loadPatchInIsolatedContext(runtimeConfigOverrides, {
-    setTimeout(callback) {
-      queueMicrotask(callback);
+    ...relayContext(runtimeConfigOverrides),
+    console: { ...console, warn: (...args) => warnings.push(args.join(" ")) },
+    setTimeout(callback, delay) {
+      expire = callback;
+      timeoutMs = delay;
       return { unref() {} };
     },
-    clearTimeout() {},
-  });
+    clearTimeout() { cleared = true; },
+  }, false);
 
   try {
     assert.match(
@@ -1247,18 +1330,17 @@ test("startup patch fails closed when app-server runtime override injection is n
       runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.observed,
       false,
     );
-    await assert.rejects(
-      runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(),
-      (error) => {
-        assert.match(
-          error.message,
-          /当前 Codex 版本的 app-server 启动参数结构与 Codey 不兼容/,
-        );
-        assert.match(error.message, /model_providers\.codey_router\.http_headers/);
-        assert.doesNotMatch(error.message, /secret-token-1234/);
-        return true;
-      },
-    );
+    const pending = runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
+    assert.equal(timeoutMs, 20_000);
+    expire();
+    await assert.rejects(pending, (error) => {
+      assert.match(error.message, /未观察到 app-server 启动调用/);
+      assert.match(error.message, /model_providers\.codey_router\.http_headers/);
+      assert.doesNotMatch(error.message, /secret-token-1234/);
+      return true;
+    });
+    assert.equal(cleared, true);
+    assert.deepEqual(warnings, []);
   } finally {
     runtime.restore();
   }

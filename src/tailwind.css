@@ -23,6 +23,8 @@
 /* 导航 */
 @import "@heroui/styles/components/disclosure.css" layer(components);
 @import "@heroui/styles/components/pagination.css" layer(components);
+@import "@heroui/styles/components/tabs.css" layer(components);
+@import "@heroui/styles/components/scroll-shadow.css" layer(components);
 
 /* 按钮 */
 @import "@heroui/styles/components/button.css" layer(components);
@@ -93,6 +95,7 @@
 @source "../node_modules/@heroui/react/dist/components/input";
 @source "../node_modules/@heroui/react/dist/components/input-group";
 @source "../node_modules/@heroui/react/dist/components/label";
+@source "../node_modules/@heroui/react/dist/components/link";
 @source "../node_modules/@heroui/react/dist/components/list-box";
 @source "../node_modules/@heroui/react/dist/components/list-box-item";
 @source "../node_modules/@heroui/react/dist/components/list-box-section";
@@ -104,6 +107,8 @@
 @source "../node_modules/@heroui/react/dist/components/spinner";
 @source "../node_modules/@heroui/react/dist/components/switch";
 @source "../node_modules/@heroui/react/dist/components/table";
+@source "../node_modules/@heroui/react/dist/components/tabs";
+@source "../node_modules/@heroui/react/dist/components/scroll-shadow";
 @source "../node_modules/@heroui/react/dist/components/textarea";
 @source "../node_modules/@heroui/react/dist/components/toast";
 @source "../node_modules/@heroui/react/dist/components/tooltip";

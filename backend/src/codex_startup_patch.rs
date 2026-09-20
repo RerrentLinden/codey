@@ -13,6 +13,9 @@ use std::io::Write;
 const PATCH_RESULT: &str = "codey-startup-patch-installed-v40";
 const APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT: &str =
     "codey-app-server-runtime-overrides-verified";
+/// 配置已验证且使用 Codey stdin relay 时，允许消息补丁失配后降级启动。
+const APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT: &str =
+    "codey-app-server-runtime-overrides-degraded";
 const MAX_INSPECTOR_TARGET_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Inspector 发现窗口。fuse 允许时 Node 在应用脚本运行前就绑定端口，20 秒足以覆盖冷启动。
 pub(crate) const STARTUP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -30,6 +33,9 @@ const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 pub(crate) const CLI_WRAPPER_TARGET_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_TARGET";
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) const CLI_WRAPPER_OVERRIDES_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_OVERRIDES";
+/// 本次启动具备 stdin relay 的包装器路径，供主进程核对实际启动入口。
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) const CLI_WRAPPER_STDIN_RELAY_ENV: &str = "CODEY_CODEX_CLI_STDIN_RELAY";
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) const CLI_WRAPPER_SUBAGENT_ENV: &str = "CODEY_CODEX_CLI_WRAPPER_SUBAGENT";
 #[cfg(any(windows, target_os = "macos", test))]
@@ -522,8 +528,10 @@ fn cli_wrapper_target(
     #[cfg(windows)]
     let target = crate::launcher::windows_cli_wrapper_target(&app_dir)?;
     #[cfg(target_os = "macos")]
-    let target = codey_runtime_core::app_paths::codex_runtime_executable(&app_dir)
-        .context("Codex App 内未找到内置 CLI")?;
+    let target =
+        codey_runtime_core::app_paths::codex_runtime_executable(&app_dir).with_context(|| {
+            codey_runtime_core::app_paths::codex_runtime_executable_missing(&app_dir)
+        })?;
     Ok(Some(target))
 }
 
@@ -601,6 +609,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             "CODEX_CLI_PATH",
             CLI_WRAPPER_TARGET_ENV,
             CLI_WRAPPER_OVERRIDES_ENV,
+            CLI_WRAPPER_STDIN_RELAY_ENV,
             CLI_WRAPPER_SUBAGENT_ENV,
             CLI_WRAPPER_PORT_ENV,
             CLI_WRAPPER_TOKEN_ENV,
@@ -1385,8 +1394,21 @@ async fn install_over_websocket(
                 let value = payload
                     .pointer("/result/result/value")
                     .and_then(serde_json::Value::as_str);
-                if value != Some(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT) {
-                    anyhow::bail!("Codex app-server 运行时覆盖校验未返回预期状态");
+                match value {
+                    Some(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT) => {}
+                    // JS 已确认运行时配置和转发入口，仅消息补丁失配。
+                    Some(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT) => {
+                        crate::error_log::record_failure(
+                            "patch_failed",
+                            "app_server_runtime_overrides_degraded",
+                            "启动补丁锚点漂移，已降级为 stdin relay 协议层改写".to_string(),
+                            serde_json::json!({
+                                "degraded": true,
+                                "transport": "stdin-relay",
+                            }),
+                        );
+                    }
+                    _ => anyhow::bail!("Codex app-server 运行时覆盖校验未返回预期状态"),
                 }
                 let _ = socket.close(None).await;
                 return Ok(());
@@ -1661,7 +1683,30 @@ mod tests {
             APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT,
             "codey-app-server-runtime-overrides-verified"
         );
+        assert_eq!(
+            APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT,
+            "codey-app-server-runtime-overrides-degraded"
+        );
+        // 降级态必须与已验证态可区分，否则启动器会把锚点漂移当成正常结果。
+        assert_ne!(
+            APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT,
+            APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT
+        );
         assert!(STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT > STARTUP_PATCH_INSTALL_TIMEOUT);
+    }
+
+    /// 状态字是 Rust 与 JS 两侧各自硬编码的跨语言契约：改了一边而忘了另一边，
+    /// 判定点会静默走 `_ => bail!` 分支，把降级重新变回「进不去」。
+    #[test]
+    fn app_server_override_status_is_a_shared_cross_language_contract() {
+        assert!(
+            STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT),
+            "JS payload must return the verified status the launcher compares against"
+        );
+        assert!(
+            STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT),
+            "JS payload must return the degraded status the launcher accepts"
+        );
     }
 
     #[test]
@@ -1902,8 +1947,8 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn inspector_protocol_waits_for_app_server_runtime_override_validation() {
+    /// 驱动完整的 Inspector 安装协议，确认结果由用例指定。
+    async fn run_inspector_runtime_override_case(status: &'static str) -> anyhow::Result<()> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
@@ -2022,7 +2067,7 @@ mod tests {
                         "result": {
                             "result": {
                                 "type": "string",
-                                "value": APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT
+                                "value": status
                             }
                         }
                     })
@@ -2038,10 +2083,32 @@ mod tests {
             subagent_gate_active: true,
             misc_model: None,
         });
-        install_over_websocket(&format!("ws://{address}"), &expression, true)
+        let result = install_over_websocket(&format!("ws://{address}"), &expression, true).await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn inspector_protocol_waits_for_app_server_runtime_override_validation() {
+        run_inspector_runtime_override_case(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT)
             .await
             .unwrap();
-        server.await.unwrap();
+    }
+
+    /// JS 确认满足降级条件后，启动器接受该状态。
+    #[tokio::test]
+    async fn inspector_protocol_accepts_the_degraded_runtime_override_status() {
+        run_inspector_runtime_override_case(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspector_protocol_rejects_unknown_runtime_override_status() {
+        let error = run_inspector_runtime_override_case("unexpected-runtime-status")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("运行时覆盖校验未返回预期状态"));
     }
 
     #[tokio::test]

@@ -26,6 +26,11 @@ test("prompt optimization switches between Codey routing and manual upstream con
   assert.match(cardSource, /OpenAI Chat Completions/);
   assert.match(cardSource, /Anthropic Messages/);
   assert.match(cardSource, /<ModelCombobox/);
+  assert.match(cardSource, /<Tabs[\s\S]*?<Tabs\.ListContainer/);
+  assert.match(cardSource, /<Tabs\.Panel\s+id="codeyRoute"/);
+  assert.match(cardSource, /<Tabs\.Panel\s+id="manual"/);
+  assert.doesNotMatch(cardSource, /prompt-optimization-content\s+codey-card/);
+  assert.doesNotMatch(cardSource, /codey-segmented-control/);
 });
 
 const manualComboboxSource = readFileSync(

@@ -5,12 +5,18 @@ import hashlib
 import json
 import pathlib
 import platform
+import sys
+from typing import cast
 import zipfile
+
+
+reconfigure = getattr(sys.stderr, "reconfigure", None)
+if callable(reconfigure):
+    reconfigure(encoding="utf-8")
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--library", type=pathlib.Path, required=True)
-parser.add_argument("--schema", type=pathlib.Path, required=True)
-parser.add_argument("--config-ui", type=pathlib.Path, help="可选单文件 UTF-8 HTML 配置页（最多 1 MiB，内嵌 CSS/JS）")
+parser.add_argument("--config", type=pathlib.Path, help="UTF-8 JSON 对象配置模板（最多 1 MiB，省略时使用空对象）")
 parser.add_argument("--output", type=pathlib.Path, required=True)
 parser.add_argument("--id", required=True)
 parser.add_argument("--name", required=True)
@@ -22,34 +28,49 @@ args = parser.parse_args()
 if args.output.suffix != ".codey-plugin":
     parser.error("输出文件必须使用 .codey-plugin 扩展名")
 library = args.library.read_bytes()
-schema = args.schema.read_bytes()
-json.loads(schema)
+config = b"{}\n"
+if args.config is not None:
+    if args.config.is_symlink() or not args.config.is_file():
+        parser.error("配置模板必须是普通文件，不能是符号链接")
+    with args.config.open("rb") as source:
+        config = source.read(1024 * 1024 + 1)
+if len(config) > 1024 * 1024:
+    parser.error("配置模板超过 1 MiB")
+try:
+    def reject_constant(value):
+        raise ValueError(f"无效 JSON 常量: {value}")
+    value = json.loads(config.decode("utf-8"), parse_constant=reject_constant)
+except (UnicodeDecodeError, ValueError, RecursionError):
+    parser.error("配置模板必须是有效的 UTF-8 JSON")
+if not isinstance(value, dict):
+    parser.error("配置模板必须是 JSON 对象")
+pending: list[tuple[dict[str, object] | list[object], str]] = [
+    (cast(dict[str, object] | list[object], value), "$")
+]
+while pending:
+    current, path = pending.pop()
+    entries = enumerate(current) if isinstance(current, list) else current.items()
+    for key, child in entries:
+        child_path = f"{path}[{key}]" if isinstance(current, list) else f"{path}[{json.dumps(key, ensure_ascii=False)}]"
+        if isinstance(current, dict) and key == "_comments":
+            if not isinstance(child, dict):
+                parser.error(f"配置注释 {child_path} 必须是对象，且每项说明必须是字符串。")
+            for name, description in child.items():
+                if not isinstance(description, str):
+                    parser.error(f"配置注释 {child_path}[{json.dumps(name, ensure_ascii=False)}] 必须是字符串。")
+        elif isinstance(child, (dict, list)):
+            pending.append((child, child_path))
 entry = "lib/" + args.library.name
 manifest = {
     "id": args.id, "name": args.name, "version": args.version,
     "abiVersion": 1, "platform": args.platform, "arch": args.arch,
     "entry": entry, "librarySha256": hashlib.sha256(library).hexdigest(),
     "capabilities": ["request.beforeSend"] if args.header else [],
-    "headerNames": args.header, "configSchema": "config.schema.json"
+    "headerNames": args.header
 }
-config_ui = None
-if args.config_ui is not None:
-    if args.config_ui.is_symlink() or not args.config_ui.is_file():
-        parser.error("配置页必须是普通文件，不能是符号链接")
-    with args.config_ui.open("rb") as source:
-        config_ui = source.read(1024 * 1024 + 1)
-    if len(config_ui) > 1024 * 1024:
-        parser.error("配置页超过 1 MiB")
-    try:
-        config_ui.decode("utf-8")
-    except UnicodeDecodeError:
-        parser.error("配置页必须为 UTF-8")
-    manifest["configUi"] = {"type": "html", "entry": "ui/config.html", "sha256": hashlib.sha256(config_ui).hexdigest()}
 args.output.parent.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(args.output, "x", compression=zipfile.ZIP_DEFLATED) as package:
     package.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     package.writestr(entry, library)
-    package.writestr("config.schema.json", schema)
-    if config_ui is not None:
-        package.writestr("ui/config.html", config_ui)
+    package.writestr("config.json", config)
 print(args.output)

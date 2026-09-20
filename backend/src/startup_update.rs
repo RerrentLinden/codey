@@ -58,6 +58,7 @@ impl StartupUpdateUi for NativeUpdateUi {
 
 #[async_trait]
 trait StartupUpdateBackend: Send + Sync {
+    async fn auto_check_enabled(&self) -> bool;
     async fn check(&self) -> Result<UpdateCandidate, String>;
     async fn download(&self, candidate: &UpdateCandidate) -> Result<UpdateDownload, String>;
     async fn install(&self, file_path: &str) -> Result<(), String>;
@@ -69,6 +70,10 @@ struct LiveBackend<'a> {
 
 #[async_trait]
 impl StartupUpdateBackend for LiveBackend<'_> {
+    async fn auto_check_enabled(&self) -> bool {
+        self.state.config.read().await.auto_check_codey_updates
+    }
+
     async fn check(&self) -> Result<UpdateCandidate, String> {
         commands::check_for_update_candidate(self.state).await
     }
@@ -105,6 +110,9 @@ async fn run_with_mode(
     ui: &impl StartupUpdateUi,
     mode: CheckMode,
 ) -> StartupUpdateOutcome {
+    if !backend.auto_check_enabled().await {
+        return StartupUpdateOutcome::Continue;
+    }
     // Successful launches check silently. Failed launches have no desktop UI,
     // so show a status window while looking for a possible compatibility fix.
     let checking_visible = matches!(mode, CheckMode::AfterLaunchFailure)
@@ -127,7 +135,11 @@ async fn run_with_mode(
         Ok(Ok(candidate)) => candidate,
         Ok(Err(_)) | Err(_) => return StartupUpdateOutcome::Continue,
     };
-    if !candidate.check.update_available || candidate.check.selected_asset.is_none() {
+    // 网络请求期间可能关闭自动检查，返回后再次确认设置。
+    if !backend.auto_check_enabled().await
+        || !candidate.check.update_available
+        || candidate.check.selected_asset.is_none()
+    {
         return StartupUpdateOutcome::Continue;
     }
 
@@ -138,7 +150,7 @@ async fn run_with_mode(
         )
         .await
         .unwrap_or_default();
-    if !should_update {
+    if !should_update || !backend.auto_check_enabled().await {
         return StartupUpdateOutcome::Continue;
     }
 
@@ -224,6 +236,8 @@ mod tests {
     }
 
     struct FakeBackend {
+        auto_check_enabled: AtomicBool,
+        checks: AtomicUsize,
         check_delay: Duration,
         check: Result<UpdateCandidate, String>,
         download: Result<UpdateDownload, String>,
@@ -235,7 +249,12 @@ mod tests {
 
     #[async_trait]
     impl StartupUpdateBackend for FakeBackend {
+        async fn auto_check_enabled(&self) -> bool {
+            self.auto_check_enabled.load(Ordering::Relaxed)
+        }
+
         async fn check(&self) -> Result<UpdateCandidate, String> {
+            self.checks.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(self.check_delay).await;
             self.check.clone()
         }
@@ -296,6 +315,8 @@ mod tests {
 
     fn backend(check_delay: Duration, candidate: UpdateCandidate) -> FakeBackend {
         FakeBackend {
+            auto_check_enabled: AtomicBool::new(true),
+            checks: AtomicUsize::new(0),
             check_delay,
             check: Ok(candidate),
             download: Ok(download()),
@@ -303,6 +324,50 @@ mod tests {
             downloads: AtomicUsize::new(0),
             installs: AtomicUsize::new(0),
             install_error: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_auto_check_skips_network_and_ui_in_both_launch_modes() {
+        for mode in [CheckMode::Background, CheckMode::AfterLaunchFailure] {
+            let backend = backend(Duration::ZERO, candidate(true, true));
+            backend.auto_check_enabled.store(false, Ordering::Relaxed);
+            let ui = FakeUi::default();
+
+            assert_eq!(
+                run_with_mode(&backend, &ui, mode).await,
+                StartupUpdateOutcome::Continue
+            );
+            assert_eq!(backend.checks.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.downloads.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.installs.load(Ordering::Relaxed), 0);
+            assert!(ui.messages.lock().unwrap().is_empty());
+            assert!(ui.failures.lock().unwrap().is_empty());
+            assert_eq!(ui.confirmations.load(Ordering::Relaxed), 0);
+            assert_eq!(ui.hides.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_auto_check_during_request_suppresses_update_prompt() {
+        for mode in [CheckMode::Background, CheckMode::AfterLaunchFailure] {
+            let backend = backend(Duration::from_secs(2), candidate(true, true));
+            let ui = FakeUi::default();
+            let (outcome, ()) = tokio::join!(run_with_mode(&backend, &ui, mode), async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                backend.auto_check_enabled.store(false, Ordering::Relaxed);
+            });
+
+            assert_eq!(outcome, StartupUpdateOutcome::Continue);
+            assert_eq!(backend.checks.load(Ordering::Relaxed), 1);
+            assert_eq!(backend.downloads.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.installs.load(Ordering::Relaxed), 0);
+            assert_eq!(ui.confirmations.load(Ordering::Relaxed), 0);
+            assert!(ui.failures.lock().unwrap().is_empty());
+            assert_eq!(
+                ui.hides.load(Ordering::Relaxed),
+                usize::from(matches!(mode, CheckMode::AfterLaunchFailure))
+            );
         }
     }
 

@@ -1304,6 +1304,9 @@
   ]);
   const appServerRuntimeOverrideVerifiedResult =
     "codey-app-server-runtime-overrides-verified";
+  // 配置已验证且使用 Codey 转发入口时，消息补丁失配允许降级。
+  const appServerRuntimeOverrideDegradedResult =
+    "codey-app-server-runtime-overrides-degraded";
   const appServerRuntimeOverrideTimeoutMs = 20_000;
   const appServerRuntimeOverrideEvidence = {
     version: 1,
@@ -1315,15 +1318,16 @@
     argumentCount: 0,
     missingRuntimeConfigs: [...appServerRuntimeConfigs],
     requiredRuntimeConfigs: [...appServerRuntimeConfigs],
+    messageSourcePatched: false,
+    stdinRelayAvailable: false,
+    failure: "",
   };
   let resolveAppServerRuntimeOverrideValidation = null;
   const appServerRuntimeOverrideValidationPromise = new Promise((resolve) => {
     resolveAppServerRuntimeOverrideValidation = resolve;
   });
   const formatAppServerRuntimeOverrideError = (status) => {
-    if (localRouterRuntimeEnabled && status.observed && !localRouterMessageSourcePatched) {
-      return "当前 Codex 版本的任务请求结构与 Codey 不兼容，未能启用本地路由请求处理，已停止启动 app-server";
-    }
+    if (status.failure) return status.failure;
     const missing = status.missingRuntimeConfigs?.length
       ? `；缺失：${status.missingRuntimeConfigs
           .map(runtimeOverrideKey)
@@ -1338,16 +1342,10 @@
     );
   };
   const finishAppServerRuntimeOverrideValidation = (status) => {
-    if (appServerRuntimeOverrideEvidence.complete) return;
+    // 只发布首次启动的完整校验结果，避免等待时机改变最终状态。
+    if (appServerRuntimeOverrideEvidence.observed) return;
     Object.assign(appServerRuntimeOverrideEvidence, status);
-    if (status.complete) {
-      appServerRuntimeOverrideEvidence.complete = true;
-      resolveAppServerRuntimeOverrideValidation?.(
-        appServerRuntimeOverrideVerifiedResult,
-      );
-      return;
-    }
-    resolveAppServerRuntimeOverrideValidation?.(status);
+    resolveAppServerRuntimeOverrideValidation?.(appServerRuntimeOverrideEvidence);
   };
   const collectRuntimeConfigArgsAfterAppServer = (args) => {
     const appServerIndex = args.indexOf("app-server");
@@ -1377,13 +1375,16 @@
     const normalized = {
       version: 1,
       observed: true,
-      complete: status.missingRuntimeConfigs.length === 0,
+      complete: !status.failure && status.missingRuntimeConfigs.length === 0,
       attempts: appServerRuntimeOverrideEvidence.attempts + 1,
       mode: status.mode,
       command: String(status.command ?? "").slice(0, 512),
       argumentCount: Array.isArray(status.args) ? status.args.length : 0,
       missingRuntimeConfigs: status.missingRuntimeConfigs,
       requiredRuntimeConfigs: [...status.requiredRuntimeConfigs],
+      messageSourcePatched: localRouterMessageSourcePatched,
+      stdinRelayAvailable: status.stdinRelayAvailable === true,
+      failure: status.failure || "",
     };
     finishAppServerRuntimeOverrideValidation(normalized);
   };
@@ -1414,34 +1415,47 @@
     }
     return null;
   };
+  let appServerRuntimeDegradationReported = false;
   const awaitCodexAppServerRuntimeOverrides = async () => {
-    if (appServerRuntimeOverrideEvidence.complete) {
-      return appServerRuntimeOverrideVerifiedResult;
-    }
-    if (appServerRuntimeOverrideEvidence.observed) {
-      throw new Error(
-        formatAppServerRuntimeOverrideError(appServerRuntimeOverrideEvidence),
-      );
-    }
     let timeout = null;
     try {
-      const result = await Promise.race([
-        appServerRuntimeOverrideValidationPromise,
-        new Promise((_resolve, reject) => {
-          timeout = setTimeout(() => {
-            reject(
-              new Error(
-                formatAppServerRuntimeOverrideError(
-                  appServerRuntimeOverrideEvidence,
+      const status = appServerRuntimeOverrideEvidence.observed
+        ? appServerRuntimeOverrideEvidence
+        : await Promise.race([
+          appServerRuntimeOverrideValidationPromise,
+          new Promise((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              reject(
+                new Error(
+                  formatAppServerRuntimeOverrideError(
+                    appServerRuntimeOverrideEvidence,
+                  ),
                 ),
-              ),
-            );
-          }, appServerRuntimeOverrideTimeoutMs);
-          timeout.unref?.();
-        }),
-      ]);
-      if (result === appServerRuntimeOverrideVerifiedResult) return result;
-      throw new Error(formatAppServerRuntimeOverrideError(result));
+              );
+            }, appServerRuntimeOverrideTimeoutMs);
+            timeout.unref?.();
+          }),
+        ]);
+      if (!status.complete) {
+        throw new Error(formatAppServerRuntimeOverrideError(status));
+      }
+      if (!localRouterRuntimeEnabled || status.messageSourcePatched) {
+        return appServerRuntimeOverrideVerifiedResult;
+      }
+      if (!status.stdinRelayAvailable) {
+        throw new Error("app-server 消息补丁未匹配，且未确认使用 Codey 标准输入转发入口，无法启用本地路由");
+      }
+      if (!appServerRuntimeDegradationReported) {
+        appServerRuntimeDegradationReported = true;
+        const message = "app-server 消息补丁未匹配；运行时配置已验证，请求改写由 stdin relay 处理";
+        console.warn(`[Codey] ${message}`);
+        recordCodeyPatchFailure(
+          "app_server_runtime_overrides_degraded",
+          new Error(message),
+          { degraded: true, transport: "stdin-relay" },
+        );
+      }
+      return appServerRuntimeOverrideDegradedResult;
     } finally {
       if (timeout != null) clearTimeout(timeout);
       setImmediate(() => {
@@ -1476,11 +1490,6 @@
     if (localRouterRuntimeEnabled && args.some((arg) => arg === "proxy" || arg === "daemon")) {
       throw new Error("本地路由模式不能使用 app-server proxy/daemon；请移除自定义后台服务启动命令");
     }
-    if (localRouterRuntimeEnabled && !localRouterMessageSourcePatched) {
-      finishAppServerRuntimeOverrideValidation({ observed: true, complete: false });
-      throw new Error(formatAppServerRuntimeOverrideError(appServerRuntimeOverrideEvidence));
-    }
-
     const managedConfigKeys = new Set(
       appServerRuntimeConfigs.map(runtimeOverrideKey),
     );
@@ -1545,6 +1554,25 @@
   });
 
   let appServerAnalyticsPatchCount = 0;
+  // 启动器提供本次包装器路径，核对实际命令及子进程环境后才允许降级。
+  const hasCodeyStdinRelay = (command, options) => {
+    const environment = options?.env ?? process.env;
+    const wrapper = process.env.CODEY_CODEX_CLI_STDIN_RELAY;
+    if (typeof wrapper !== "string" || !wrapper ||
+        command !== wrapper || environment.CODEX_CLI_PATH !== wrapper ||
+        environment.CODEY_CODEX_CLI_STDIN_RELAY !== wrapper ||
+        !environment.CODEY_CODEX_CLI_WRAPPER_TARGET) return false;
+    try {
+      const configs = JSON.parse(environment.CODEY_CODEX_CLI_WRAPPER_OVERRIDES);
+      if (!Array.isArray(configs) || !configs.every((config) => typeof config === "string")) return false;
+      const effectiveConfigs = uniqueRuntimeConfigsByKey(configs);
+      return runtimeConfigValue(effectiveConfigs, "model_provider") === "codey_router" &&
+        uniqueRuntimeConfigsByKey(nativeRuntimeConfigOverrides)
+          .every((config) => effectiveConfigs.includes(config));
+    } catch {
+      return false;
+    }
+  };
   const childProcess = process.getBuiltinModule("child_process");
   const NativeSpawn = childProcess.spawn;
   if (!NativeSpawn.__codeyAppServerAnalyticsDisabled) {
@@ -1589,17 +1617,40 @@
         rewritten,
       );
       if (runtimeOverrideStatus != null) {
-        recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+        if (runtimeOverrideStatus.missingRuntimeConfigs.length > 0) {
+          recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+          throw new Error(formatAppServerRuntimeOverrideError({
+            ...runtimeOverrideStatus,
+            observed: true,
+            argumentCount: rewritten.length,
+          }));
+        }
+        runtimeOverrideStatus.stdinRelayAvailable = hasCodeyStdinRelay(command, rewrittenRest[0]);
+        if (localRouterRuntimeEnabled && !localRouterMessageSourcePatched &&
+            !runtimeOverrideStatus.stdinRelayAvailable) {
+          runtimeOverrideStatus.failure = "app-server 消息补丁未匹配，且未确认使用 Codey 标准输入转发入口，已停止启动 app-server";
+          recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+          throw new Error(runtimeOverrideStatus.failure);
+        }
       }
-      if (rewritten === args && rewrittenRest === rest) {
-        return Reflect.apply(NativeSpawn, this, arguments);
+      let child;
+      try {
+        child = Reflect.apply(NativeSpawn, this,
+          rewritten === args && rewrittenRest === rest
+            ? arguments
+            : [command, rewritten, ...rewrittenRest]);
+      } catch (error) {
+        if (runtimeOverrideStatus != null) {
+          runtimeOverrideStatus.failure = "无法创建 app-server 进程，运行时配置未完成验证";
+          recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+        }
+        throw error;
       }
       if (rewritten !== args) appServerAnalyticsPatchCount += 1;
-      return Reflect.apply(NativeSpawn, this, [
-        command,
-        rewritten,
-        ...rewrittenRest,
-      ]);
+      if (runtimeOverrideStatus != null) {
+        recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+      }
+      return child;
     };
     Object.defineProperty(
       codeyAnalyticsDisabledSpawn,
@@ -2524,10 +2575,8 @@
         try {
           source = patchCodexAppServerMessages(source);
         } catch (error) {
-          // Router mode cannot route without this hook, so the app-server spawn
-          // below still fails closed. Letting the error escape this compile hook
-          // would instead kill the desktop app before its first window exists,
-          // which the launcher can only report as a renderer injection failure.
+          // 在启动入口统一检查配置和 stdin relay，再决定能否降级。
+          // 此处保留桌面加载流程，避免编译阶段提前终止进程。
           recordCodeyPatchFailure("patch_codex_app_server_messages", error, { filename });
         }
       }
@@ -2632,8 +2681,11 @@
       mainBundleSourcePatched = true;
       return source;
       } catch (error) {
+        // 退回最后一次一致的 patch 结果，而不是 throw。走到这里说明 patch 基础
+        // 设施本身出问题（告警输出撞上 EPIPE 等），不是源码锚点失配——把它升级成
+        // bundle 编译失败，就等于让一行告警把整个主进程拖下水。
         recordCodeyPatchFailure("patch_codex_main_bundle", error, { filename });
-        throw error;
+        return source;
       }
     };
     const originalJsExtension = Module._extensions[".js"];

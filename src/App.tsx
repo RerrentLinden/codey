@@ -5,6 +5,7 @@ import {
   IconCircleArrowUp,
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
+  IconLayoutDashboard,
   IconLoader2 as LoaderCircle,
   IconMessageCircleQuestion,
   IconRefresh as RefreshCw,
@@ -15,8 +16,10 @@ import { reconcileConfigDraft } from "./configDraft";
 import { ModelPickerDialog } from "./AppDialogs";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
+import { UsageAnalysisPanel } from "./UsageAnalysisPanel";
 import { OperationsPanel } from "./OperationsPanel";
 import { CodeyPluginsSection } from "./CodeyPluginsSection";
+import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
 import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
 import { repairOperationResult } from "./injectionRepair";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
@@ -31,6 +34,8 @@ import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { customContextRestoredNote } from "./modelSelectionNotice";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
+import { SettingsLayout } from "./SettingsLayout";
+import { SettingsPageHeader } from "./SettingsPageHeader";
 import { useModelSelection } from "./useModelSelection";
 import { useRuntimeStatus } from "./useRuntimeStatus";
 import { useAppUpdates } from "./useAppUpdates";
@@ -53,9 +58,10 @@ import type {
   PluginMarketplaceStatus,
   Profile,
 } from "./App.types";
-import { Badge, Button, Tooltip } from "./components/ui";
+import { Badge, Button, Switch, Tooltip } from "./components/ui";
 
 const Check = IconCheck;
+const extensionRequest: ExtensionTransport = request => invoke("codex_extensions", { request });
 const X = IconX;
 const FEEDBACK_GROUP_QR_BASE_URL =
   "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.png";
@@ -132,6 +138,23 @@ export function App({
   const [fastContextToolsStatus, setFastContextToolsStatus] =
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
   const [dirty, setDirty] = useState(false);
+  const [usageAnalysisOpen, setUsageAnalysisOpen] = useState(false);
+  const settingsScroll = useRef<HTMLDivElement>(null);
+  const usageReturn = useRef<{ trigger: HTMLElement; scrollTop: number } | null>(null);
+  const handleOpenUsageAnalysis = useCallback((trigger: HTMLElement) => {
+    usageReturn.current = { trigger, scrollTop: settingsScroll.current?.scrollTop ?? 0 };
+    setUsageAnalysisOpen(true);
+  }, []);
+  useEffect(() => {
+    if (usageAnalysisOpen || !usageReturn.current) return;
+    const previous = usageReturn.current;
+    const frame = requestAnimationFrame(() => {
+      if (settingsScroll.current) settingsScroll.current.scrollTop = previous.scrollTop;
+      previous.trigger.focus({ preventScroll: true });
+      usageReturn.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [usageAnalysisOpen]);
   const [busy, setBusy] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
@@ -265,6 +288,7 @@ export function App({
     setNotice,
   });
   const {
+    automaticallyChecking,
     updateResult,
     updateCheck,
     downloadedUpdate,
@@ -274,6 +298,7 @@ export function App({
   } = useAppUpdates({
     embedded,
     configLoaded,
+    autoCheckCodeyUpdates: config?.autoCheckCodeyUpdates !== false,
     isBusy,
     setBusy,
     setNotice,
@@ -355,6 +380,24 @@ export function App({
   function editConfig(next: Config) {
     setConfig(next);
     setDirty(true);
+  }
+
+  function changeAutomaticUpdateChecks(enabled: boolean) {
+    if (!config || isBusy) return;
+    if (enabled) {
+      editConfig({ ...config, autoCheckCodeyUpdates: true });
+      return;
+    }
+    setConfirmation({
+      action: "disable-auto-update-check",
+      title: "关闭自动检查 Codey 更新？",
+      description: "关闭后，若 Codex 更新导致 Codey 插件无法启动，需要手动下载最新版插件包。",
+      confirmLabel: "确认关闭",
+      run: () => {
+        setConfig((current) => current ? { ...current, autoCheckCodeyUpdates: false } : current);
+        setDirty(true);
+      },
+    });
   }
 
   async function persist(next: Config) {
@@ -877,6 +920,8 @@ export function App({
     }
     setDirty(false);
     setModelPickerVisible(false);
+    setUsageAnalysisOpen(false);
+    usageReturn.current = null;
     setConfirmation(null);
     onClose?.();
   }
@@ -1200,7 +1245,7 @@ export function App({
   const hasUpdate =
     updateCheck?.updateAvailable === true &&
     Boolean(updateCheck.selectedAsset);
-  const isCheckingUpdate = busy === "check-update";
+  const isCheckingUpdate = busy === "check-update" || automaticallyChecking;
   const isDownloadingUpdate = busy === "download-update";
   const isInstallingUpdate = busy === "install-update";
   const updateTooltipText = downloadedUpdate
@@ -1218,61 +1263,8 @@ export function App({
       <div className="flex min-w-0 items-center gap-3 justify-self-start max-[760px]:gap-2">
         <CodeyBrandMark />
         <div className="flex min-w-0 flex-col">
-          <div className="flex min-w-0 items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <h1 className="m-0 whitespace-nowrap text-base font-bold tracking-[-0.02em] text-[var(--codey-text,#1d1d1f)]">Codey 控制台</h1>
-            <div className="flex items-center gap-1.5">
-              <span className="header-version-badge">
-                v{status.appVersion || "0.0.1"}
-              </span>
-
-              <Tooltip
-                content={updateTooltipText}
-                position="bottom"
-              >
-                <span className="header-update-btn-wrap">
-                  <Button
-                    size="xs"
-                    className={`header-update-btn ${
-                      downloadedUpdate
-                        ? "is-downloaded"
-                        : hasUpdate
-                          ? "has-update"
-                          : "is-idle"
-                    }`}
-                    variant={downloadedUpdate ? "default" : hasUpdate ? "brand-outline" : "ghost"}
-                    disabled={isBusy}
-                    aria-label={updateTooltipText}
-                    onClick={() => {
-                      if (downloadedUpdate) {
-                        handleInstallDownloadedUpdate();
-                      } else if (hasUpdate) {
-                        handleDownloadUpdate();
-                      } else {
-                        handleCheckForUpdates();
-                      }
-                    }}
-                  >
-                    {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
-                      <LoaderCircle className="animate-spin" size={12} aria-hidden="true" />
-                    ) : downloadedUpdate ? (
-                      <IconCheck size={12} aria-hidden="true" />
-                    ) : (
-                      <IconCircleArrowUp size={13} aria-hidden="true" />
-                    )}
-                    {downloadedUpdate ? (
-                      <span>
-                        v{downloadedUpdate.latestVersion} 已下载
-                      </span>
-                    ) : hasUpdate ? (
-                      <span>
-                        v{updateCheck?.latestVersion} 可更新
-                      </span>
-                    ) : null}
-                  </Button>
-                </span>
-              </Tooltip>
-            </div>
-
             {dirty && (
               <Badge variant="warning">
                 未保存更改
@@ -1306,15 +1298,15 @@ export function App({
           {embedded && (
             <Button
               aria-label={restartStatusError ? "重新查询状态" : status.running ? "重启 Codex" : "Codex 未运行"}
-              className="h-8! whitespace-nowrap px-3.5 text-xs max-[520px]:w-8! max-[520px]:px-0!"
+              className="h-8! whitespace-nowrap px-3 text-xs max-[520px]:w-8! max-[520px]:px-0!"
               disabled={isBusy || (!restartStatusError && (status.restartInProgress || !status.running))}
               onClick={handleRestartCodex}
               variant="warning"
             >
               {busy === "restart" || (status.restartInProgress && !restartStatusError) ? (
-                <LoaderCircle className="animate-spin" aria-hidden="true" />
+                <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
               ) : (
-                <RefreshCw aria-hidden="true" />
+                <RefreshCw size={14} aria-hidden="true" />
               )}
               <span className="max-[520px]:hidden">
                 {restartStatusError ? "重新查询状态" : status.running ? "重启 Codex" : "未运行"}
@@ -1323,17 +1315,17 @@ export function App({
           )}
           <Button
             aria-label={dirty ? "保存更改" : "已保存"}
-            className="h-8! min-w-[88px] px-3.5 text-xs max-[520px]:min-w-8! max-[520px]:w-8! max-[520px]:px-0!"
+            className="h-8! min-w-[84px] px-3 text-xs max-[520px]:min-w-8! max-[520px]:w-8! max-[520px]:px-0!"
             disabled={!dirty || isBusy}
             onClick={handleSaveCurrent}
             variant={dirty ? "default" : "secondary"}
           >
             {busy === "save" ? (
-              <LoaderCircle className="animate-spin" aria-hidden="true" />
+              <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
             ) : dirty ? (
-              <Save aria-hidden="true" />
+              <Save size={14} aria-hidden="true" />
             ) : (
-              <Check aria-hidden="true" />
+              <Check size={14} aria-hidden="true" />
             )}
             <span className="max-[520px]:hidden">
               {dirty ? "保存更改" : "已保存"}
@@ -1342,13 +1334,13 @@ export function App({
           {embedded && (
             <Button
               aria-label="关闭配置"
-              className="size-8! flex-none p-0! max-[520px]:size-8! max-[520px]:p-0!"
+              className="size-8! flex-none p-0! rounded-full! max-[520px]:size-8! max-[520px]:p-0!"
               disabled={isBusy}
               onClick={handleCloseSettings}
               size="icon"
               variant="ghost"
             >
-              <X aria-hidden="true" />
+              <X size={15} aria-hidden="true" />
             </Button>
           )}
         </div>
@@ -1358,8 +1350,8 @@ export function App({
 
   const appContent = (
     <main className={`app-shell${embedded ? " embedded" : ""}`}>
-      <a className="skip-link" href="#codey-settings-content">
-        跳至设置内容
+      <a className="skip-link" href={usageAnalysisOpen ? "#usage-analysis-title" : "#codey-settings-content"}>
+        {usageAnalysisOpen ? "跳至用量分析" : "跳至设置内容"}
       </a>
 
       {!embedded && (
@@ -1389,9 +1381,6 @@ export function App({
           </div>
           <div className="macos-titlebar-title">
             <span className="app-title-text">Codey Control Panel</span>
-            <span className="app-version-tag">
-              v{status.appVersion || "0.2.0"}
-            </span>
           </div>
           <div className="macos-titlebar-right" aria-hidden="true" />
         </div>
@@ -1403,28 +1392,101 @@ export function App({
         </header>
       )}
 
-      <div className="page-scroll">
-        <div className="page" id="codey-settings-content">
-          {/* 最上方：运行状态 (Codex 运行与维护) */}
-          <OperationsPanel
-            codexAppPath={config.codexAppPath}
-            fastContextToolsStatus={fastContextToolsStatus}
-            status={operationsStatus}
-            busy={busy}
-            isBusy={isBusy}
-            pluginMarketplaceStatus={pluginMarketplaceStatus}
-            onRepairPluginMarketplace={handleRepairPluginMarketplace}
-            onRepairMainProcessInjection={handleRepairMainProcessInjection}
-            onRepairCodexConfig={askRepairCodexConfig}
-            configRepairNotice={configRepairNotice}
-            injectionRepairing={injectionRepairRequested || busy === "repair-main-process-injection"}
-            onRestart={handleRestartCodex}
-            restartStatusUnknown={Boolean(restartStatusError)}
-            showRestartAction={!embedded}
-          />
-
-          {/* 线路与模型：单独一行展示 */}
-          <div className="full-row-section">
+      {usageAnalysisOpen ? (
+        <div className="page-scroll">
+          <UsageAnalysisPanel onBack={() => setUsageAnalysisOpen(false)} />
+        </div>
+      ) : (
+      <SettingsLayout
+        contentRef={settingsScroll}
+        sidebarFooter={
+          <div className="sidebar-updates">
+            <div className="sidebar-update-version">
+              <span>Codey</span>
+              <span className="header-version-badge">v{status.appVersion || "0.0.1"}</span>
+            </div>
+            <Tooltip content={updateTooltipText} position="top">
+              <Button
+                size="xs"
+                className="sidebar-update-button"
+                variant={downloadedUpdate ? "default" : "brand-outline"}
+                disabled={isBusy}
+                aria-label={updateTooltipText}
+                onClick={() => {
+                  if (downloadedUpdate) handleInstallDownloadedUpdate();
+                  else if (hasUpdate) handleDownloadUpdate();
+                  else handleCheckForUpdates();
+                }}
+              >
+                {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
+                  <LoaderCircle className="animate-spin" size={14} aria-hidden="true" />
+                ) : downloadedUpdate ? (
+                  <IconCheck size={14} aria-hidden="true" />
+                ) : (
+                  <IconCircleArrowUp size={14} aria-hidden="true" />
+                )}
+                <span>{isInstallingUpdate ? "正在安装…" : isDownloadingUpdate ? "正在下载…" : isCheckingUpdate ? "正在检查…" : downloadedUpdate ? "安装并重启" : hasUpdate ? "下载更新" : "检查更新"}</span>
+              </Button>
+            </Tooltip>
+            {(downloadedUpdate || updateCheck?.updateAvailable) && (
+              <span className="sidebar-update-status" role="status">
+                {downloadedUpdate ? `v${downloadedUpdate.latestVersion} 已下载` : `v${updateCheck?.latestVersion} 可更新`}
+              </span>
+            )}
+            <div className="sidebar-auto-update">
+              <span id="codey-auto-update-label">自动检查 Codey 更新</span>
+              <Switch
+                size="sm"
+                aria-labelledby="codey-auto-update-label"
+                checked={config.autoCheckCodeyUpdates !== false}
+                disabled={isBusy}
+                onCheckedChange={changeAutomaticUpdateChecks}
+              />
+            </div>
+          </div>
+        }
+        sections={{
+          overview: (
+            <>
+              <SettingsPageHeader
+                id="overview-title"
+                title="基础功能"
+                icon={<IconLayoutDashboard size={15} />}
+                description="查看 Codex 运行状态，管理客户端功能与通知。"
+              />
+              <OperationsPanel
+                codexAppPath={config.codexAppPath}
+                fastContextToolsStatus={fastContextToolsStatus}
+                status={operationsStatus}
+                busy={busy}
+                isBusy={isBusy}
+                pluginMarketplaceStatus={pluginMarketplaceStatus}
+                onRepairPluginMarketplace={handleRepairPluginMarketplace}
+                onRepairMainProcessInjection={handleRepairMainProcessInjection}
+                onRepairCodexConfig={askRepairCodexConfig}
+                configRepairNotice={configRepairNotice}
+                injectionRepairing={injectionRepairRequested || busy === "repair-main-process-injection"}
+                onRestart={handleRestartCodex}
+                restartStatusUnknown={Boolean(restartStatusError)}
+                showRestartAction={!embedded}
+              />
+              <FeaturePolicyCard
+                config={config}
+                fastContextToolsStatus={fastContextToolsStatus}
+                isMacClient={status.clientPlatform === "macos"}
+                isWindowsClient={status.clientPlatform === "windows"}
+                cleanupBusy={busy === "clear-diagnostic-storage"}
+                onAnalyzeDiagnosticStorage={handleAnalyzeDiagnosticStorage}
+                popupContainer={popupContainer}
+                isBusy={isBusy}
+                onConfigChange={handleConfigChange}
+                onAddChannel={handleAddNotificationChannel}
+                onChannelChange={handleNotificationChannelChange}
+                onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
+              />
+            </>
+          ),
+          models: (
             <ModelSection
               config={config}
               currentProvider={provider ?? null}
@@ -1439,6 +1501,7 @@ export function App({
               subagentModelOptions={subagentModelOptions}
               onToggleLocalRouter={handleToggleLocalRouter}
               onToggleRouteRequestLog={handleToggleRouteRequestLog}
+              onOpenUsageAnalysis={handleOpenUsageAnalysis}
               onSaveRoute={handleSaveRoute}
               onSetRouteEnabled={handleSetRouteEnabled}
               onReorderRoute={handleReorderRoute}
@@ -1451,57 +1514,35 @@ export function App({
               onConfigChange={handleConfigChange}
               onRequestConfirmation={setConfirmation}
             />
-          </div>
-
-          {/* 提示词优化 与 Codey 子代理角色与调度增强：放在一行 */}
-          <div className="prompt-subagent-grid">
-            {/* 左侧：提示词优化 */}
-            <div className="prompt-column">
-              <PromptOptimizationCard
-                config={config}
-                isBusy={isBusy}
-                subagentModelOptions={subagentModelOptions}
-                onConfigChange={handleConfigChange}
-                onNotice={setNotice}
-              />
-            </div>
-
-            {/* 右侧：Codey 子代理角色与调度增强 */}
-            <div className="subagent-column">
-              <SubagentPolicyCard
-                config={config}
-                isBusy={isBusy}
-                subagentModelOptions={subagentModelOptions}
-                onConfigChange={handleConfigChange}
-                onSubagentOptimizationChange={handleSubagentOptimizationChange}
-              />
-            </div>
-          </div>
-
-          {/* Codex 功能策略：整行排列 */}
-          <div className="full-row-section">
-            <FeaturePolicyCard
+          ),
+          prompt: (
+            <PromptOptimizationCard
               config={config}
-              fastContextToolsStatus={fastContextToolsStatus}
-              isMacClient={status.clientPlatform === "macos"}
-              isWindowsClient={status.clientPlatform === "windows"}
-              cleanupBusy={busy === "clear-diagnostic-storage"}
-              onAnalyzeDiagnosticStorage={handleAnalyzeDiagnosticStorage}
-              popupContainer={popupContainer}
               isBusy={isBusy}
+              subagentModelOptions={subagentModelOptions}
               onConfigChange={handleConfigChange}
-              onAddChannel={handleAddNotificationChannel}
-              onChannelChange={handleNotificationChannelChange}
-              onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
+              onNotice={setNotice}
             />
-          </div>
-
-          <div className="full-row-section">
-            <CodeyPluginsSection container={popupContainer} />
-          </div>
-
-        </div>
-      </div>
+          ),
+          subagents: (
+            <SubagentPolicyCard
+              config={config}
+              isBusy={isBusy}
+              subagentModelOptions={subagentModelOptions}
+              onConfigChange={handleConfigChange}
+              onSubagentOptimizationChange={handleSubagentOptimizationChange}
+            />
+          ),
+          plugins: <CodeyPluginsSection container={popupContainer} />,
+          mcp: (active) => (
+            <CodexExtensionsPage kind="mcp" active={active} request={extensionRequest} container={popupContainer} />
+          ),
+          skills: (active) => (
+            <CodexExtensionsPage kind="skill" active={active} request={extensionRequest} container={popupContainer} />
+          ),
+        }}
+      />
+      )}
 
       <NoticeToast controller={noticeController} />
 

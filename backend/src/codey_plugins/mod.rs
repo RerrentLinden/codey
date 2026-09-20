@@ -1,7 +1,6 @@
 //! Codey 原生插件平台。安装不执行代码，用户显式启用后加载可信动态库。
 mod native;
 mod package;
-mod schema;
 
 use native::Native;
 pub use package::Inspection;
@@ -35,34 +34,32 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub header_names: Vec<String>,
-    pub config_schema: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_ui: Option<ConfigUi>,
+    // Older manifests are read once without retaining form metadata in new state.
+    #[serde(default, rename = "configSchema", skip_serializing)]
+    legacy_config_schema: Option<Value>,
+    #[serde(default, rename = "configUi", skip_serializing)]
+    _legacy_config_ui: Option<serde::de::IgnoredAny>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConfigUi {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub entry: String,
-    pub sha256: String,
-}
+const CONFIG_FILE: &str = "config.json";
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConfigUiPage {
+pub struct ConfigFile {
     pub plugin_id: String,
     pub version: String,
-    pub html: String,
+    pub path: PathBuf,
+    pub content: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Record {
     manifest: Manifest,
-    config_schema: Value,
-    config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config: Option<Value>,
     enabled: bool,
     directory: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,7 +71,7 @@ struct Record {
 struct State {
     #[serde(default)]
     plugins: BTreeMap<String, Record>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     retained_config: BTreeMap<String, Value>,
 }
 
@@ -87,15 +84,11 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub enabled: bool,
     pub status: String,
-    pub config: Value,
-    pub config_schema: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_ui: Option<ConfigUi>,
+    pub config_path: PathBuf,
     pub capabilities: Vec<String>,
     pub last_error: Option<String>,
     pub restart_required: bool,
     pub active_version: Option<String>,
-    pub active_config: Option<Value>,
     pub plugin_dir: PathBuf,
     pub data_dir: PathBuf,
     pub log_dir: PathBuf,
@@ -173,8 +166,8 @@ fn manager() -> Result<std::sync::MutexGuard<'static, Manager>, String> {
 pub fn list() -> Result<PluginList, String> {
     Ok(manager()?.list())
 }
-pub fn get_config_ui(id: &str) -> Result<Option<ConfigUiPage>, String> {
-    manager()?.get_config_ui(id)
+pub fn get_config_file(id: &str) -> Result<ConfigFile, String> {
+    manager()?.get_config_file(id)
 }
 pub fn has_request_plugins() -> bool {
     HAS_HEADERS.load(Ordering::Relaxed)
@@ -255,24 +248,13 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<PluginList, String> {
     Ok(manager.list())
 }
 
-pub fn configure(id: &str, config: Value) -> Result<PluginList, String> {
-    if serde_json::to_vec(&config)
-        .map_err(|e| e.to_string())?
-        .len()
-        > codey_plugin_sdk::MAX_MESSAGE_BYTES
-    {
-        return Err("配置超过 1 MiB".into());
-    }
+pub fn save_config_file(
+    id: &str,
+    content: &str,
+    expected_sha256: &str,
+) -> Result<PluginList, String> {
     let mut manager = manager()?;
-    if manager.stopping {
-        return Err("插件管理器正在关闭".into());
-    }
-    let record = manager.state.plugins.get(id).ok_or("插件未安装")?;
-    schema::validate(&record.config_schema, &config)?;
-    let mut state = manager.state.clone();
-    state.plugins.get_mut(id).unwrap().config = config;
-    manager.commit(state)?;
-    manager.log_event(id, "configuration_saved");
+    manager.save_config_file(id, content, expected_sha256)?;
     Ok(manager.list())
 }
 
@@ -490,14 +472,16 @@ impl Manager {
                     .map(|error| (id.clone(), error.clone()))
             })
             .collect();
-        Ok(Self {
+        let mut manager = Self {
             root: canonical_root,
             state,
             live: BTreeMap::new(),
             errors,
             stopping: false,
             generations: BTreeMap::new(),
-        })
+        };
+        manager.migrate_config_files()?;
+        Ok(manager)
     }
 
     fn load_enabled(&mut self) -> Result<(), String> {
@@ -592,7 +576,10 @@ impl Manager {
                     // Preserve persistent children, and remove both new and legacy artifact directories.
                     for entry in fs::read_dir(&plugin_dir).map_err(|e| e.to_string())? {
                         let entry = entry.map_err(|e| e.to_string())?;
-                        if entry.file_name() == "data" || entry.file_name() == "logs" {
+                        if entry.file_name() == "data"
+                            || entry.file_name() == "logs"
+                            || entry.file_name() == CONFIG_FILE
+                        {
                             continue;
                         }
                         checked_directory(&entry.path())?;
@@ -604,12 +591,8 @@ impl Manager {
             Err(e) => return Err(e.to_string()),
         }
         let mut state = self.state.clone();
-        let record = state.plugins.remove(id).unwrap();
-        if remove_data {
-            state.retained_config.remove(id);
-        } else {
-            state.retained_config.insert(id.to_owned(), record.config);
-        }
+        state.plugins.remove(id);
+        state.retained_config.remove(id);
         // Move before state commit; any move/commit failure restores the original installation.
         let mut moved = Vec::new();
         for source in sources {
@@ -654,15 +637,10 @@ impl Manager {
         {
             return Err("仅允许安装更高版本；相同版本不可覆盖".into());
         }
-        let config = old
-            .map(|r| r.config.clone())
-            .or_else(|| self.state.retained_config.get(&id).cloned())
-            .unwrap_or_else(|| schema::default_value(&inspection.config_schema));
-        // A plugin may require user-supplied fields and have no valid defaults. It stays disabled.
-        if old.is_some() {
-            schema::validate(&inspection.config_schema, &config)
-                .map_err(|e| format!("新版本配置不兼容，请先调整配置: {e}"))?;
-        }
+        let enabled = old.is_some_and(|record| record.enabled);
+        let legacy_config = old
+            .and_then(|record| record.config.clone())
+            .or_else(|| self.state.retained_config.get(&id).cloned());
         // Unique paths prevent dlopen from reusing a retained mapping after reinstall.
         let version_directory = format!("{}-{}", inspection.manifest.version, uuid::Uuid::new_v4());
         let directory = format!("versions/{version_directory}");
@@ -677,6 +655,15 @@ impl Manager {
         let versions = checked_child_directory(&plugin_directory, "versions", true)?;
         checked_child_directory(&plugin_directory, "data", true)?;
         checked_child_directory(&plugin_directory, "logs", true)?;
+        let config_path = plugin_directory.join(CONFIG_FILE);
+        let initial_content = if let Some(config) = legacy_config {
+            serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?
+        } else {
+            package.default_config.clone()
+        };
+        if fs::symlink_metadata(&config_path).is_ok() {
+            checked_config_file(&config_path)?;
+        }
         let destination = versions.join(&version_directory);
         if destination.exists() {
             return Err("目标版本目录已存在".into());
@@ -693,14 +680,20 @@ impl Manager {
             fs::write(&file, bytes).map_err(|e| e.to_string())?;
         }
         fs::rename(stage.path(), &destination).map_err(|e| e.to_string())?;
+        let created_config = match ensure_config_file(&config_path, &initial_content) {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&destination);
+                return Err(error);
+            }
+        };
         let mut state = self.state.clone();
         state.plugins.insert(
             id.clone(),
             Record {
                 manifest: inspection.manifest,
-                config_schema: inspection.config_schema,
-                config,
-                enabled: old.is_some_and(|r| r.enabled),
+                config: None,
+                enabled,
                 directory,
                 load_error: None,
             },
@@ -708,6 +701,9 @@ impl Manager {
         state.retained_config.remove(&id);
         if let Err(e) = self.commit(state) {
             let _ = fs::remove_dir_all(destination);
+            if created_config {
+                let _ = fs::remove_file(&config_path);
+            }
             return Err(e);
         }
         self.errors.remove(&id);
@@ -715,48 +711,89 @@ impl Manager {
         Ok(())
     }
 
-    fn get_config_ui(&self, id: &str) -> Result<Option<ConfigUiPage>, String> {
+    fn migrate_config_files(&mut self) -> Result<(), String> {
+        let mut state = self.state.clone();
+        let ids: HashSet<_> = state
+            .plugins
+            .keys()
+            .chain(state.retained_config.keys())
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for id in ids {
+            if !package::valid_id(&id) {
+                return Err("插件状态 ID 无效".into());
+            }
+            let legacy = state
+                .plugins
+                .get(&id)
+                .and_then(|record| record.config.as_ref())
+                .or_else(|| state.retained_config.get(&id));
+            let content = serde_json::to_string_pretty(legacy.unwrap_or(&serde_json::json!({})))
+                .map_err(|e| e.to_string())?;
+            let installed = checked_child_directory(&self.root, "installed", false)?;
+            let directory = checked_child_directory(&installed, &id, true)?;
+            // Existing files always take precedence, including files needing syntax repair.
+            ensure_config_file(&directory.join(CONFIG_FILE), &content)?;
+            if let Some(record) = state.plugins.get_mut(&id) {
+                changed |= record.config.take().is_some();
+            }
+            changed |= state.retained_config.remove(&id).is_some();
+        }
+        if changed {
+            self.commit(state)?;
+        }
+        Ok(())
+    }
+
+    fn config_path(&self, id: &str) -> Result<PathBuf, String> {
+        if !package::valid_id(id) {
+            return Err("插件 ID 无效".into());
+        }
         let record = self.state.plugins.get(id).ok_or("插件未安装")?;
-        package::validate_manifest(&record.manifest)?;
         if record.manifest.id != id {
             return Err("插件状态 ID 不一致".into());
         }
-        let Some(ui) = &record.manifest.config_ui else {
-            return Ok(None);
-        };
-        let host_root = checked_directory(&self.root)?;
-        let installed = checked_child_directory(&host_root, "installed", false)?;
-        let plugin_dir = checked_child_directory(&installed, id, false)?;
-        let root = checked_artifact_directory(&plugin_dir, &record.directory)?;
-        let parts: Vec<_> = ui.entry.split('/').collect();
-        let mut parent = root;
-        for name in &parts[..parts.len() - 1] {
-            parent = checked_child_directory(&parent, name, false)?;
-        }
-        let file = parent.join(parts.last().unwrap());
-        let metadata = fs::symlink_metadata(&file).map_err(|e| e.to_string())?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("插件配置页必须是普通文件，不能是符号链接".into());
-        }
-        if metadata.len() > package::MAX_CONFIG_UI {
-            return Err("插件配置页超过 1 MiB".into());
-        }
-        let canonical = file.canonicalize().map_err(|e| e.to_string())?;
-        if canonical.parent() != Some(parent.as_path()) {
-            return Err("插件配置页超出安装目录".into());
-        }
-        let mut bytes = Vec::new();
-        fs::File::open(&canonical)
-            .map_err(|e| e.to_string())?
-            .take(package::MAX_CONFIG_UI + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let html = package::validate_config_ui_bytes(ui, &bytes)?.to_owned();
-        Ok(Some(ConfigUiPage {
+        let root = checked_directory(&self.root)?;
+        let installed = checked_child_directory(&root, "installed", false)?;
+        Ok(checked_child_directory(&installed, id, false)?.join(CONFIG_FILE))
+    }
+
+    fn get_config_file(&self, id: &str) -> Result<ConfigFile, String> {
+        let path = self.config_path(id)?;
+        let content = read_config_text(&path)?;
+        Ok(ConfigFile {
             plugin_id: id.to_owned(),
-            version: record.manifest.version.clone(),
-            html,
-        }))
+            version: self.state.plugins[id].manifest.version.clone(),
+            sha256: package::digest(content.as_bytes()),
+            path,
+            content,
+        })
+    }
+
+    fn save_config_file(
+        &mut self,
+        id: &str,
+        content: &str,
+        expected_sha256: &str,
+    ) -> Result<(), String> {
+        if self.stopping {
+            return Err("插件管理器正在关闭".into());
+        }
+        parse_config(content)?;
+        let current = self.get_config_file(id)?;
+        if current.sha256 != expected_sha256 {
+            return Err("配置文件已被外部修改，请重新读取后再保存".into());
+        }
+        let temp = config_temp_file(&current.path, content)?;
+        // Recheck after staging so edits made while preparing the write are not overwritten.
+        if package::digest(read_config_text(&self.config_path(id)?)?.as_bytes()) != expected_sha256
+        {
+            return Err("配置文件已被外部修改，请重新读取后再保存".into());
+        }
+        temp.persist(&current.path).map_err(|e| e.to_string())?;
+        self.log_event(id, "configuration_saved");
+        Ok(())
     }
 
     fn load(&mut self, id: &str) -> Result<(), String> {
@@ -765,8 +802,7 @@ impl Manager {
         if record.manifest.id != id {
             return Err("插件状态 ID 不一致".into());
         }
-        schema::check_schema(&record.config_schema)?;
-        schema::validate(&record.config_schema, &record.config)?;
+        let config = parse_config(&self.get_config_file(id)?.content)?;
         let host_root = checked_directory(&self.root)?;
         let installed = checked_child_directory(&host_root, "installed", false)?;
         let plugin_directory = checked_child_directory(&installed, id, false)?;
@@ -788,7 +824,7 @@ impl Manager {
         {
             return Err("已安装动态库校验失败".into());
         }
-        let native = Native::load(&file, record.config.clone(), context)?;
+        let native = Native::load(&file, config.clone(), context)?;
         let generations = self.generations.entry(id.to_owned()).or_default();
         generations.retain(|generation| generation.strong_count() > 0);
         generations.push(native.lifetime());
@@ -797,7 +833,7 @@ impl Manager {
             Active {
                 instance: Arc::new(Mutex::new(native)),
                 manifest: record.manifest.clone(),
-                config: record.config.clone(),
+                config,
             },
         );
         self.log_event(id, "loaded");
@@ -814,10 +850,15 @@ impl Manager {
                 .iter()
                 .map(|(id, r)| {
                     let live = self.live.get(id);
+                    let config = self
+                        .get_config_file(id)
+                        .and_then(|file| parse_config(&file.content));
+                    let config_error = config.as_ref().err().cloned();
                     let restart_required = live.is_some_and(|p| {
-                        p.manifest.version != r.manifest.version || p.config != r.config
+                        p.manifest.version != r.manifest.version || config.as_ref() != Ok(&p.config)
                     });
-                    let status = if self.errors.contains_key(id) {
+                    let last_error = config_error.or_else(|| self.errors.get(id).cloned());
+                    let status = if last_error.is_some() {
                         "error"
                     } else if live.is_some() {
                         "enabled"
@@ -831,14 +872,11 @@ impl Manager {
                         description: r.manifest.description.clone(),
                         enabled: r.enabled,
                         status: status.into(),
-                        config: r.config.clone(),
-                        config_schema: r.config_schema.clone(),
-                        config_ui: r.manifest.config_ui.clone(),
+                        config_path: self.root.join("installed").join(id).join(CONFIG_FILE),
                         capabilities: r.manifest.capabilities.clone(),
-                        last_error: self.errors.get(id).cloned(),
+                        last_error,
                         restart_required,
                         active_version: live.map(|p| p.manifest.version.clone()),
-                        active_config: live.map(|p| p.config.clone()),
                         plugin_dir: self.root.join("installed").join(id),
                         data_dir: self.root.join("installed").join(id).join("data"),
                         log_dir: self.root.join("installed").join(id).join("logs"),
@@ -871,6 +909,126 @@ impl Manager {
         let has_headers = !entries.is_empty();
         request_plugins().store(Arc::new(entries));
         HAS_HEADERS.store(has_headers, Ordering::Relaxed);
+    }
+}
+
+fn parse_config(content: &str) -> Result<Value, String> {
+    if content.len() as u64 > MAX_CONFIG_BYTES {
+        return Err("配置文件超过 1 MiB".into());
+    }
+    let mut value: Value = serde_json::from_str(content)
+        .map_err(|e| format!("config.json 不是有效 JSON，请打开配置文件修复：{e}"))?;
+    if !value.is_object() {
+        return Err("config.json 的根值必须是 JSON 对象".into());
+    }
+    remove_config_comments(&mut value, "$")?;
+    Ok(value)
+}
+
+// 仅移除运行配置中的说明，保存和冲突检查始终使用文件原文。
+fn remove_config_comments(value: &mut Value, path: &str) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            if let Some(comments) = object.remove("_comments") {
+                let comments_path = format!("{path}[\"_comments\"]");
+                let entries = comments
+                    .as_object()
+                    .ok_or_else(|| format!("{comments_path} 必须是对象，每项说明必须是字符串"))?;
+                for (key, description) in entries {
+                    if !description.is_string() {
+                        return Err(format!(
+                            "{comments_path}[{}] 说明必须是字符串",
+                            serde_json::to_string(key).unwrap()
+                        ));
+                    }
+                }
+            }
+            for (key, child) in object {
+                remove_config_comments(
+                    child,
+                    &format!("{path}[{}]", serde_json::to_string(key).unwrap()),
+                )?;
+            }
+        }
+        Value::Array(array) => {
+            for (index, child) in array.iter_mut().enumerate() {
+                remove_config_comments(child, &format!("{path}[{index}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn checked_config_file(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| format!("无法读取 config.json：{e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("配置文件必须是普通文件，不能是符号链接".into());
+    }
+    let canonical = path.canonicalize().map_err(|e| e.to_string())?;
+    if canonical.parent() != path.parent() {
+        return Err("配置文件超出安装目录".into());
+    }
+    Ok(())
+}
+
+fn read_config_text(path: &Path) -> Result<String, String> {
+    checked_config_file(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("无法读取 config.json：{e}"))?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("配置文件必须是普通文件，不能是符号链接".into());
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err("配置文件超过 1 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err("配置文件超过 1 MiB".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "配置文件必须为 UTF-8".into())
+}
+
+fn config_temp_file(path: &Path, content: &str) -> Result<tempfile::NamedTempFile, String> {
+    let parent = path.parent().ok_or("配置文件路径无效")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    temp.write_all(content.as_bytes())
+        .map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    Ok(temp)
+}
+
+fn ensure_config_file(path: &Path, content: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            checked_config_file(path)?;
+            Ok(false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            parse_config(content)?;
+            config_temp_file(path, content)?
+                .persist_noclobber(path)
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -933,7 +1091,60 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixture_package() -> package::Package {
+    #[test]
+    fn config_comments_are_removed_recursively_without_changing_business_values() {
+        let content = json!({
+            "_comments": {"value": "说明", "_comments": "说明对象中的键不作为配置解析"},
+            "value": "_comments 字符串保持原样",
+            "_private": true,
+            "_commentsLike": {"value": 7},
+            "nested": {"_comments": {}, "enabled": false},
+            "rules": [{"_comments": {"model": "模型"}, "model": "gpt6"},
+                [null, {"_comments": {}, "lengths": [292]}]]
+        });
+        assert_eq!(
+            parse_config(&content.to_string()).unwrap(),
+            json!({
+                "value": "_comments 字符串保持原样",
+                "_private": true,
+                "_commentsLike": {"value": 7},
+                "nested": {"enabled": false},
+                "rules": [{"model": "gpt6"}, [null, {"lengths": [292]}]]
+            })
+        );
+    }
+
+    #[test]
+    fn config_comments_reject_invalid_types_at_their_json_paths() {
+        for invalid in [Value::Null, json!(true), json!(7), json!("说明"), json!([])] {
+            let content = json!({"rules": [{"_comments": invalid}]}).to_string();
+            let error = parse_config(&content).unwrap_err();
+            assert!(
+                error.starts_with("$[\"rules\"][0][\"_comments\"] 必须是对象"),
+                "{error}"
+            );
+        }
+        for invalid in [Value::Null, json!(false), json!(42), json!([]), json!({})] {
+            let content = json!({"rules": [{"_comments": {"a\"b": invalid}}]}).to_string();
+            let error = parse_config(&content).unwrap_err();
+            assert_eq!(
+                error,
+                "$[\"rules\"][0][\"_comments\"][\"a\\\"b\"] 说明必须是字符串"
+            );
+        }
+        assert!(parse_config("{\"_comments\":{\"note\":\"valid\"}, // comment\n}").is_err());
+    }
+
+    #[test]
+    fn config_comment_text_counts_toward_the_utf8_size_limit() {
+        let content = format!(
+            "{{\"_comments\":{{\"note\":\"{}\"}}}}",
+            "说".repeat(MAX_CONFIG_BYTES as usize / 3)
+        );
+        assert!(parse_config(&content).unwrap_err().contains("1 MiB"));
+    }
+
+    pub(super) fn fixture_package() -> package::Package {
         let entry = if cfg!(target_os = "macos") {
             "lib.dylib"
         } else if cfg!(target_os = "windows") {
@@ -944,7 +1155,7 @@ mod tests {
         let manifest: Manifest = serde_json::from_value(json!({
             "id":"test.boundary","name":"Boundary","version":"1.0.0","abiVersion":1,
             "platform":std::env::consts::OS,"arch":std::env::consts::ARCH,
-            "entry":entry,"librarySha256":"0".repeat(64),"configSchema":"config.json"
+            "entry":entry,"librarySha256":"0".repeat(64)
         }))
         .unwrap();
         package::Package {
@@ -952,9 +1163,9 @@ mod tests {
                 path: "fixture.codey-plugin".into(),
                 sha256: "0".repeat(64),
                 manifest,
-                config_schema: json!({"type":"object"}),
             },
             files: BTreeMap::from([("file.txt".into(), b"fixture".to_vec())]),
+            default_config: "{}\n".into(),
         }
     }
 
@@ -989,178 +1200,198 @@ mod tests {
         assert!(repaired.plugins[0].last_error.is_none());
     }
 
-    fn html_fixture_package(html: &[u8], ui: Option<Value>) -> Result<package::Package, String> {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("html.codey-plugin");
-        let mut manifest = fixture_package().inspection.manifest;
-        manifest.library_sha256 = package::digest(b"not a native library");
-        let mut manifest = serde_json::to_value(manifest).unwrap();
-        if let Some(ui) = ui {
-            manifest["configUi"] = ui;
-        }
-        let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
-        for (name, bytes) in [
-            (
-                "manifest.json".to_owned(),
-                serde_json::to_vec(&manifest).unwrap(),
-            ),
-            (
-                manifest["entry"].as_str().unwrap().to_owned(),
-                b"not a native library".to_vec(),
-            ),
-            ("config.json".into(), br#"{"type":"object"}"#.to_vec()),
-            ("ui/config.html".into(), html.to_vec()),
-        ] {
-            archive
-                .start_file(name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            archive.write_all(&bytes).unwrap();
-        }
-        archive.finish().unwrap();
-        package::read(&path)
-    }
-
-    fn html_metadata(html: &[u8]) -> Value {
-        json!({"type":"html", "entry":"ui/config.html", "sha256":package::digest(html)})
-    }
-
     #[test]
-    fn config_ui_packages_validate_content_and_manifest() {
-        let html = b"<!doctype html><html><body>Configuration</body></html>";
-        assert!(html_fixture_package(html, Some(html_metadata(html))).is_ok());
-        assert!(
-            html_fixture_package(html, None)
-                .unwrap()
-                .inspection
-                .manifest
-                .config_ui
-                .is_none()
-        );
-        for metadata in [
-            json!({"type":"url","entry":"ui/config.html","sha256":package::digest(html)}),
-            json!({"type":"html","entry":"../outside.html","sha256":package::digest(html)}),
-            json!({"type":"html","entry":"ui/missing.html","sha256":package::digest(html)}),
-            json!({"type":"html","entry":"ui/config.html","sha256":"0".repeat(64)}),
-            json!({"type":"html","entry":"ui/config.html","sha256":"invalid"}),
-        ] {
-            assert!(html_fixture_package(html, Some(metadata)).is_err());
-        }
-        let oversized = vec![b'a'; package::MAX_CONFIG_UI as usize + 1];
-        assert!(
-            html_fixture_package(&oversized, Some(html_metadata(&oversized)))
-                .err()
-                .unwrap()
-                .contains("1 MiB")
-        );
-        assert!(
-            html_fixture_package(&[0xff], Some(html_metadata(&[0xff])))
-                .err()
-                .unwrap()
-                .contains("UTF-8")
-        );
-    }
-
-    #[test]
-    fn installed_config_ui_reads_without_loading_and_checks_changed_files() {
+    fn config_file_preserves_text_and_rejects_external_edits() {
         let root = tempfile::tempdir().unwrap();
         let mut manager = Manager::open(root.path().into()).unwrap();
-        let html = b"<!doctype html><html><body>Settings</body></html>";
+        let mut package = fixture_package();
+        package.default_config =
+            "{\r\n  \"_comments\": {\"value\": \"初始说明\"},\r\n  \"value\":  1\r\n}\r\n".into();
+        let initial = package.default_config.clone();
+        manager.install(package).unwrap();
+        let file = manager.get_config_file("test.boundary").unwrap();
+        assert_eq!(file.content, initial);
+        assert_eq!(file.sha256, package::digest(initial.as_bytes()));
+        let edited = "{\n  \"_comments\": {\"value\": \"修改后的说明\"},\n  \"value\": 2, \"中文\": true\n}\n";
         manager
-            .install(html_fixture_package(html, Some(html_metadata(html))).unwrap())
+            .save_config_file("test.boundary", edited, &file.sha256)
             .unwrap();
-        let page = manager.get_config_ui("test.boundary").unwrap().unwrap();
-        assert_eq!(page.plugin_id, "test.boundary");
-        assert_eq!(page.version, "1.0.0");
-        assert_eq!(page.html.as_bytes(), html);
-        assert!(manager.live.is_empty());
-        assert!(!manager.list().plugins[0].enabled);
-        assert!(manager.list().plugins[0].config_ui.is_some());
-        let plugin_dir = root.path().join("installed/test.boundary");
-        let directory = manager.state.plugins["test.boundary"].directory.clone();
-        let file = plugin_dir.join(&directory).join("ui/config.html");
-        fs::write(&file, b"changed").unwrap();
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), edited);
         assert!(
             manager
-                .get_config_ui("test.boundary")
-                .err()
-                .unwrap()
-                .contains("SHA-256")
+                .save_config_file("test.boundary", "{}", &file.sha256)
+                .unwrap_err()
+                .contains("外部修改")
         );
-        fs::write(&file, vec![b'a'; package::MAX_CONFIG_UI as usize + 1]).unwrap();
+        let latest = manager.get_config_file("test.boundary").unwrap();
+        fs::write(&file.path, "{\"external\":true}").unwrap();
         assert!(
             manager
-                .get_config_ui("test.boundary")
-                .err()
+                .save_config_file("test.boundary", "{}", &latest.sha256)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&file.path).unwrap(),
+            "{\"external\":true}"
+        );
+        assert!(manager.get_config_file("../test.boundary").is_err());
+        assert!(manager.get_config_file("missing").is_err());
+        let info = serde_json::to_value(manager.list()).unwrap();
+        assert_eq!(
+            info["plugins"][0]["configPath"],
+            file.path.to_string_lossy().as_ref()
+        );
+        for removed in ["config", "configSchema", "configUi", "activeConfig"] {
+            assert!(info["plugins"][0].get(removed).is_none());
+        }
+    }
+
+    #[test]
+    fn damaged_config_can_be_read_and_repaired_but_never_loaded() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let path = manager.get_config_file("test.boundary").unwrap().path;
+        fs::write(&path, "{broken").unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        let broken = manager.get_config_file("test.boundary").unwrap();
+        assert_eq!(broken.content, "{broken");
+        assert!(
+            manager.list().plugins[0]
+                .last_error
+                .as_ref()
                 .unwrap()
+                .contains("JSON")
+        );
+        assert!(manager.load("test.boundary").unwrap_err().contains("JSON"));
+        for invalid in ["[]", "null", "{", "true"] {
+            assert!(
+                manager
+                    .save_config_file("test.boundary", invalid, &broken.sha256)
+                    .is_err()
+            );
+        }
+        manager
+            .save_config_file("test.boundary", "{}\n", &broken.sha256)
+            .unwrap();
+        assert!(manager.list().plugins[0].last_error.is_none());
+        fs::write(&path, [0xff]).unwrap();
+        assert!(
+            manager
+                .get_config_file("test.boundary")
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        assert!(
+            manager
+                .get_config_file("test.boundary")
+                .unwrap_err()
                 .contains("1 MiB")
         );
-        fs::write(&file, html).unwrap();
-        let legacy = directory.strip_prefix("versions/").unwrap();
-        fs::rename(plugin_dir.join(&directory), plugin_dir.join(legacy)).unwrap();
-        manager
-            .state
-            .plugins
-            .get_mut("test.boundary")
-            .unwrap()
-            .directory = legacy.into();
-        assert_eq!(
+        assert!(
             manager
-                .get_config_ui("test.boundary")
-                .unwrap()
-                .unwrap()
-                .html
-                .as_bytes(),
-            html
+                .save_config_file(
+                    "test.boundary",
+                    &" ".repeat(MAX_CONFIG_BYTES as usize + 1),
+                    ""
+                )
+                .unwrap_err()
+                .contains("1 MiB")
         );
-        manager
-            .state
-            .plugins
-            .get_mut("test.boundary")
-            .unwrap()
-            .manifest
-            .config_ui = None;
-        assert!(manager.get_config_ui("test.boundary").unwrap().is_none());
-        assert!(manager.get_config_ui("missing").is_err());
+    }
+
+    #[test]
+    fn legacy_config_migrates_once_and_existing_file_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let path = manager.get_config_file("test.boundary").unwrap().path;
+        fs::remove_file(&path).unwrap();
+        let mut old = serde_json::to_value(&manager.state).unwrap();
+        old["plugins"]["test.boundary"]["config"] = json!({"legacy":true});
+        old["plugins"]["test.boundary"]["configSchema"] = json!({"type":"object"});
+        old["plugins"]["test.boundary"]["manifest"]["configSchema"] = json!("schema.json");
+        old["plugins"]["test.boundary"]["manifest"]["configUi"] =
+            json!({"type":"html", "entry":"gone.html"});
+        old["retainedConfig"] = json!({"test.retained":{"retained":true}});
+        fs::write(
+            root.path().join("state.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let migrated = Manager::open(root.path().into()).unwrap();
+        assert_eq!(
+            parse_config(&fs::read_to_string(&path).unwrap()).unwrap(),
+            json!({"legacy":true})
+        );
+        assert_eq!(
+            parse_config(
+                &fs::read_to_string(root.path().join("installed/test.retained/config.json"))
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"retained":true})
+        );
+        assert!(migrated.state.plugins["test.boundary"].config.is_none());
+        let saved = fs::read_to_string(root.path().join("state.json")).unwrap();
+        for removed in ["configSchema", "configUi", "retainedConfig", "\"config\""] {
+            assert!(!saved.contains(removed), "{removed}");
+        }
+        fs::write(&path, "{invalid but preserved").unwrap();
+        fs::write(
+            root.path().join("state.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        Manager::open(root.path().into()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{invalid but preserved");
+    }
+
+    #[test]
+    fn migration_failure_keeps_legacy_configuration_in_state() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let path = manager.get_config_file("test.boundary").unwrap().path;
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let mut old = serde_json::to_value(&manager.state).unwrap();
+        old["plugins"]["test.boundary"]["config"] = json!({"preserved":true});
+        let bytes = serde_json::to_vec(&old).unwrap();
+        fs::write(root.path().join("state.json"), &bytes).unwrap();
+        assert!(Manager::open(root.path().into()).is_err());
+        assert_eq!(fs::read(root.path().join("state.json")).unwrap(), bytes);
     }
 
     #[cfg(unix)]
     #[test]
-    fn installed_config_ui_rejects_symlink_files_and_parents() {
+    fn config_file_rejects_symlink_files_and_parents() {
         for relative in [
             "installed",
             "installed/test.boundary",
-            "installed/test.boundary/versions",
-            "ui",
-            "ui/config.html",
+            "installed/test.boundary/config.json",
         ] {
             let root = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
             let mut manager = Manager::open(root.path().into()).unwrap();
-            let html = b"<html>Settings</html>";
-            manager
-                .install(html_fixture_package(html, Some(html_metadata(html))).unwrap())
-                .unwrap();
-            let artifact = root
-                .path()
-                .join("installed/test.boundary")
-                .join(&manager.state.plugins["test.boundary"].directory);
-            let source = if relative.starts_with("installed") {
-                root.path().join(relative)
-            } else {
-                artifact.join(relative)
-            };
+            manager.install(fixture_package()).unwrap();
+            let file = manager.get_config_file("test.boundary").unwrap();
+            let source = root.path().join(relative);
             let destination = outside.path().join("moved");
             fs::rename(&source, &destination).unwrap();
             std::os::unix::fs::symlink(&destination, &source).unwrap();
             assert!(
                 manager
-                    .get_config_ui("test.boundary")
-                    .err()
-                    .unwrap()
-                    .contains("符号链接"),
-                "{relative}"
+                    .get_config_file("test.boundary")
+                    .unwrap_err()
+                    .contains("符号链接")
             );
-            assert!(manager.live.is_empty());
+            assert!(
+                manager
+                    .save_config_file("test.boundary", "{}", &file.sha256)
+                    .is_err()
+            );
         }
     }
 
@@ -1242,24 +1473,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_config_can_be_installed_but_not_loaded() {
-        let root = tempfile::tempdir().unwrap();
-        let mut manager = Manager::open(root.path().into()).unwrap();
-        let mut package = fixture_package();
-        package.inspection.config_schema = json!({
-            "type":"object", "properties":{"value":{"type":"string"}},
-            "required":["value"], "additionalProperties":false
-        });
-        manager.install(package).unwrap();
-        let plugin = &manager.list().plugins[0];
-        assert!(!plugin.enabled);
-        assert_eq!(plugin.config, json!({}));
-        assert!(manager.load("test.boundary").is_err());
-        assert!(manager.live.is_empty());
-        assert!(schema::validate(&plugin.config_schema, &json!({"value":"provided"})).is_ok());
-    }
-
-    #[test]
     fn patches_are_validated_as_a_whole() {
         let allowed = vec!["x-example".into()];
         assert!(validate_patches(json!({"headers":[{"name":"x-example","value":"ok"},{"name":"authorization","value":"bad"}]}),&allowed).is_err());
@@ -1276,21 +1489,6 @@ mod tests {
                 &allowed
             )
             .is_ok()
-        );
-    }
-    #[test]
-    fn state_write_restores_retained_config() {
-        let root = tempfile::tempdir().unwrap();
-        let mut manager = Manager::open(root.path().into()).unwrap();
-        let mut state = State::default();
-        state
-            .retained_config
-            .insert("test.plugin".into(), json!({"enabled":true}));
-        manager.commit(state).unwrap();
-        let restored = Manager::open(root.path().into()).unwrap();
-        assert_eq!(
-            restored.state.retained_config["test.plugin"],
-            json!({"enabled":true})
         );
     }
     #[test]
@@ -1325,12 +1523,18 @@ mod tests {
                 path: "fixture.codey-plugin".into(),
                 sha256: "0".repeat(64),
                 manifest,
-                config_schema: json!({"type":"object"}),
             },
             files: BTreeMap::from([("file.txt".into(), b"fixture".to_vec())]),
+            default_config: "{}\n".into(),
         };
         assert!(manager.install(package).is_err());
         assert!(manager.state.plugins.is_empty());
+        assert!(
+            !root
+                .path()
+                .join("installed/test.rollback/config.json")
+                .exists()
+        );
         assert_eq!(
             fs::read_dir(root.path().join("installed/test.rollback/versions"))
                 .unwrap()
@@ -1347,6 +1551,8 @@ mod tests {
         let context = manager.context("test.boundary", false).unwrap();
         fs::write(context.data_dir.join("saved.json"), b"persistent").unwrap();
         fs::write(context.log_dir.join("plugin.log"), b"log\n").unwrap();
+        let config_path = context.plugin_dir.join(CONFIG_FILE);
+        fs::write(&config_path, b"{\"saved\":true}\n").unwrap();
         let mut upgrade = fixture_package();
         upgrade.inspection.manifest.version = "2.0.0".into();
         manager.install(upgrade).unwrap();
@@ -1362,11 +1568,13 @@ mod tests {
         reopened.uninstall("test.boundary", false).unwrap();
         assert!(!context.plugin_dir.join("versions").exists());
         assert!(context.log_dir.join("plugin.log").exists());
+        assert_eq!(fs::read(&config_path).unwrap(), b"{\"saved\":true}\n");
         reopened.install(fixture_package()).unwrap();
         assert_eq!(
             fs::read(context.data_dir.join("saved.json")).unwrap(),
             b"persistent"
         );
+        assert_eq!(fs::read(&config_path).unwrap(), b"{\"saved\":true}\n");
         reopened.uninstall("test.boundary", true).unwrap();
         assert!(!context.plugin_dir.exists());
     }
