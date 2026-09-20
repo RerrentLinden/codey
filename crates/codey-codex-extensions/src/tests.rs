@@ -896,7 +896,10 @@ fn project_skill_toggle_uses_user_path_rule_and_preserves_project_config() {
     assert!(!project.join(".codex/config.toml").exists());
     let config = fs::read_to_string(f.home.join("config.toml")).unwrap();
     assert!(config.contains("model='keep'"));
-    assert!(config.contains(".agents/skills/demo/SKILL.md"));
+    assert!(
+        config.contains(".agents/skills/demo/SKILL.md")
+            || config.contains(r".agents\skills\demo\SKILL.md")
+    );
     assert!(config.contains("enabled = false"));
 }
 

@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use crate::fsutil;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;

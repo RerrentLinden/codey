@@ -4228,25 +4228,47 @@ mod tests {
             query.clone(),
         )
         .unwrap();
-        let actual = stats.daily_trend.iter().map(|day| {
-            (day.timestamp_unix_ms, day.total, day.total_tokens_sum, day.total_tokens_known_count)
-        }).collect::<Vec<_>>();
-        assert_eq!(actual, vec![
-            (DAY_MS, 2, Some(10), 1),
-            (2 * DAY_MS, 1, None, 0),
-            (3 * DAY_MS, 1, Some(0), 1),
-            (6 * DAY_MS, 1, Some(20), 1),
-        ]);
+        let actual = stats
+            .daily_trend
+            .iter()
+            .map(|day| {
+                (
+                    day.timestamp_unix_ms,
+                    day.total,
+                    day.total_tokens_sum,
+                    day.total_tokens_known_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (DAY_MS, 2, Some(10), 1),
+                (2 * DAY_MS, 1, None, 0),
+                (3 * DAY_MS, 1, Some(0), 1),
+                (6 * DAY_MS, 1, Some(20), 1),
+            ]
+        );
         assert_eq!(
             stats.daily_trend.iter().map(|day| day.total).sum::<u64>(),
             stats.summary.total,
         );
         assert_eq!(
-            Some(stats.daily_trend.iter().filter_map(|day| day.total_tokens_sum).sum::<u64>()),
+            Some(
+                stats
+                    .daily_trend
+                    .iter()
+                    .filter_map(|day| day.total_tokens_sum)
+                    .sum::<u64>()
+            ),
             stats.summary.total_tokens_sum,
         );
         assert_eq!(
-            stats.daily_trend.iter().map(|day| day.total_tokens_known_count).sum::<u64>(),
+            stats
+                .daily_trend
+                .iter()
+                .map(|day| day.total_tokens_known_count)
+                .sum::<u64>(),
             stats.summary.total_tokens_known_count,
         );
         let serialized = serde_json::to_value(&stats).unwrap();
@@ -4326,16 +4348,20 @@ mod tests {
             assert_eq!(day.total_tokens_known_count, 1);
         }
         assert_eq!(
-            Some(stats.daily_trend.iter().filter_map(|day| day.total_tokens_sum).sum::<u64>()),
+            Some(
+                stats
+                    .daily_trend
+                    .iter()
+                    .filter_map(|day| day.total_tokens_sum)
+                    .sum::<u64>()
+            ),
             stats.summary.total_tokens_sum,
         );
         assert_eq!(stats.from_unix_ms, earliest);
         assert!(stats.to_unix_ms >= now);
         assert_eq!(stats.bucket_ms % DAY_MS, 0);
         assert!(stats.trend.len() <= 367);
-        assert!(
-            stats.to_unix_ms / stats.bucket_ms - stats.from_unix_ms / stats.bucket_ms + 1 <= 367
-        );
+        assert!(stats.to_unix_ms / stats.bucket_ms - stats.from_unix_ms / stats.bucket_ms < 367);
         assert_eq!(
             stats.trend.iter().map(|bucket| bucket.total).sum::<u64>(),
             800
