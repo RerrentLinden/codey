@@ -522,8 +522,10 @@ fn cli_wrapper_target(
     #[cfg(windows)]
     let target = crate::launcher::windows_cli_wrapper_target(&app_dir)?;
     #[cfg(target_os = "macos")]
-    let target = codey_runtime_core::app_paths::codex_runtime_executable(&app_dir)
-        .context("Codex App 内未找到内置 CLI")?;
+    let target =
+        codey_runtime_core::app_paths::codex_runtime_executable(&app_dir).with_context(|| {
+            codey_runtime_core::app_paths::codex_runtime_executable_missing(&app_dir)
+        })?;
     Ok(Some(target))
 }
 

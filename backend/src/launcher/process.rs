@@ -1104,8 +1104,13 @@ fn windows_local_app_data(value: Option<std::ffi::OsString>) -> Result<PathBuf> 
 
 #[cfg(any(windows, test))]
 pub(crate) fn windows_cli_wrapper_target(app_dir: &std::path::Path) -> Result<PathBuf> {
-    let target = codey_runtime_core::app_paths::codex_runtime_executable(app_dir)
-        .ok_or_else(|| anyhow::anyhow!("Codex App 内未找到内置 CLI"))?;
+    let target =
+        codey_runtime_core::app_paths::codex_runtime_executable(app_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                codey_runtime_core::app_paths::codex_runtime_executable_missing(app_dir)
+            )
+        })?;
     if codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir).is_none() {
         return Ok(target);
     }
@@ -1167,8 +1172,13 @@ async fn prepare_cli_wrapper(
             .context("准备 Windows Codex 用户运行文件的任务异常退出")??
     };
     #[cfg(target_os = "macos")]
-    let target = codey_runtime_core::app_paths::codex_runtime_executable(app_dir)
-        .ok_or_else(|| anyhow::anyhow!("Codex App 内未找到内置 CLI"))?;
+    let target =
+        codey_runtime_core::app_paths::codex_runtime_executable(app_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                codey_runtime_core::app_paths::codex_runtime_executable_missing(app_dir)
+            )
+        })?;
     validate_code_mode_host(&target)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

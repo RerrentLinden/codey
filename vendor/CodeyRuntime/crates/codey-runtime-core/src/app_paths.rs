@@ -496,16 +496,44 @@ fn normalize_version_value(value: &str) -> Option<String> {
     is_version_like(value).then(|| value.to_string())
 }
 
-pub fn codex_runtime_executable(app_dir: &Path) -> Option<PathBuf> {
-    let candidates = if app_dir.extension() == Some(OsStr::new("app")) {
-        vec![app_dir.join("Contents").join("Resources").join("codex")]
+/// 内置 CLI 的候选位置。Codex 更新改动过文件名与目录层级，所以按已知命名逐个
+/// 尝试：只认单一路径时，一次改名就等于「找不到内置 CLI」并卡死启动。
+/// 首选项与历史行为一致，因此存在同名文件时仍选到原来的那一个。
+pub fn codex_runtime_executable_candidates(app_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if app_dir.extension() == Some(OsStr::new("app")) {
+        let resources = app_dir.join("Contents").join("Resources");
+        candidates.push(resources.join("codex"));
+        candidates.push(resources.join("codex-cli"));
+        candidates.push(resources.join("bin").join("codex"));
+        candidates.push(app_dir.join("Contents").join("MacOS").join("codex"));
     } else {
-        vec![
-            app_dir.join("resources").join("codex.exe"),
-            app_dir.join("Resources").join("codex.exe"),
-        ]
-    };
-    candidates.into_iter().find(|path| path.is_file())
+        let resources = app_dir.join("resources");
+        candidates.push(resources.join("codex.exe"));
+        candidates.push(app_dir.join("Resources").join("codex.exe"));
+        candidates.push(resources.join("bin").join("codex.exe"));
+        candidates.push(resources.join("codex-cli.exe"));
+    }
+    candidates
+}
+
+/// 失败时把尝试过的路径带回调用点。缺少这层信息时，一次改名只会留下
+/// 「未找到内置 CLI」，排查还得先去猜 Codex 把文件挪到了哪里。
+pub fn codex_runtime_executable_missing(app_dir: &Path) -> String {
+    format!(
+        "Codex App 内未找到内置 CLI；已尝试：{}",
+        codex_runtime_executable_candidates(app_dir)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、")
+    )
+}
+
+pub fn codex_runtime_executable(app_dir: &Path) -> Option<PathBuf> {
+    codex_runtime_executable_candidates(app_dir)
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
