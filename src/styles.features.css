@@ -220,68 +220,7 @@
   min-width: 0;
 }
 
-/* 顶部概览状态条 */
-.subagent-overview-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-  padding: 12px 16px;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--codey-surface-sunken, #f5f5f7) 45%, var(--codey-surface, #ffffff) 55%);
-  border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
-}
-
-[data-theme="dark"] .subagent-overview-card {
-  background: color-mix(in srgb, var(--codey-surface-sunken, #1c1c1e) 55%, var(--codey-surface, #252529) 45%);
-  border-color: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
-}
-
-.subagent-overview-main {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.subagent-overview-title-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.subagent-pulse-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--codey-green, #34c759);
-  box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
-  flex-shrink: 0;
-}
-
-.subagent-overview-title {
-  font-size: 12.5px;
-  font-weight: 650;
-  color: var(--codey-text, #1d1d1f);
-  letter-spacing: -0.01em;
-}
-
-.subagent-overview-desc {
-  margin: 0;
-  font-size: 11.5px;
-  color: var(--codey-muted, #6e6e73);
-  line-height: 1.45;
-}
-
-.subagent-overview-stats {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
+/* 分组状态胶囊徽章 */
 
 .subagent-stat-badge {
   display: inline-flex;
@@ -329,12 +268,11 @@
   background: currentColor;
 }
 
-/* 分组与卡片列表 */
-.subagent-role-group {
+/* 分组卡片与项目列表 */
+.subagent-group-card {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-top: 2px;
+  overflow: hidden;
 }
 
 .subagent-group-header {
@@ -342,8 +280,15 @@
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 6px 12px;
-  padding: 0 4px;
+  gap: 8px 14px;
+  padding: 12px 18px;
+  border-bottom: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
+  background: color-mix(in srgb, var(--codey-surface-sunken, #f5f5f7) 45%, var(--codey-surface, #ffffff) 55%);
+}
+
+[data-theme="dark"] .subagent-group-header {
+  background: color-mix(in srgb, var(--codey-surface-sunken, #1c1c1e) 50%, var(--codey-surface, #252529) 50%);
+  border-bottom-color: rgba(255, 255, 255, 0.06);
 }
 
 .subagent-group-title-wrap {
@@ -353,77 +298,63 @@
 }
 
 .subagent-group-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 650;
   color: var(--codey-text, #1d1d1f);
   letter-spacing: -0.01em;
 }
 
 .subagent-group-desc {
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--codey-muted, #8e8e93);
 }
 
-.subagent-card-list {
+.subagent-group-items {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 角色行项目 */
+.subagent-role-item {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  padding: 14px 18px 15px;
+  border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.05);
+  transition: background-color 150ms ease, opacity 150ms ease;
 }
 
-/* 角色卡片本体 */
-.subagent-role-card {
-  display: flex;
-  flex-direction: column;
-  border-radius: 12px;
-  border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
-  background: var(--codey-surface, #ffffff);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
-  transition: border-color 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
-  overflow: hidden;
+.subagent-role-item:first-child {
+  border-top: none;
 }
 
-[data-theme="dark"] .subagent-role-card {
-  border-color: rgba(255, 255, 255, 0.08);
-  background: var(--codey-surface, #252529);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+[data-theme="dark"] .subagent-role-item {
+  border-top-color: rgba(255, 255, 255, 0.05);
 }
 
-.subagent-role-card:hover {
-  border-color: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.16);
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+.subagent-role-item:not(.subagent-role-disabled):hover {
+  background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.015);
 }
 
-[data-theme="dark"] .subagent-role-card:hover {
-  border-color: rgba(255, 255, 255, 0.16);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+[data-theme="dark"] .subagent-role-item:not(.subagent-role-disabled):hover {
+  background: rgba(255, 255, 255, 0.015);
 }
 
-.subagent-role-card.subagent-role-disabled {
-  opacity: 0.62;
-  background: color-mix(in srgb, var(--codey-surface-sunken, #f5f5f7) 40%, var(--codey-surface, #ffffff) 60%);
+.subagent-role-item.subagent-role-disabled {
+  opacity: 0.6;
+  background: color-mix(in srgb, var(--codey-surface-sunken, #f5f5f7) 30%, var(--codey-surface, #ffffff) 70%);
 }
 
-[data-theme="dark"] .subagent-role-card.subagent-role-disabled {
-  background: color-mix(in srgb, var(--codey-surface-sunken, #1c1c1e) 45%, var(--codey-surface, #252529) 55%);
+[data-theme="dark"] .subagent-role-item.subagent-role-disabled {
+  background: color-mix(in srgb, var(--codey-surface-sunken, #1c1c1e) 30%, var(--codey-surface, #252529) 70%);
 }
 
-.subagent-role-card.subagent-role-disabled:hover {
-  border-color: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
-}
-
-[data-theme="dark"] .subagent-role-card.subagent-role-disabled:hover {
-  border-color: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-}
-
-/* 卡片头部 */
-.subagent-role-card-header {
+/* 项目头部 */
+.subagent-role-item-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 13px 16px 11px;
 }
 
 .subagent-role-identity {
@@ -548,19 +479,12 @@
   margin-top: 2px;
 }
 
-/* 卡片底部控制托盘 */
+/* 控制行 */
 .subagent-role-controls-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px 11px;
-  border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.045);
-  background: color-mix(in srgb, var(--codey-surface-sunken, #f7f7f9) 60%, var(--codey-surface, #ffffff) 40%);
-}
-
-[data-theme="dark"] .subagent-role-controls-row {
-  border-top-color: rgba(255, 255, 255, 0.045);
-  background: color-mix(in srgb, var(--codey-surface-sunken, #1c1c1e) 40%, var(--codey-surface, #252529) 60%);
+  gap: 14px;
+  padding-left: 46px;
 }
 
 .subagent-control-group {
@@ -594,6 +518,7 @@
 
 @media (max-width: 640px) {
   .subagent-role-controls-row {
+    padding-left: 0;
     flex-direction: column;
     align-items: stretch;
     gap: 8px;
@@ -601,11 +526,6 @@
 
   .subagent-control-group--effort {
     width: 100%;
-  }
-
-  .subagent-overview-card {
-    flex-direction: column;
-    align-items: flex-start;
   }
 }
 

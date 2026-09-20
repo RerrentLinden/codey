@@ -52,6 +52,10 @@ const REASONING_EFFORT_LABELS: Record<string, string> = {
   max: "最大",
   ultra: "超高",
 };
+const SUBAGENT_ACCESS_LABELS = {
+  readOnly: "只读",
+  write: "可写",
+} as const;
 const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
@@ -183,11 +187,11 @@ export function SubagentPolicyCardComponent({
       <div
         key={task.id}
         id={task.id}
-        className={`subagent-role-card codey-card ${
+        className={`subagent-role-item ${
           roleDisabled ? "subagent-role-disabled" : ""
         }`}
       >
-        <div className="subagent-role-card-header">
+        <div className="subagent-role-item-header">
           <div className="subagent-role-identity">
             <div
               className={`subagent-role-icon-box subagent-role-icon-box--${task.id}`}
@@ -197,11 +201,6 @@ export function SubagentPolicyCardComponent({
             <div className="subagent-role-meta">
               <div className="subagent-role-title-row">
                 <h4 className="subagent-role-name">{task.name}</h4>
-                <Badge
-                  variant={task.access === "write" ? "warning" : "brand"}
-                >
-                  {task.access === "write" ? "可写" : "只读"}
-                </Badge>
                 {roleDisabled && (
                   <span className="subagent-role-status-chip">已停用</span>
                 )}
@@ -318,62 +317,44 @@ export function SubagentPolicyCardComponent({
         <div className="module-card-body subagent-policy-body">
           {config.subagentOptimization ? (
             <>
-              <div className="subagent-overview-card codey-card">
-                <div className="subagent-overview-main">
-                  <div className="subagent-overview-title-row">
-                    <span className="subagent-pulse-dot" aria-hidden="true" />
-                    <span className="subagent-overview-title">
-                      已启用 {enabledRoleCount} / {SUBAGENT_TASK_TYPES.length} 个调度角色
-                    </span>
-                  </div>
-                  <p className="subagent-overview-desc">
-                    只读角色执行快速定位与分析，可写角色执行代码变更
-                  </p>
-                </div>
-                <div className="subagent-overview-stats">
-                  <div className="subagent-stat-badge subagent-stat-badge--readonly">
-                    <span className="subagent-stat-indicator" aria-hidden="true" />
-                    <span>只读分析</span>
-                    <strong>
-                      {enabledReadOnlyCount} / {readOnlyTasks.length}
-                    </strong>
-                  </div>
-                  <div className="subagent-stat-badge subagent-stat-badge--write">
-                    <span className="subagent-stat-indicator" aria-hidden="true" />
-                    <span>可写实施</span>
-                    <strong>
-                      {enabledWriteCount} / {writeTasks.length}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-
-              <div className="subagent-role-group">
+              <div className="subagent-group-card codey-card">
                 <div className="subagent-group-header">
                   <div className="subagent-group-title-wrap">
-                    <span className="subagent-group-title">只读分析角色</span>
-                    <Badge variant="brand">3 个角色</Badge>
+                    <span className="subagent-group-title">分析角色</span>
+                    <div className="subagent-stat-badge subagent-stat-badge--readonly">
+                      <span className="subagent-stat-indicator" aria-hidden="true" />
+                      <span>{SUBAGENT_ACCESS_LABELS.readOnly}分析</span>
+                      <strong>
+                        {enabledReadOnlyCount} / {readOnlyTasks.length}
+                      </strong>
+                    </div>
                   </div>
                   <span className="subagent-group-desc">
                     负责小范围定位、宽范围跨文件检索及视觉证据分析，不产生写入操作
                   </span>
                 </div>
-                <div className="subagent-card-list">
+                <div className="subagent-group-items">
                   {readOnlyTasks.map(renderRoleCard)}
                 </div>
               </div>
 
-              <div className="subagent-role-group">
+              <div className="subagent-group-card codey-card">
                 <div className="subagent-group-header">
                   <div className="subagent-group-title-wrap">
-                    <span className="subagent-group-title">可写实施角色</span>
-                    <Badge variant="warning">2 个角色</Badge>
+                    <span className="subagent-group-title">实施角色</span>
+                    <div className="subagent-stat-badge subagent-stat-badge--write">
+                      <span className="subagent-stat-indicator" aria-hidden="true" />
+                      <span>{SUBAGENT_ACCESS_LABELS.write}实施</span>
+                      <strong>
+                        {enabledWriteCount} / {writeTasks.length}
+                      </strong>
+                    </div>
                   </div>
                   <span className="subagent-group-desc">
                     负责代码修改、文件写入与页面渲染验证，受父任务权限约束
                   </span>
                 </div>
-                <div className="subagent-card-list">
+                <div className="subagent-group-items">
                   {writeTasks.map(renderRoleCard)}
                 </div>
               </div>
