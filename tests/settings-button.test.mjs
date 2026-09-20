@@ -672,6 +672,7 @@ const createStartupUpdateFixture = (bridge) => {
   const events = [];
   const alerts = [];
   const documentListeners = new Map();
+  const windowListeners = new Map();
   const activeTimers = () => timers.filter((timer) => !timer.cleared);
   const visibleButton = () =>
     elementsById.get("codey-settings-button") || null;
@@ -720,7 +721,11 @@ const createStartupUpdateFixture = (bridge) => {
       }
       return bridge(path, payload, options);
     },
-    addEventListener() {},
+    addEventListener(type, handler) {
+      const handlers = windowListeners.get(type) || [];
+      handlers.push(handler);
+      windowListeners.set(type, handlers);
+    },
     alert(message) {
       alerts.push(String(message));
     },
@@ -730,6 +735,7 @@ const createStartupUpdateFixture = (bridge) => {
     },
     dispatchEvent(event) {
       events.push(event);
+      for (const handler of windowListeners.get(event.type) || []) handler(event);
       return true;
     },
     getComputedStyle: () => ({ display: "flex", visibility: "visible" }),
@@ -866,6 +872,59 @@ test("falls back to a passive periodic check when backend update state hangs", a
     fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
     true,
   );
+});
+
+test("saved automatic update preference controls renderer polling and manual update badges", async () => {
+  const calls = [];
+  const fixture = createStartupUpdateFixture(async (path) => {
+    calls.push(path);
+    if (path === "/backend/status") return { autoCheckCodeyUpdates: false };
+    if (path === "/backend/health") return { status: "ok" };
+    if (path === "/account/usage") return { status: "disabled" };
+    if (path === "/api/check_for_updates") return { updateAvailable: false };
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const updateTimers = () => fixture.activeTimers().filter((timer) => timer.delay === 30 * 60 * 1000);
+  assert.equal(updateTimers().length, 0);
+  assert.equal(calls.includes("/api/check_for_updates"), false);
+
+  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: true } } });
+  for (const timer of fixture.activeTimers().filter((timer) => timer.delay === 0)) {
+    timer.cleared = true;
+    timer.callback();
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.filter((path) => path === "/api/check_for_updates").length, 1);
+  assert.equal(updateTimers().length, 1);
+
+  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
+  assert.equal(updateTimers().length, 0);
+  fixture.window.dispatchEvent({ type: "codey:config-changed" });
+  assert.equal(updateTimers().length, 0);
+  fixture.window.dispatchEvent({ type: "codey-update-availability-changed", detail: { updateAvailable: true, latestVersion: "2.0.0" } });
+  assert.equal(fixture.document.getElementById("codey-settings-button").getAttribute("data-codey-update-available"), "true");
+});
+
+test("disabling renderer automatic checks ignores an in-flight update response", async () => {
+  let resolveUpdate;
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { autoCheckCodeyUpdates: true };
+    if (path === "/backend/health") return { status: "ok" };
+    if (path === "/api/check_for_updates") return new Promise((resolve) => { resolveUpdate = resolve; });
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const timer = fixture.activeTimers().find((entry) => entry.delay === 30 * 60 * 1000);
+  assert.ok(timer);
+  timer.cleared = true;
+  timer.callback();
+  assert.equal(typeof resolveUpdate, "function");
+  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
+  resolveUpdate({ updateAvailable: true, latestVersion: "2.0.0" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.window.__codeyUpdateAvailability, null);
+  assert.equal(fixture.activeTimers().some((entry) => entry.delay === 30 * 60 * 1000), false);
 });
 
 test("marks the Codey icon unavailable after consecutive hung health checks and recovers", async () => {

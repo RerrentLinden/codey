@@ -74,6 +74,7 @@ if (import.meta.env.DEV) {
     };
     let previewConfig: Config = {
       settingsRevision: 0,
+      autoCheckCodeyUpdates: true,
       localRouterEnabled: true,
       routeRequestLog: {
         enabled: true,

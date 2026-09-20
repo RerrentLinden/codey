@@ -57,7 +57,7 @@ import type {
   PluginMarketplaceStatus,
   Profile,
 } from "./App.types";
-import { Badge, Button, Tooltip } from "./components/ui";
+import { Badge, Button, Switch, Tooltip } from "./components/ui";
 
 const Check = IconCheck;
 const extensionRequest: ExtensionTransport = request => invoke("codex_extensions", { request });
@@ -270,6 +270,7 @@ export function App({
     setNotice,
   });
   const {
+    automaticallyChecking,
     updateResult,
     updateCheck,
     downloadedUpdate,
@@ -279,6 +280,7 @@ export function App({
   } = useAppUpdates({
     embedded,
     configLoaded,
+    autoCheckCodeyUpdates: config?.autoCheckCodeyUpdates !== false,
     isBusy,
     setBusy,
     setNotice,
@@ -360,6 +362,24 @@ export function App({
   function editConfig(next: Config) {
     setConfig(next);
     setDirty(true);
+  }
+
+  function changeAutomaticUpdateChecks(enabled: boolean) {
+    if (!config || isBusy) return;
+    if (enabled) {
+      editConfig({ ...config, autoCheckCodeyUpdates: true });
+      return;
+    }
+    setConfirmation({
+      action: "disable-auto-update-check",
+      title: "关闭自动检查 Codey 更新？",
+      description: "关闭后，若 Codex 更新导致 Codey 插件无法启动，需要手动下载最新版插件包。",
+      confirmLabel: "确认关闭",
+      run: () => {
+        setConfig((current) => current ? { ...current, autoCheckCodeyUpdates: false } : current);
+        setDirty(true);
+      },
+    });
   }
 
   async function persist(next: Config) {
@@ -1205,7 +1225,7 @@ export function App({
   const hasUpdate =
     updateCheck?.updateAvailable === true &&
     Boolean(updateCheck.selectedAsset);
-  const isCheckingUpdate = busy === "check-update";
+  const isCheckingUpdate = busy === "check-update" || automaticallyChecking;
   const isDownloadingUpdate = busy === "download-update";
   const isInstallingUpdate = busy === "install-update";
   const updateTooltipText = downloadedUpdate
@@ -1387,6 +1407,16 @@ export function App({
                 {downloadedUpdate ? `v${downloadedUpdate.latestVersion} 已下载` : `v${updateCheck?.latestVersion} 可更新`}
               </span>
             )}
+            <div className="sidebar-auto-update">
+              <span id="codey-auto-update-label">自动检查 Codey 更新</span>
+              <Switch
+                size="sm"
+                aria-labelledby="codey-auto-update-label"
+                checked={config.autoCheckCodeyUpdates !== false}
+                disabled={isBusy}
+                onCheckedChange={changeAutomaticUpdateChecks}
+              />
+            </div>
           </div>
         }
         sections={{

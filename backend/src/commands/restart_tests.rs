@@ -1059,6 +1059,12 @@ async fn runtime_status_exposes_cached_available_update() {
     assert_eq!(status["availableUpdate"]["currentVersion"], "1.0.0");
     assert_eq!(status["availableUpdate"]["latestVersion"], "2.0.0");
     assert_eq!(status["availableUpdate"]["updateAvailable"], true);
+    assert_eq!(status["autoCheckCodeyUpdates"], true);
+    state.config.write().await.auto_check_codey_updates = false;
+    assert_eq!(
+        runtime_status(&state).await.unwrap()["autoCheckCodeyUpdates"],
+        false
+    );
 }
 
 #[test]
