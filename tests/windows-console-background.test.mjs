@@ -129,7 +129,7 @@ test("Windows source contract: updates use the detached native helper", async ()
   // 反复回到旧版本。
   assert.match(
     updateHelper,
-    /match outcome \{[\s\S]*?Ok\(UpdateInstallOutcome::Updated\)[\s\S]*?restart_codey\(invocation, &log_path\)/,
+    /match outcome \{[\s\S]*?Ok\(UpdateInstallOutcome::Updated\s*\|\s*UpdateInstallOutcome::Failed\)[\s\S]*?restart_codey\(invocation, &log_path\)/,
   );
   assert.match(
     updateHelper,
