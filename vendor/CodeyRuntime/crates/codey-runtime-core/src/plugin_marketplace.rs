@@ -575,21 +575,21 @@ fn merge_marketplace_configs_and_plugins_into_text(
     let mut doc = parse_toml_document(config_text)?;
     let marketplaces = table_mut_or_insert(&mut doc, "marketplaces")?;
     for marketplace_name in marketplace_names {
-        if *marketplace_name == CODEY_CURATED_MARKETPLACE {
-            if let Some(entry) = marketplaces.get(marketplace_name) {
-                anyhow::ensure!(
-                    entry.as_table_like().is_some_and(|table| {
-                        table.get("source_type").and_then(Item::as_str) == Some("local")
-                            && table
-                                .get("source")
-                                .and_then(Item::as_str)
-                                .is_some_and(|source| {
-                                    managed_marketplace_path_matches(source, marketplace_root)
-                                })
-                    }),
-                    "codey-curated is registered to a custom source; existing registration was preserved"
-                );
-            }
+        if *marketplace_name == CODEY_CURATED_MARKETPLACE
+            && let Some(entry) = marketplaces.get(marketplace_name)
+        {
+            anyhow::ensure!(
+                entry.as_table_like().is_some_and(|table| {
+                    table.get("source_type").and_then(Item::as_str) == Some("local")
+                        && table
+                            .get("source")
+                            .and_then(Item::as_str)
+                            .is_some_and(|source| {
+                                managed_marketplace_path_matches(source, marketplace_root)
+                            })
+                }),
+                "codey-curated is registered to a custom source; existing registration was preserved"
+            );
         }
         if marketplaces
             .get(marketplace_name)
