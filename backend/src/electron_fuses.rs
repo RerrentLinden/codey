@@ -738,8 +738,7 @@ const NODE_OPTIONS_AUTO_REPAIR_DIR: &str = "node-options-auto-repair";
 /// record stable while the install path itself does not change.
 #[cfg(windows)]
 fn runtime_key(binary: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(binary.to_string_lossy().as_bytes()))
+    crate::fs_util::sha256_hex_str(&binary.to_string_lossy())
 }
 
 /// Canonical runtime that carries the fuse wire together with its backup file.

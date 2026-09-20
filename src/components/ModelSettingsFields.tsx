@@ -3,6 +3,10 @@ import { IconChevronRight } from "@tabler/icons-react";
 
 import type { ModelContextConfig, ModelReasoningEffort } from "../App.types";
 import {
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  MAX_CONTEXT_WINDOW_TOKENS,
+} from "../modelContextPresets";
+import {
   MODEL_REASONING_EFFORT_COLUMNS,
   MODEL_REASONING_EFFORT_LEVELS,
   normalizeReasoningEfforts,
@@ -88,7 +92,7 @@ export function ModelSettingsFields({
       <div className="mt-1.5 rounded-[9px] border border-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.08] bg-[var(--codey-surface-sunken,#f8f8fa)] p-3 shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
         <div className="mb-2.5 flex items-start justify-between gap-2">
           <p className="text-[11px] leading-[1.45] text-[var(--codey-muted,#6e6e73)]">
-            自定义值优先于上游模板；清空窗口恢复默认。未知模型默认使用 200000 Token 保守预算，不代表服务端容量。窗口与压缩阈值的修改需重启 Codex 生效。
+            自定义值优先于上游模板；清空窗口恢复默认。未知模型默认使用 {DEFAULT_CONTEXT_WINDOW_TOKENS} Token 保守预算，不代表服务端容量。窗口与压缩阈值的修改需重启 Codex 生效。
           </p>
           {policy && (
             <button
@@ -134,7 +138,7 @@ export function ModelSettingsFields({
               <Input
                 type="number"
                 min={min}
-                max={10_000_000}
+                max={MAX_CONTEXT_WINDOW_TOKENS}
                 step={1}
                 disabled={disabled}
                 className="h-7 rounded-md border-[rgb(var(--codey-ink-rgb,0,0,0))]/10 bg-[var(--codey-surface,#fff)] text-xs focus:border-[var(--codey-blue,#007aff)]"
@@ -144,7 +148,7 @@ export function ModelSettingsFields({
                 onChange={(event) => {
                   const raw = event.target.value;
                   onChange({
-                    contextWindowTokens: 200000,
+                    contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
                     ...policy,
                     [field]: raw === "" ? undefined : Number(raw),
                   });

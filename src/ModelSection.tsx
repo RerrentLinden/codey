@@ -6,6 +6,7 @@ import {
   IconEdit as Edit,
   IconEye,
   IconEyeOff,
+  IconFileText,
   IconGripVertical,
   IconHelpCircle,
   IconInfoCircle,
@@ -35,7 +36,6 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
-  Link,
   NumberInput,
   PasswordInput,
   Select,
@@ -283,6 +283,12 @@ function ModelSectionComponent({
     },
     [onOfficialAccountsChanged],
   );
+
+  // 账号面板只在开启本地路由时挂载，只读模式下线路卡片仍要显示所属账号邮箱。
+  useEffect(() => {
+    if (!routeConfigReadOnly) return;
+    void refreshOfficialAccounts();
+  }, [refreshOfficialAccounts, routeConfigReadOnly]);
 
   const defaultOfficialAccount = useMemo(
     () => officialAccounts?.find((account) => account.isDefault) ?? null,
@@ -683,17 +689,6 @@ function ModelSectionComponent({
           : "统一管理供应商线路与模型目录"}
         actions={
           <div className="route-header-controls">
-            <Button
-              color="primary"
-              variant="filled"
-              size="sm"
-              onClick={(event) => {
-                if (event.currentTarget instanceof HTMLElement) onOpenUsageAnalysis(event.currentTarget);
-              }}
-            >
-              <IconChartDonut size={14} aria-hidden="true" />
-              <span>用量分析</span>
-            </Button>
             <div className="route-header-switch-item">
               <span className="route-header-switch-label">本地路由</span>
               <Switch
@@ -707,22 +702,38 @@ function ModelSectionComponent({
             {config.localRouterEnabled && (
               <>
                 <span className="route-header-divider" aria-hidden="true" />
-                <div className="route-header-log-col">
-                  <div className="route-header-switch-item">
-                    <span className="route-header-switch-label">日志记录</span>
-                    <Switch
-                      size="sm"
-                      checked={config.routeRequestLog.enabled}
-                      disabled={isBusy}
-                      onCheckedChange={onToggleRouteRequestLog}
-                      aria-label="开启请求日志记录"
-                    />
-                  </div>
-                  <Link
-                    onPress={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
+                <div className="route-header-switch-item">
+                  <span className="route-header-switch-label">日志记录</span>
+                  <Switch
+                    size="sm"
+                    checked={config.routeRequestLog.enabled}
+                    disabled={isBusy}
+                    onCheckedChange={onToggleRouteRequestLog}
+                    aria-label="开启请求日志记录"
+                  />
+                </div>
+                <span className="route-header-divider" aria-hidden="true" />
+                <div className="route-header-btn-group">
+                  <Button
+                    color="primary"
+                    variant="filled"
+                    size="sm"
+                    onClick={(event) => {
+                      if (event.currentTarget instanceof HTMLElement) onOpenUsageAnalysis(event.currentTarget);
+                    }}
                   >
-                    查看请求日志
-                  </Link>
+                    <IconChartDonut size={14} aria-hidden="true" />
+                    <span>用量分析</span>
+                  </Button>
+                  <Button
+                    color="primary"
+                    variant="filled"
+                    size="sm"
+                    onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
+                  >
+                    <IconFileText size={14} aria-hidden="true" />
+                    <span>查看请求日志</span>
+                  </Button>
                 </div>
               </>
             )}
@@ -733,16 +744,18 @@ function ModelSectionComponent({
       <div className="route-content">
         <div className={`route-manager${routeConfigReadOnly ? " route-manager-current" : ""}`}>
           <div className="route-catalog-pane">
-            <OfficialAccountsPanel
-              officialAccountAvailable={officialAccountAvailable}
-              isBusy={isBusy}
-              maskSensitive={maskSensitive}
-              popupContainer={popupContainer}
-              onAccountsLoaded={setOfficialAccounts}
-              onAccountsChanged={handleOfficialAccountsChanged}
-              onNotice={onNotice}
-              onRequestConfirmation={onRequestConfirmation}
-            />
+            {!routeConfigReadOnly && (
+              <OfficialAccountsPanel
+                officialAccountAvailable={officialAccountAvailable}
+                isBusy={isBusy}
+                maskSensitive={maskSensitive}
+                popupContainer={popupContainer}
+                onAccountsLoaded={setOfficialAccounts}
+                onAccountsChanged={handleOfficialAccountsChanged}
+                onNotice={onNotice}
+                onRequestConfirmation={onRequestConfirmation}
+              />
+            )}
 
             <div className="catalog-aggregate-heading">
               <div className="catalog-aggregate-title-wrap">

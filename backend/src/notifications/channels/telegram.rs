@@ -2,7 +2,7 @@ use anyhow::Result;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
-use super::{NotificationChannelAdapter, bounded_remote_message};
+use super::{NotificationChannelAdapter, bounded_remote_message, redact_secret};
 use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
@@ -43,12 +43,7 @@ impl NotificationChannelAdapter for TelegramChannel<'_> {
     }
 
     fn sanitize_error(&self, error: &str) -> String {
-        let token = self.config.bot_token.trim();
-        if token.is_empty() {
-            error.to_string()
-        } else {
-            error.replace(token, "***")
-        }
+        redact_secret(error, &self.config.bot_token)
     }
 }
 

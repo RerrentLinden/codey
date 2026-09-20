@@ -1145,8 +1145,8 @@ export function App({
     setNotice({
       tone: "info",
       text: checked
-        ? "保存并重启 Codex 后启用本地路由"
-        : "保存并重启 Codex 后关闭本地路由；线路配置将保持只读",
+        ? "保存并重启 Codex 后开启本地路由"
+        : "保存并重启 Codex 后关闭本地路由",
     });
   });
   const handleToggleRouteRequestLog = useStableEvent((checked: boolean) => {
@@ -1162,8 +1162,8 @@ export function App({
     setNotice({
       tone: "info",
       text: checked
-        ? "保存后将实时开启请求日志记录，无需重启 Codex"
-        : "保存后将实时关闭请求日志记录，无需重启 Codex；历史日志仍可查看",
+        ? "保存后开启日志记录，无需重启"
+        : "保存后关闭日志记录，无需重启",
     });
   });
   const handleOfficialAccountsChanged = useStableEvent(

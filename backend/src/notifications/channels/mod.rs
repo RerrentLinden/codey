@@ -26,6 +26,27 @@ pub(super) trait NotificationChannelAdapter: Send + Sync {
     fn sanitize_error(&self, error: &str) -> String;
 }
 
+pub(super) fn redact_secret(error: &str, secret: &str) -> String {
+    let secret = secret.trim();
+    if secret.is_empty() {
+        error.to_string()
+    } else {
+        error.replace(secret, "***")
+    }
+}
+
+pub(super) fn redact_url(error: &str, url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return error.to_string();
+    }
+    let mut sanitized = error.replace(url, "***");
+    if let Ok(normalized) = reqwest::Url::parse(url) {
+        sanitized = sanitized.replace(normalized.as_str(), "***");
+    }
+    sanitized
+}
+
 pub(super) fn bounded_remote_message(message: &str) -> String {
     let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let truncated = normalized.chars().take(200).collect::<String>();
@@ -47,5 +68,29 @@ pub(super) fn adapter_for(
             Box::new(wechat_claw::WechatClawChannel::new(config))
         }
         NotificationChannelKind::Ntfy => Box::new(ntfy::NtfyChannel::new(config)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{redact_secret, redact_url};
+
+    #[test]
+    fn empty_secret_does_not_expand_error_text() {
+        assert_eq!(redact_secret("normal error", ""), "normal error");
+        assert_eq!(redact_secret("normal error", "   "), "normal error");
+        assert_eq!(redact_url("normal error", ""), "normal error");
+        assert_eq!(redact_url("normal error", "   "), "normal error");
+    }
+
+    #[test]
+    fn redact_url_replaces_raw_and_normalized_forms() {
+        let error = redact_url(
+            "request to https://open.feishu.cn/open-apis/bot/v2/hook/secret?sign=private failed",
+            "https://open.feishu.cn/open-apis/bot/v2/hook/secret?sign=private",
+        );
+        assert!(!error.contains("hook/secret"));
+        assert!(!error.contains("sign=private"));
+        assert!(error.contains("***"));
     }
 }

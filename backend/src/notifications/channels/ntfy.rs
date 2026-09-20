@@ -2,7 +2,7 @@ use anyhow::Result;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
-use super::{NotificationChannelAdapter, bounded_remote_message};
+use super::{NotificationChannelAdapter, bounded_remote_message, redact_secret};
 use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
@@ -47,16 +47,10 @@ impl NotificationChannelAdapter for NtfyChannel<'_> {
     }
 
     fn sanitize_error(&self, error: &str) -> String {
-        let mut sanitized = error.to_string();
-        let url = self.config.url.trim();
-        if !url.is_empty() {
-            sanitized = sanitized.replace(url, "***");
-        }
-        let token = self.config.bot_token.trim();
-        if !token.is_empty() {
-            sanitized = sanitized.replace(token, "***");
-        }
-        sanitized
+        redact_secret(
+            &redact_secret(error, &self.config.url),
+            &self.config.bot_token,
+        )
     }
 }
 

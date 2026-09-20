@@ -5,7 +5,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{NotificationChannelAdapter, bounded_remote_message};
+use super::{NotificationChannelAdapter, bounded_remote_message, redact_secret, redact_url};
 use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
 use crate::notifications::ilink;
 use crate::notifications::{
@@ -83,24 +83,13 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
     }
 
     fn sanitize_error(&self, error: &str) -> String {
-        let token = self.config.bot_token.trim();
-        let mut sanitized = if token.is_empty() {
-            error.to_string()
-        } else {
-            error.replace(token, "***")
-        };
-        let context_token = self.config.context_token.trim();
-        if !context_token.is_empty() {
-            sanitized = sanitized.replace(context_token, "***");
-        }
-        let url = self.config.url.trim();
-        if !url.is_empty() {
-            sanitized = sanitized.replace(url, "***");
-            if let Ok(normalized) = reqwest::Url::parse(url) {
-                sanitized = sanitized.replace(normalized.as_str(), "***");
-            }
-        }
-        sanitized
+        redact_url(
+            &redact_secret(
+                &redact_secret(error, &self.config.bot_token),
+                &self.config.context_token,
+            ),
+            &self.config.url,
+        )
     }
 }
 

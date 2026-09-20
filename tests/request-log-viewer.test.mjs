@@ -77,7 +77,7 @@ test("request log controls are scoped to built-in routing and preserve logger se
   assert.match(app, /enabled: checked/);
   assert.match(app, /checked \? \{ backend: "sqlite" as const \} : \{\}/);
   assert.match(app, /请求日志记录已实时开启，无需重启/);
-  assert.match(app, /保存后将实时关闭请求日志记录，无需重启 Codex/);
+  assert.match(app, /保存后关闭日志记录，无需重启/);
   assert.match(modelSection, /\{config\.localRouterEnabled && \([\s\S]*(开启)?日志记录/);
   assert.match(modelSection, /aria-label="开启请求日志记录"/);
   assert.match(modelSection, /查看请求日志/);

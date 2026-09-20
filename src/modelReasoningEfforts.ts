@@ -16,7 +16,6 @@ export const MODEL_REASONING_EFFORT_COLUMNS: readonly (readonly string[])[] = [
   MODEL_REASONING_EFFORT_LEVELS.filter((_, index) => index % 2 === 1),
 ];
 
-export const MAX_MODEL_REASONING_EFFORTS = MODEL_REASONING_EFFORT_LEVELS.length;
 export const MAX_MODEL_REASONING_EFFORT_VALUE_BYTES = 32;
 
 const valueEncoder = new TextEncoder();

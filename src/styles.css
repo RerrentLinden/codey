@@ -425,7 +425,7 @@ button,
 
 .settings-layout {
   display: grid;
-  grid-template-columns: 208px minmax(0, 1fr);
+  grid-template-columns: 168px minmax(0, 1fr);
   flex: 1;
   min-height: 0;
   overflow: hidden;
@@ -454,7 +454,7 @@ button,
 .settings-sidebar-footer {
   flex: none;
   margin-top: 16px;
-  padding: 14px 6px 0;
+  padding: 14px 4px 0;
   border-top: 1px solid var(--codey-border-subtle);
 }
 
@@ -462,8 +462,8 @@ button,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 2px 2px;
+  gap: 6px;
+  padding: 2px 0;
 }
 
 .sidebar-footer-left {
@@ -582,8 +582,15 @@ button,
   font-weight: 500;
   line-height: 1.4;
   text-align: left;
+  white-space: nowrap;
   cursor: pointer;
   transition: all 120ms ease;
+}
+
+.settings-nav-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settings-nav-item svg {

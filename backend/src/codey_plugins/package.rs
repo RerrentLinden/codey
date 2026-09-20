@@ -1,6 +1,5 @@
 use super::Manifest;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
@@ -26,7 +25,7 @@ pub struct Package {
 }
 
 pub fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::fs_util::sha256_hex(bytes)
 }
 
 pub fn safe_relative(path: &str) -> bool {

@@ -2,7 +2,7 @@ use anyhow::Result;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
-use super::{NotificationChannelAdapter, bounded_remote_message};
+use super::{NotificationChannelAdapter, bounded_remote_message, redact_url};
 use crate::notifications::formatting::{format_duration, format_timestamp, markdown_text_value};
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
@@ -42,16 +42,7 @@ impl NotificationChannelAdapter for FeishuChannel<'_> {
     }
 
     fn sanitize_error(&self, error: &str) -> String {
-        let url = self.config.url.trim();
-        if url.is_empty() {
-            return error.to_string();
-        }
-
-        let mut sanitized = error.replace(url, "***");
-        if let Ok(normalized) = reqwest::Url::parse(url) {
-            sanitized = sanitized.replace(normalized.as_str(), "***");
-        }
-        sanitized
+        redact_url(error, &self.config.url)
     }
 }
 
