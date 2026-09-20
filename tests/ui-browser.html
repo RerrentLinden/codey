@@ -26,7 +26,52 @@
         ] };
       };
     }
-    if (view === "logs" || view === "quota") {
+    if (view === "usage") {
+      await import("../src/tailwind.css");
+      await import("../src/styles.css");
+      const scenario = new URLSearchParams(location.search).get("state");
+      window.__codeyInvokeApi = async (command, args) => {
+        if (command !== "query_route_request_log_stats") return mock(command, args);
+        if (scenario === "error") throw new Error("测试：统计服务暂不可用");
+        if (scenario === "loading") return new Promise(() => {});
+        if (scenario === "unavailable") return { queryable: false, reason: "ndjson_not_queryable" };
+        const result = await mock(command, args);
+        if (scenario === "calendar") {
+          // Explicit daily fixtures, independent from the coarser histogram buckets.
+          const dayMs = 86400000;
+          if (args.allTime) result.fromUnixMs = Date.UTC(new Date(result.toUnixMs).getUTCFullYear() - 2, 0, 1);
+          result.dailyTrend = [];
+          for (let day = Math.floor(result.fromUnixMs / dayMs) * dayMs, index = 0; day < result.toUnixMs; day += dayMs, index++) {
+            if (index % 6 === 0) continue;
+            result.dailyTrend.push({ timestampUnixMs: day, total: 4, totalTokensKnownCount: index % 9 === 0 ? 0 : index % 7 === 0 ? 3 : 4, totalTokensSum: index % 9 === 0 ? null : index % 8 === 0 ? 0 : (index % 5 + 1) ** 2 * 12345 });
+          }
+        }
+        if (scenario === "legacy") delete result.dailyTrend;
+        if (scenario === "empty") return { ...result, total: 0, groups: [], trend: [] };
+        if (scenario === "recording-off") result.recordingHealth = { ...result.recordingHealth, enabled: false, active: false };
+        if (scenario === "unknown") {
+          result.totalTokensSum = result.inputTokensSum = result.outputTokensSum = result.cachedTokensSum = null;
+          result.totalTokensKnownCount = 0;
+          result.groups = result.groups.map((group) => ({ ...group, totalTokensSum: null }));
+          result.trend = result.trend.map((bucket) => ({ ...bucket, totalTokensSum: null }));
+          result.dailyTrend = result.dailyTrend?.map((bucket) => ({ ...bucket, totalTokensSum: null, totalTokensKnownCount: 0 }));
+        }
+        if (scenario === "many") {
+          result.total = 600;
+          result.totalTokensKnownCount = 520;
+          result.totalTokensSum = 90000000;
+          result.groupsTruncated = true;
+          result.groups = Array.from({ length: 50 }, (_, index) => ({ ...result, groups: undefined, trend: undefined, key: `gpt-model-${index}-very-long-model-name-for-responsive-layout-${"long".repeat(10)}`, total: 10, totalTokensSum: (50 - index) * 50000 }));
+          result.recordingHealth.sampleRatePerMillion = 500000;
+        }
+        return result;
+      };
+      const { UsageAnalysisPanel } = await import("../src/UsageAnalysisPanel.tsx");
+      createRoot(document.getElementById("root")).render(React.createElement(UiProvider, null,
+        React.createElement("main", { className: "app-shell" },
+          React.createElement("div", { className: "page-scroll" },
+            React.createElement(UsageAnalysisPanel, { onBack() { location.href = new URL("ui-browser.html", location.href).href; } })))));
+    } else if (view === "logs" || view === "quota") {
       const { installRequestLogTheme } = await import("../src/requestLogTheme.ts");
       installRequestLogTheme();
       await import("../src/tailwind.css");
