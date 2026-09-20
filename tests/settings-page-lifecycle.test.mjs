@@ -7,7 +7,7 @@ const source = await readFile(new URL("../src/SettingsLayout.tsx", import.meta.u
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
 }).outputText;
-const pages = ["overview", "models", "prompt", "subagents", "plugins"];
+const pages = ["overview", "models", "prompt", "subagents", "plugins", "mcp", "skills"];
 
 // 与现有组件测试一样，用轻量 hook/组件身份模型验证生命周期，无需 DOM 或新增依赖。
 function layoutHarness() {
@@ -123,4 +123,20 @@ test("first visits mount once and preserve drafts, expansion and late results ac
   }
   assert.deepEqual(harness.mounts, pages);
   assert.deepEqual(harness.unmounts, []);
+});
+
+test("visited render callbacks receive active=false while hidden and latest active=true on return", () => {
+  const harness = layoutHarness();
+  harness.select("mcp");
+  assert.equal(harness.page("mcp").active, true);
+  assert.equal(harness.page("skills"), undefined);
+  harness.select("skills");
+  assert.equal(harness.page("mcp").active, false);
+  assert.equal(harness.page("skills").active, true);
+  harness.select("overview");
+  assert.equal(harness.page("mcp").active, false);
+  assert.equal(harness.page("skills").active, false);
+  harness.select("mcp");
+  assert.equal(harness.page("mcp").active, true);
+  assert.equal(harness.page("skills").active, false);
 });

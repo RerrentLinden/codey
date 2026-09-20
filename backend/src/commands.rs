@@ -13,6 +13,7 @@ use std::time::Duration;
 
 mod config_repair;
 mod diagnostics;
+mod extensions;
 mod models;
 mod native_plugins;
 mod official_accounts;
@@ -1335,6 +1336,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "plugin_marketplace_status" => plugin_marketplace_status().await,
+        "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
         "list_codey_plugins" => native_plugins::invoke(command, &args).await,
         "get_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,

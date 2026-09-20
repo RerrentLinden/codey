@@ -3,6 +3,7 @@
 // module never ships in the production overlay.
 import type { ProviderStatus, Config, ModelState, OfficialAccount, Profile } from "../App.types";
 import { pluginConfigBusinessValuesEqual, validatePluginConfigText } from "../codeyPlugins";
+import { createCodexExtensionsPreview } from "./codexExtensionsMock";
 import {
   AUTO_REVIEW_MODEL,
   includesModelId,
@@ -510,10 +511,13 @@ if (import.meta.env.DEV) {
     let pluginConfigContent = pluginPreviewMode === "config-invalid" ? '{ "value": ' : '{\n  "value": "demo"\n}\n';
     let activePluginConfigContent: string | null = null;
     const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
+    const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
       await new Promise((resolve) => setTimeout(resolve, 300));
+
+      if (command === "codex_extensions") return extensionsPreview(args?.request as Record<string, unknown>);
 
       if (command === "list_codey_plugins") {
         const pluginPreview = new URLSearchParams(window.location.search).get("plugins");

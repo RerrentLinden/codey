@@ -29,6 +29,7 @@ bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 codey-runtime-core = { path = "../vendor/CodeyRuntime/crates/codey-runtime-core" }
 codey-plugin-sdk = { path = "../crates/codey-plugin-sdk" }
+codey-codex-extensions = { path = "../crates/codey-codex-extensions" }
 libloading = "0.8"
 zip.workspace = true
 tempfile.workspace = true
@@ -78,6 +79,8 @@ windows = { version = "0.58", default-features = false, features = [
   "Win32_System_Com",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
+  "Win32_System_JobObjects",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

@@ -50,6 +50,7 @@ export const CODEY_API_COMMANDS = [
   "save_codey_plugin_config_file",
   "uninstall_codey_plugin",
   "invoke_codey_plugin",
+  "codex_extensions",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];

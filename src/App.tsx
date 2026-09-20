@@ -18,6 +18,7 @@ import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
 import { OperationsPanel } from "./OperationsPanel";
 import { CodeyPluginsSection } from "./CodeyPluginsSection";
+import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
 import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
 import { repairOperationResult } from "./injectionRepair";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
@@ -59,6 +60,7 @@ import type {
 import { Badge, Button, Tooltip } from "./components/ui";
 
 const Check = IconCheck;
+const extensionRequest: ExtensionTransport = request => invoke("codex_extensions", { request });
 const X = IconX;
 const FEEDBACK_GROUP_QR_BASE_URL =
   "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.png";
@@ -1475,6 +1477,12 @@ export function App({
             />
           ),
           plugins: <CodeyPluginsSection container={popupContainer} />,
+          mcp: (active) => (
+            <CodexExtensionsPage kind="mcp" active={active} request={extensionRequest} container={popupContainer} />
+          ),
+          skills: (active) => (
+            <CodexExtensionsPage kind="skill" active={active} request={extensionRequest} container={popupContainer} />
+          ),
         }}
       />
 
