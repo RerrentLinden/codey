@@ -1197,7 +1197,13 @@ async fn inject_initial_renderer(
     child: &Arc<Mutex<Option<Child>>>,
     restore_context: RuntimeConfigRestoreContext<'_>,
 ) -> Result<cdp::InjectedTarget> {
-    let failure = match cdp::retry_inject_with_scripts(debug_port, handler, injection_scripts).await
+    let failure = match cdp::retry_inject_with_scripts(
+        debug_port,
+        handler,
+        injection_scripts,
+        cdp::InjectionRetrySource::Startup,
+    )
+    .await
     {
         Ok(target) => return Ok(target),
         Err(failure) => failure,
@@ -1376,6 +1382,7 @@ fn spawn_injection_watchdog(
                     debug_port,
                     handler.clone(),
                     &watchdog_scripts,
+                    cdp::InjectionRetrySource::Watchdog,
                 ) => result,
             };
             match reinjection {

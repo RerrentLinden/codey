@@ -23,6 +23,9 @@ const INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 // 退避，避免在 Codex 冷启动的 CPU 高峰窗口里叠加负担。
 const DISCOVERY_RETRY_STEP: Duration = Duration::from_millis(50);
 const DISCOVERY_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(200);
+// 发现阶段单次失败超过这个预算就不再算廉价探测：正常情况是一次被拒绝或返回空
+// 列表的 loopback 请求，远低于此值。
+const DISCOVERY_RETRY_COST_BUDGET: Duration = Duration::from_millis(100);
 const BRIDGE_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(500);
 const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -90,6 +93,23 @@ impl InjectionPhase {
     /// 用更短的间隔重试。
     fn is_discovery(self) -> bool {
         matches!(self, Self::DiscoverTargets | Self::SelectTarget)
+    }
+}
+
+/// 触发这一轮注入重试的入口：首次启动等待渲染进程就绪，与看门狗在运行期按
+/// 健康判定重建，失败画像的含义完全不同，日志里必须能分开。
+#[derive(Clone, Copy)]
+pub enum InjectionRetrySource {
+    Startup,
+    Watchdog,
+}
+
+impl InjectionRetrySource {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Watchdog => "watchdog",
+        }
     }
 }
 
@@ -447,6 +467,7 @@ pub async fn retry_inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
+    source: InjectionRetrySource,
 ) -> std::result::Result<InjectedTarget, InjectionRetryFailure> {
     // Renderer asset preparation on newer Windows Codex builds can consume
     // more than ten seconds before the first injectable page appears. Keep
@@ -469,14 +490,15 @@ pub async fn retry_inject_with_scripts(
         .await
         {
             Ok(Ok(target)) => {
-                stats.report("injected", started.elapsed());
+                stats.report(source, "injected", started.elapsed());
                 return Ok(target);
             }
             Ok(Err(error)) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
-                stats.record_failure(current_phase, attempt_started.elapsed());
+                let failure_cost = attempt_started.elapsed();
+                stats.record_failure(current_phase, failure_cost);
                 if tokio::time::Instant::now() + delay > deadline {
-                    stats.report("noRetryBudget", started.elapsed());
+                    stats.report(source, "noRetryBudget", started.elapsed());
                     break anyhow::anyhow!(
                         "Codex CDP bridge 注入失败（阶段：{}；{}）",
                         current_phase.label(),
@@ -485,11 +507,11 @@ pub async fn retry_inject_with_scripts(
                 }
                 previous_error = Some(safe_injection_error_summary(&error));
                 tokio::time::sleep(delay).await;
-                delay = next_injection_retry_delay(delay, current_phase);
+                delay = next_injection_retry_delay(delay, current_phase, failure_cost);
             }
             Err(_) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
-                stats.report("deadlineExceeded", started.elapsed());
+                stats.report(source, "deadlineExceeded", started.elapsed());
                 let previous_error = previous_error
                     .as_deref()
                     .map(|error| format!("；最近一次失败：{error}"))
@@ -506,11 +528,18 @@ pub async fn retry_inject_with_scripts(
     Err(InjectionRetryFailure { error: last_error })
 }
 
-/// 下一次重试前的等待时长。发现与选择阶段的失败没有 CDP 副作用，也不触碰
-/// renderer，用小步长逼近 renderer 就绪即可；桥接及之后的阶段每次失败都会重建
-/// WebSocket 并重复注册持久脚本，沿用原来的指数退避。
-fn next_injection_retry_delay(current: Duration, phase: InjectionPhase) -> Duration {
-    if phase.is_discovery() {
+/// 下一次重试前的等待时长。发现与选择阶段的失败通常只付一次 loopback 请求的
+/// 代价，既不触碰 renderer 也不留 CDP 副作用，用小步长逼近 renderer 就绪即可。
+/// 但同一阶段的失败也可能突然变贵（例如调试端口被别的服务占用而让请求挂到
+/// 超时），因此还要看刚结束的那次失败的实付代价：一旦不再廉价就立刻退回保守
+/// 退避。桥接及之后的阶段每次失败都会重建 WebSocket 并重复注册持久脚本，无论
+/// 代价高低都沿用原来的指数退避。
+fn next_injection_retry_delay(
+    current: Duration,
+    phase: InjectionPhase,
+    last_failure_cost: Duration,
+) -> Duration {
+    if phase.is_discovery() && last_failure_cost <= DISCOVERY_RETRY_COST_BUDGET {
         return (current + DISCOVERY_RETRY_STEP).min(DISCOVERY_RETRY_MAX_INTERVAL);
     }
     (current * 2).min(BRIDGE_RETRY_MAX_INTERVAL)
@@ -538,10 +567,11 @@ impl InjectionRetryStats {
         self.last_failure_phase = Some(phase);
     }
 
-    fn report(&self, outcome: &str, elapsed: Duration) {
+    fn report(&self, source: InjectionRetrySource, outcome: &str, elapsed: Duration) {
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "cdp.injection_retry_summary",
             serde_json::json!({
+                "source": source.key(),
                 "outcome": outcome,
                 "attempts": self.attempts,
                 "discoveryFailures": self.discovery_failures,
@@ -1516,6 +1546,148 @@ assert.equal(nextPage.window.attempts, 1);
     #[test]
     fn injection_deadline_leaves_time_for_slow_windows_renderer_startup() {
         assert_eq!(CDP_INJECTION_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// 按给定阶段的退避节奏推导探测时刻（毫秒），首项为立即执行的第一次探测。
+    fn probe_times(phase: InjectionPhase, count: usize) -> Vec<u64> {
+        let mut delay = INITIAL_RETRY_INTERVAL;
+        let mut elapsed = 0u64;
+        let mut probes = vec![0];
+        for _ in 0..count {
+            elapsed += delay.as_millis() as u64;
+            probes.push(elapsed);
+            delay = next_injection_retry_delay(delay, phase, Duration::from_millis(1));
+        }
+        probes
+    }
+
+    #[test]
+    fn discovery_retry_stays_dense_while_probes_stay_cheap() {
+        assert_eq!(
+            probe_times(InjectionPhase::DiscoverTargets, 5),
+            vec![0, 100, 250, 450, 650, 850]
+        );
+        assert_eq!(
+            probe_times(InjectionPhase::SelectTarget, 5),
+            vec![0, 100, 250, 450, 650, 850]
+        );
+    }
+
+    #[test]
+    fn discovery_retry_never_exceeds_its_dense_ceiling() {
+        assert_eq!(
+            next_injection_retry_delay(
+                Duration::from_millis(500),
+                InjectionPhase::SelectTarget,
+                Duration::from_millis(1)
+            ),
+            DISCOVERY_RETRY_MAX_INTERVAL
+        );
+    }
+
+    #[test]
+    fn discovery_retry_falls_back_when_a_probe_stops_being_cheap() {
+        // 廉价失败：维持密集节奏。
+        assert_eq!(
+            next_injection_retry_delay(
+                INITIAL_RETRY_INTERVAL,
+                InjectionPhase::DiscoverTargets,
+                Duration::from_millis(8)
+            ),
+            Duration::from_millis(150)
+        );
+        // 同阶段但单次探测已花掉 900 ms，说明失败不再廉价（例如端口被别的
+        // 服务占用导致请求挂起），立刻退回指数退避而不是继续密集轮询。
+        assert_eq!(
+            next_injection_retry_delay(
+                Duration::from_millis(200),
+                InjectionPhase::DiscoverTargets,
+                Duration::from_millis(900)
+            ),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn bridge_retry_keeps_the_original_exponential_backoff() {
+        assert_eq!(
+            probe_times(InjectionPhase::InstallBridge, 6),
+            vec![0, 100, 300, 700, 1200, 1700, 2200]
+        );
+    }
+
+    #[test]
+    fn post_discovery_phases_ignore_the_dense_interval() {
+        for phase in [
+            InjectionPhase::InstallBridge,
+            InjectionPhase::VerifyOverlay,
+            InjectionPhase::ReadStatuses,
+        ] {
+            assert!(!phase.is_discovery());
+            assert_eq!(
+                next_injection_retry_delay(INITIAL_RETRY_INTERVAL, phase, Duration::from_millis(1)),
+                Duration::from_millis(200)
+            );
+        }
+    }
+
+    #[test]
+    fn dense_discovery_retry_probes_a_late_renderer_sooner() {
+        let legacy = probe_times(InjectionPhase::InstallBridge, 6);
+        let dense = probe_times(InjectionPhase::DiscoverTargets, 12);
+
+        // 旧节奏在 1200 ms 之后要等到 1700 ms 才再次探测。
+        assert_eq!(legacy[4], 1200);
+        assert_eq!(legacy[5], 1700);
+        // 新节奏在 1200~1700 ms 之间补出三个探测点，最多提前 450 ms 命中。
+        assert_eq!(
+            dense
+                .iter()
+                .copied()
+                .filter(|&t| t > 1200 && t < 1700)
+                .collect::<Vec<_>>(),
+            vec![1250, 1450, 1650]
+        );
+    }
+
+    #[test]
+    fn retry_stats_separate_cheap_discovery_failures_from_bridge_failures() {
+        let mut stats = InjectionRetryStats {
+            attempts: 5,
+            ..Default::default()
+        };
+        stats.record_failure(InjectionPhase::DiscoverTargets, Duration::from_millis(12));
+        stats.record_failure(InjectionPhase::SelectTarget, Duration::from_millis(18));
+        stats.record_failure(InjectionPhase::VerifyOverlay, Duration::from_millis(900));
+
+        assert_eq!(stats.attempts, 5);
+        assert_eq!(stats.discovery_failures, 2);
+        assert_eq!(stats.bridge_failures, 1);
+        assert_eq!(stats.failure_expense_ms, 930);
+        assert_eq!(
+            stats.last_failure_phase.map(InjectionPhase::key),
+            Some("verifyOverlay")
+        );
+    }
+
+    #[test]
+    fn retry_source_keys_separate_startup_from_watchdog_rebuilds() {
+        assert_eq!(InjectionRetrySource::Startup.key(), "startup");
+        assert_eq!(InjectionRetrySource::Watchdog.key(), "watchdog");
+    }
+
+    #[test]
+    fn injection_phase_keys_cover_every_variant() {
+        for (phase, key) in [
+            (InjectionPhase::DiscoverTargets, "discoverTargets"),
+            (InjectionPhase::SelectTarget, "selectTarget"),
+            (InjectionPhase::InstallBridge, "installBridge"),
+            (InjectionPhase::VerifyOverlay, "verifyOverlay"),
+            (InjectionPhase::ReadStatuses, "readStatuses"),
+        ] {
+            assert_eq!(phase.key(), key);
+            assert_eq!(InjectionPhase::from_raw(phase as u8) as u8, phase as u8);
+        }
     }
 
     #[test]
