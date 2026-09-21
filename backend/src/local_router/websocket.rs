@@ -639,6 +639,31 @@ impl WebSocketResponsesDownstream {
     }
 }
 
+/// 复用连接补 `stream_id` 时 flatten 原对象再追加字段，避免为 delta 事件整树 clone。
+/// 新键写在末尾，与 `Map::insert` 后再 `to_string` 的键序一致。
+fn encode_responses_websocket_event(event: &Value, stream_id: Option<&str>) -> Result<String> {
+    match stream_id {
+        Some(stream_id) => {
+            let object = event
+                .as_object()
+                .context("Responses WebSocket 事件必须是 JSON 对象")?;
+            serde_json::to_string(&EventWithInsertedStreamId {
+                event: object,
+                stream_id,
+            })
+            .context("序列化 Responses WebSocket 事件失败")
+        }
+        None => serde_json::to_string(event).context("序列化 Responses WebSocket 事件失败"),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EventWithInsertedStreamId<'a> {
+    #[serde(flatten)]
+    event: &'a serde_json::Map<String, Value>,
+    stream_id: &'a str,
+}
+
 pub(crate) fn responses_event_is_terminal(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
@@ -961,24 +986,14 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
             self.terminal_started = true;
             self.native_history.observe(event);
         }
-        let encoded = if self.event_needs_stream_id(event) {
-            let mut event = event.clone();
-            event
-                .as_object_mut()
-                .context("Responses WebSocket 事件必须是 JSON 对象")?
-                .insert(
-                    "stream_id".to_string(),
-                    Value::String(
-                        self.stream_id
-                            .as_deref()
-                            .expect("stream id must exist when insertion is required")
-                            .to_string(),
-                    ),
-                );
-            serde_json::to_string(&event).context("序列化 Responses WebSocket 事件失败")?
-        } else {
-            serde_json::to_string(event).context("序列化 Responses WebSocket 事件失败")?
-        };
+        let encoded = encode_responses_websocket_event(
+            event,
+            self.event_needs_stream_id(event).then(|| {
+                self.stream_id
+                    .as_deref()
+                    .expect("stream id must exist when insertion is required")
+            }),
+        )?;
         self.write_text(encoded).await
     }
 
@@ -1297,4 +1312,34 @@ pub(crate) async fn write_static_response(
     write_all_with_timeout(stream, header.as_bytes(), "写入请求日志页面响应头失败").await?;
     write_all_with_timeout(stream, body, "写入请求日志页面失败").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod encode_stream_id_tests {
+    use super::*;
+
+    #[test]
+    fn inserted_stream_id_matches_map_insert_key_order() {
+        let event = json!({
+            "delta": "x",
+            "type": "response.output_text.delta",
+        });
+        let encoded = encode_responses_websocket_event(&event, Some("main")).unwrap();
+        let mut cloned = event.clone();
+        cloned
+            .as_object_mut()
+            .unwrap()
+            .insert("stream_id".into(), Value::String("main".into()));
+        assert_eq!(encoded, serde_json::to_string(&cloned).unwrap());
+        assert!(encoded.contains("\"stream_id\":\"main\""));
+    }
+
+    #[test]
+    fn missing_stream_id_serializes_the_original_event() {
+        let event = json!({"type": "response.created"});
+        assert_eq!(
+            encode_responses_websocket_event(&event, None).unwrap(),
+            serde_json::to_string(&event).unwrap()
+        );
+    }
 }

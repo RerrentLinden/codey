@@ -2,7 +2,7 @@ use super::responses::format_upstream_headers;
 use super::*;
 use crate::codey_plugins::lifecycle::{
     LifecycleDecision, LifecycleError, LifecycleOutcome, LifecycleRequest, LifecycleResponse,
-    LifecycleStage,
+    LifecycleStage, has_plugins,
 };
 
 pub(super) fn apply_codey_plugin_header_patches(
@@ -53,6 +53,9 @@ pub(super) fn request_lifecycle(
     stream: bool,
     subagent: bool,
 ) -> LifecycleRequest {
+    if !has_plugins() {
+        return LifecycleRequest::inert();
+    }
     let upstream_account_id = headers
         .get(CHATGPT_ACCOUNT_ID_HEADER)
         .and_then(|v| v.to_str().ok());

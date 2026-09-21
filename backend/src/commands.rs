@@ -392,27 +392,27 @@ impl AppState {
                     .expect("CodeyConfig must be JSON-serializable")
             }
             "/codex-model-catalog" => {
-                let current_config = self.config.read().await.clone();
                 let runtime = self.runtime.lock().await.clone();
                 let applied_catalog_config = match runtime.as_ref() {
                     Some(runtime) => Some(runtime.applied_model_catalog_config().await),
                     None => None,
                 };
-                let current_config = runtime
-                    .as_ref()
-                    .filter(|runtime| {
-                        runtime
-                            .validate_subagent_route_hot_reload(&current_config)
-                            .is_err()
-                    })
-                    .and(applied_catalog_config.as_ref())
-                    .unwrap_or(&current_config);
-                let catalog_config = model_catalog_config_for_runtime(
-                    current_config,
-                    runtime.as_ref().map(|runtime| &runtime.applied_config),
-                    applied_catalog_config.as_ref(),
-                )
-                .clone();
+                let catalog_config = {
+                    let config = self.config.read().await;
+                    let current_config = runtime
+                        .as_ref()
+                        .filter(|runtime| {
+                            runtime.validate_subagent_route_hot_reload(&config).is_err()
+                        })
+                        .and(applied_catalog_config.as_ref())
+                        .unwrap_or(&config);
+                    model_catalog_config_for_runtime(
+                        current_config,
+                        runtime.as_ref().map(|runtime| &runtime.applied_config),
+                        applied_catalog_config.as_ref(),
+                    )
+                    .clone()
+                };
                 current_renderer_model_catalog_async(catalog_config)
                     .await
                     .unwrap_or_else(api_error_message)

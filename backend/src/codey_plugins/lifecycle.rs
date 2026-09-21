@@ -12,6 +12,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, timeout};
 
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +54,7 @@ pub(super) struct LifecyclePlugin {
     callback: Arc<Callback>,
     active: AtomicBool,
     busy: Arc<AtomicBool>,
+    waiters: Arc<Notify>,
     request_headers: Vec<String>,
     response_headers: Vec<String>,
     auth: bool,
@@ -73,6 +75,7 @@ impl LifecyclePlugin {
             }),
             active: AtomicBool::new(false),
             busy: Arc::new(AtomicBool::new(false)),
+            waiters: Arc::new(Notify::new()),
             request_headers: manifest.header_names.clone(),
             response_headers: manifest.response_header_names.clone(),
             auth: manifest.capabilities.iter().any(|s| s == AUTH_CAPABILITY),
@@ -95,6 +98,7 @@ impl LifecyclePlugin {
             .min(deadline.unwrap_or_else(|| Instant::now() + self.invoke_timeout));
         // 正常并发在异步任务中排队，只有拿到实例执行权才创建阻塞任务。
         // 排队和原生调用共用一次回调期限，挂起实例不会积累阻塞线程。
+        // 先订阅 Notify 再 CAS，避免实例刚释放时丢掉唤醒。
         let guard = loop {
             if !self.active.load(Ordering::Acquire) {
                 return Err(failure("plugin_disabled"));
@@ -103,10 +107,14 @@ impl LifecyclePlugin {
             if remaining.is_zero() {
                 return Err(failure("plugin_busy"));
             }
-            if let Some(guard) = BusyGuard::acquire(self.busy.clone()) {
+            let notified = self.waiters.notified();
+            if let Some(guard) = BusyGuard::acquire(self.busy.clone(), self.waiters.clone()) {
                 break guard;
             }
-            sleep(Duration::from_millis(5).min(remaining)).await;
+            tokio::select! {
+                _ = sleep(remaining) => return Err(failure("plugin_busy")),
+                _ = notified => {}
+            }
         };
         let plugin = self.clone();
         let mut task = tokio::task::spawn_blocking(move || {
@@ -117,7 +125,8 @@ impl LifecyclePlugin {
             (plugin.callback)(method, params)
         });
         let duration = call_deadline.saturating_duration_since(Instant::now());
-        // Poll only while this request is waiting; no global lifecycle polling task.
+        // 原生超时只能停止等待，不能杀掉阻塞回调。停用探测必须和实例 Notify 分开：
+        // 持有 BusyGuard 时不能再等同一把锁的唤醒，否则会抢走排队请求的许可。
         let result = timeout(duration, async {
             loop {
                 tokio::select! {
@@ -136,23 +145,37 @@ impl LifecyclePlugin {
     }
 }
 
-struct BusyGuard(Arc<AtomicBool>);
+struct BusyGuard {
+    busy: Arc<AtomicBool>,
+    waiters: Arc<Notify>,
+}
 impl BusyGuard {
-    fn acquire(busy: Arc<AtomicBool>) -> Option<Self> {
+    fn acquire(busy: Arc<AtomicBool>, waiters: Arc<Notify>) -> Option<Self> {
         busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| Self(busy))
+            .map(|_| Self { busy, waiters })
     }
 }
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.busy.store(false, Ordering::Release);
+        self.waiters.notify_one();
     }
 }
 
 static PLUGINS: OnceLock<arc_swap::ArcSwap<Vec<Arc<LifecyclePlugin>>>> = OnceLock::new();
 fn plugins() -> &'static arc_swap::ArcSwap<Vec<Arc<LifecyclePlugin>>> {
     PLUGINS.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// 与 [`LifecycleRequest::new`] 同一快照源：测试优先 `TEST_PLUGINS`，否则 ArcSwap。
+/// 空检查用 `load()` 而不是 `load_full()`，避免无插件热路径上的 Arc clone。
+pub(crate) fn has_plugins() -> bool {
+    #[cfg(test)]
+    if let Ok(active) = TEST_PLUGINS.try_with(|plugins| !plugins.is_empty()) {
+        return active;
+    }
+    !plugins().load().is_empty()
 }
 pub(super) fn enabled(manifest: &Manifest) -> bool {
     manifest.capabilities.iter().any(|s| s == CAPABILITY)
@@ -163,6 +186,7 @@ pub(super) fn publish(mut next: Vec<Arc<LifecyclePlugin>>) {
     for old in previous.iter() {
         if !next.iter().any(|new| Arc::ptr_eq(old, new)) {
             old.active.store(false, Ordering::Release);
+            old.waiters.notify_waiters();
         }
     }
     for entry in &next {
@@ -214,6 +238,16 @@ impl LifecycleRequest {
                     context: None,
                 })
                 .collect(),
+            finished: false,
+            remaining_wait: Duration::from_secs(600),
+        }
+    }
+
+    pub(crate) fn inert() -> Self {
+        Self {
+            metadata: Value::Null,
+            credentials: None,
+            entries: Vec::new(),
             finished: false,
             remaining_wait: Duration::from_secs(600),
         }
@@ -312,7 +346,9 @@ impl LifecycleRequest {
                 params.as_object_mut().unwrap().remove("response");
                 params["status"] = json!(status);
                 params["code"] = json!(code);
-                if let Some(_guard) = BusyGuard::acquire(entry.plugin.busy.clone()) {
+                if let Some(_guard) =
+                    BusyGuard::acquire(entry.plugin.busy.clone(), entry.plugin.waiters.clone())
+                {
                     let _ = (entry.plugin.callback)(method, params);
                 }
             };
@@ -452,18 +488,23 @@ async fn dispatch_one(
                 });
                 let wake = Instant::now() + delay;
                 while Instant::now() < wake {
+                    let notified = plugin.waiters.notified();
                     if !plugin.active.load(Ordering::Acquire) {
                         return Err(failure("plugin_disabled"));
                     }
                     if Instant::now() >= end {
                         return Err(failure("plugin_wait_timeout"));
                     }
-                    sleep(
-                        Duration::from_millis(50)
-                            .min(wake.saturating_duration_since(Instant::now()))
-                            .min(end.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
+                    let remaining = Duration::from_millis(50)
+                        .min(wake.saturating_duration_since(Instant::now()))
+                        .min(end.saturating_duration_since(Instant::now()));
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = sleep(remaining) => {}
+                        _ = notified => {}
+                    }
                 }
                 if Instant::now() >= end {
                     return Err(failure("plugin_wait_timeout"));
@@ -493,6 +534,7 @@ impl TestPlugin {
                 callback: Arc::new(callback),
                 active: AtomicBool::new(true),
                 busy: Arc::new(AtomicBool::new(false)),
+                waiters: Arc::new(Notify::new()),
                 request_headers: vec!["x-test".into()],
                 response_headers: vec!["x-test".into(), "content-type".into()],
                 auth: false,
@@ -534,6 +576,37 @@ mod tests {
             ("x-test".into(), "original".into()),
             ("authorization".into(), "private".into()),
         ])
+    }
+
+    #[tokio::test]
+    async fn empty_snapshot_is_inactive_without_credentials() {
+        with_test_plugins(vec![], async {
+            assert!(!has_plugins());
+            let request = LifecycleRequest::inert();
+            assert!(!request.is_active());
+            assert!(request.metadata.is_null());
+            assert!(request.credentials.is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn has_plugins_reads_the_same_snapshot_as_new() {
+        with_test_plugins(
+            vec![TestPlugin::new("a", |_, _| {
+                Ok(json!({"action": "continue"}))
+            })],
+            async {
+                assert!(has_plugins());
+                assert!(LifecycleRequest::new(json!({}), None).is_active());
+            },
+        )
+        .await;
+        with_test_plugins(vec![], async {
+            assert!(!has_plugins());
+            assert!(!LifecycleRequest::new(json!({}), None).is_active());
+        })
+        .await;
     }
 
     #[test]

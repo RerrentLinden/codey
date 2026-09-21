@@ -61,17 +61,17 @@ pub(super) async fn runtime_status_with_options(
     let runtime = state.runtime.lock().await.clone();
     // 先在无锁状态取运行时模型基线，再持配置读锁做同步比较：读守卫跨
     // await 会让排队写者阻塞所有新的桥接请求。
-    let applied_models = match runtime.as_ref() {
-        Some(runtime) => Some(runtime.applied_model_config().await),
-        None => None,
-    };
-    let applied_subagent = match runtime.as_ref() {
-        Some(runtime) => Some(runtime.applied_subagent_config().await),
-        None => None,
-    };
-    let crashpad_disk_protection_active = match runtime.as_ref() {
-        Some(runtime) => runtime.crashpad_pending_protection_active().await,
-        None => false,
+    let (applied_models, applied_subagent, crashpad_disk_protection_active) = match runtime.as_ref()
+    {
+        Some(runtime) => {
+            let (models, subagent, crashpad) = tokio::join!(
+                runtime.applied_model_config(),
+                runtime.applied_subagent_config(),
+                runtime.crashpad_pending_protection_active(),
+            );
+            (Some(models), Some(subagent), crashpad)
+        }
+        None => (None, None, false),
     };
     let config = state.config.read().await;
     let profile = config.active_profile();
@@ -154,24 +154,22 @@ pub(super) async fn runtime_status_with_options(
     ) {
         status.extend(feature_status.clone());
     }
-    let codex_app_version =
-        codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path)
-            .await;
+    let (codex_app_version, startup_error, available_update) = tokio::join!(
+        codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path),
+        async { state.startup_error.read().await.clone() },
+        async { state.available_update.read().await.clone() },
+    );
     if let Some(object) = status.as_object_mut() {
         object.insert("codexAppVersion".into(), Value::String(codex_app_version));
-    }
-    if let Some(error) = state.startup_error.read().await.clone()
-        && let Some(object) = status.as_object_mut()
-    {
-        object.insert("startupError".into(), Value::String(error));
-    };
-    if let Some(update) = state.available_update.read().await.clone()
-        && let Some(object) = status.as_object_mut()
-    {
-        object.insert(
-            "availableUpdate".into(),
-            serde_json::to_value(update).expect("update metadata must be JSON-serializable"),
-        );
+        if let Some(error) = startup_error {
+            object.insert("startupError".into(), Value::String(error));
+        }
+        if let Some(update) = available_update {
+            object.insert(
+                "availableUpdate".into(),
+                serde_json::to_value(update).expect("update metadata must be JSON-serializable"),
+            );
+        }
     }
     if let Some(runtime) = runtime.as_ref()
         && let Some(object) = status.as_object_mut()
