@@ -37,8 +37,8 @@ struct StoreWriteGuard {
 pub(crate) const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
+const OAUTH_CALLBACK_LAST_PORT: u16 = 1555;
 const OAUTH_SCOPE: &str = "openid profile email offline_access";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
@@ -1150,12 +1150,12 @@ fn pkce_pair() -> PkcePair {
     }
 }
 
-fn build_authorize_url(state: &str, challenge: &str) -> String {
+fn build_authorize_url(state: &str, challenge: &str, redirect_uri: &str) -> String {
     let mut url = reqwest::Url::parse(OAUTH_AUTHORIZE_URL).expect("static authorize url");
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", OAUTH_CLIENT_ID)
-        .append_pair("redirect_uri", OAUTH_REDIRECT_URI)
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", OAUTH_SCOPE)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
@@ -1166,24 +1166,39 @@ fn build_authorize_url(state: &str, challenge: &str) -> String {
     url.to_string()
 }
 
+async fn bind_callback_listener(first_port: u16, last_port: u16) -> Result<TcpListener> {
+    for port in first_port..=last_port {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法监听登录回调端口 127.0.0.1:{port}"));
+            }
+        }
+    }
+    bail!(
+        "登录回调端口 127.0.0.1:{first_port}–{last_port} 均被占用；请关闭正在进行的 codex login 或占用这些端口的程序后重试"
+    )
+}
+
 /// Starts a login: binds the OAuth callback port, returns the URL to open.
 pub async fn start_login(client: reqwest::Client) -> Result<LoginSession> {
-    let listener = TcpListener::bind(("127.0.0.1", OAUTH_CALLBACK_PORT))
-        .await
-        .map_err(|error| {
-            anyhow!(
-                "无法监听登录回调端口 127.0.0.1:{OAUTH_CALLBACK_PORT}（{error}）；请关闭正在进行的 codex login 或占用该端口的程序后重试"
-            )
-        })?;
+    let listener = bind_callback_listener(OAUTH_CALLBACK_PORT, OAUTH_CALLBACK_LAST_PORT).await?;
+    let port = listener
+        .local_addr()
+        .context("读取登录回调端口失败")?
+        .port();
+    let redirect_uri = format!("http://localhost:{port}/auth/callback");
     let pkce = pkce_pair();
     let state = uuid::Uuid::new_v4().simple().to_string();
-    let auth_url = build_authorize_url(&state, &pkce.challenge);
+    let auth_url = build_authorize_url(&state, &pkce.challenge, &redirect_uri);
     let phase = Arc::new(Mutex::new(LoginPhase::Waiting));
     let task_phase = Arc::clone(&phase);
     let task = tokio::spawn(async move {
         let outcome = tokio::time::timeout(
             LOGIN_TIMEOUT,
-            run_callback_server(listener, client, state, pkce.verifier),
+            run_callback_server(listener, client, state, pkce.verifier, redirect_uri),
         )
         .await;
         let next = match outcome {
@@ -1208,6 +1223,7 @@ async fn run_callback_server(
     client: reqwest::Client,
     expected_state: String,
     verifier: String,
+    redirect_uri: String,
 ) -> Result<OfficialAccountRecord> {
     loop {
         let (mut socket, _) = listener.accept().await.context("接受登录回调连接失败")?;
@@ -1242,7 +1258,7 @@ async fn run_callback_server(
             let _ = write_response(&mut socket, 400, "缺少授权码，请回到 Codey 重新开始。").await;
             continue;
         };
-        let exchanged = exchange_code(&client, code, &verifier).await;
+        let exchanged = exchange_code(&client, code, &verifier, &redirect_uri).await;
         match exchanged {
             Ok(record) => {
                 let _ = write_response(
@@ -1339,6 +1355,7 @@ async fn exchange_code(
     client: &reqwest::Client,
     code: &str,
     verifier: &str,
+    redirect_uri: &str,
 ) -> Result<OfficialAccountRecord> {
     let response = client
         .post(OAUTH_TOKEN_URL)
@@ -1346,7 +1363,7 @@ async fn exchange_code(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
-            ("redirect_uri", OAUTH_REDIRECT_URI),
+            ("redirect_uri", redirect_uri),
             ("client_id", OAUTH_CLIENT_ID),
             ("code_verifier", verifier),
         ])
@@ -2088,11 +2105,46 @@ mod tests {
         assert_eq!(stored.auth["tokens"]["access_token"], json!("access-new"));
     }
 
+    #[tokio::test]
+    async fn callback_listener_skips_occupied_ports() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let first_port = occupied.local_addr().unwrap().port();
+        let last_port = first_port.saturating_add(100);
+        let listener = bind_callback_listener(first_port, last_port).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(address.ip().is_loopback());
+        assert!(address.port() > first_port && address.port() <= last_port);
+
+        let redirect_uri = format!("http://localhost:{}/auth/callback", address.port());
+        let url =
+            reqwest::Url::parse(&build_authorize_url("state", "challenge", &redirect_uri)).unwrap();
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "redirect_uri")
+                .unwrap()
+                .1,
+            redirect_uri
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_listener_reports_exhausted_range() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let error = bind_callback_listener(port, port).await.unwrap_err();
+        assert!(error.to_string().contains("均被占用"));
+        assert!(error.to_string().contains(&format!("{port}–{port}")));
+    }
+
     #[test]
     fn authorize_url_and_callback_parsing_follow_codex_conventions() {
         let pkce = pkce_pair();
         assert!(pkce.verifier.len() >= 43 && pkce.verifier.len() <= 128);
-        let url = build_authorize_url("state123", &pkce.challenge);
+        let url = build_authorize_url(
+            "state123",
+            &pkce.challenge,
+            "http://localhost:1455/auth/callback",
+        );
         assert!(url.starts_with(OAUTH_AUTHORIZE_URL));
         assert!(url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
         assert!(url.contains("code_challenge_method=S256"));

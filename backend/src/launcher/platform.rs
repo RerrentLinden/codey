@@ -1017,8 +1017,7 @@ fn windows_executable_sits_at_app_root(executable_path: &Path, app_dir: &Path) -
 /// directory itself.
 #[cfg(any(windows, test))]
 fn windows_executable_is_inside_codex_app(normalized_directories: &str) -> bool {
-    let names_codex =
-        |segment: &str| segment == "codex" || segment.starts_with("openai.codex");
+    let names_codex = |segment: &str| segment == "codex" || segment.starts_with("openai.codex");
     let mut segments = normalized_directories.rsplit('\\');
     match segments.next() {
         Some(parent) if names_codex(parent) => true,
@@ -1432,10 +1431,7 @@ mod compatibility_tests {
                 (23, Some(user_profile_codex)),
             ],
         );
-        assert!(
-            instances.is_empty(),
-            "unexpected instances: {instances:?}"
-        );
+        assert!(instances.is_empty(), "unexpected instances: {instances:?}");
     }
 
     // 【自动化测试】启动 - 单实例锁：主程序名或安装目录布局任一变化都不能漏掉桌面实例

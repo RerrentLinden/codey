@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../../components/ui";
+import { IconArchive } from "@tabler/icons-react";
 import { ConfirmationDialog } from "./ConfirmationDialog";
 import { ExtensionError } from "./ExtensionError";
 import { getSkillCacheRequests } from "./requests";
@@ -67,10 +68,24 @@ export function SkillCacheDialog({ open, request, container, onClose }: {
       <Dialog open onOpenChange={(value) => { if (!value && busy !== "remove" && !confirmation) onClose(); }}>
         <DialogContent container={container} className="sm:w-[760px]" onEscapeKeyDown={(event) => { if (busy === "remove" || confirmation) event.preventDefault(); }}>
           <DialogHeader>
-            <DialogTitle>缓存 Skill 管理</DialogTitle>
-            <DialogDescription>查看当前用户的全局插件 Skill 缓存，不受项目范围影响。删除可能影响插件后续加载，插件更新或重新安装时可能再次生成缓存。</DialogDescription>
+            <div className="flex items-start gap-3.5">
+              <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-blue-500/10 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400">
+                <IconArchive size={20} stroke={1.75} aria-hidden="true" />
+              </div>
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="flex items-center gap-2">
+                  <DialogTitle>缓存 Skill 管理</DialogTitle>
+                  <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-[11px] font-medium text-blue-600 dark:bg-blue-500/15 dark:text-blue-400">
+                    全局缓存
+                  </span>
+                </div>
+                <DialogDescription>
+                  查看当前用户的全局插件 Skill 缓存，不受项目范围影响。删除可能影响插件后续加载，插件更新或重新安装时可能再次生成缓存。
+                </DialogDescription>
+              </div>
+            </div>
           </DialogHeader>
-          <div className="max-h-[70vh] space-y-3 overflow-y-auto px-6 pb-6">
+          <div className="max-h-[70vh] space-y-3 overflow-y-auto pt-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs text-muted">全局用户缓存{cache ? ` · 共 ${cache.skills.length} 项` : ""}</span>
               <Button size="sm" variant="outline" disabled={!!busy} onClick={refresh}>刷新缓存</Button>
@@ -95,7 +110,28 @@ export function SkillCacheDialog({ open, request, container, onClose }: {
                 {entry.canRemove === false && entry.reason && <p className="m-0 text-xs text-warning">{entry.reason}</p>}
               </article>
             ))}
-            {document && <section className="space-y-2" aria-label="缓存 Skill 内容"><h3 className="text-sm font-semibold">{document.name} · SKILL.md（只读）</h3><textarea aria-label="缓存 SKILL.md 内容" readOnly value={document.content} className="min-h-64 w-full rounded-lg border border-default bg-transparent p-3 font-mono text-xs" /></section>}
+            {document && (
+              <section className="space-y-2" aria-label="缓存 Skill 内容">
+                <div className="overflow-hidden rounded-xl border border-black/[0.12] bg-[var(--codey-surface,#fff)] shadow-2xs dark:border-white/[0.12] dark:bg-black/20">
+                  <div className="flex items-center justify-between border-b border-black/[0.08] bg-black/[0.02] px-3.5 py-2 dark:border-white/[0.08] dark:bg-white/[0.03]">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-xs font-semibold text-foreground">
+                        {document.name} · SKILL.md
+                      </span>
+                      <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                        只读
+                      </span>
+                    </div>
+                  </div>
+                  <textarea
+                    aria-label="缓存 SKILL.md 内容"
+                    readOnly
+                    value={document.content}
+                    className="min-h-64 w-full resize-y bg-transparent p-3.5 font-mono text-xs leading-relaxed text-foreground outline-none"
+                  />
+                </div>
+              </section>
+            )}
           </div>
         </DialogContent>
       </Dialog>

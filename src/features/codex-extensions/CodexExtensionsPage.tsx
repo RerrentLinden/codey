@@ -9,6 +9,7 @@ import {
 } from "../../components/ui";
 import {
   IconBook2,
+  IconFolderPlus,
   IconPlus,
   IconRefresh,
   IconServer,
@@ -663,24 +664,54 @@ export function CodexExtensionsPage({
         >
           <DialogContent
             container={container}
-            className="sm:w-[760px]"
+            className={draft.kind === "install" ? "sm:w-[560px]" : "sm:w-[760px]"}
             onEscapeKeyDown={(event) => {
               if (busy || discard) event.preventDefault();
             }}
           >
             <DialogHeader>
-              <DialogTitle>
-                {draft.kind === "install"
-                  ? "新增 Skill"
-                  : `${draft.readOnly ? "查看" : draft.isNew ? "新增" : "编辑"} ${draft.kind === "mcp" ? "MCP" : "Skill"}`}
-              </DialogTitle>
-              <DialogDescription>
-                {draft.kind === "install"
-                  ? "选择本地 Skill 目录或 ZIP 文件进行安装。"
-                  : "查看或修改当前范围内的资源配置。"}
-              </DialogDescription>
+              <div className="flex items-start gap-3.5">
+                <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-blue-500/10 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400">
+                  {draft.kind === "mcp" ? (
+                    <IconServer size={20} stroke={1.75} aria-hidden="true" />
+                  ) : draft.kind === "install" ? (
+                    <IconFolderPlus size={20} stroke={1.75} aria-hidden="true" />
+                  ) : (
+                    <IconBook2 size={20} stroke={1.75} aria-hidden="true" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <DialogTitle>
+                      {draft.kind === "install"
+                        ? "新增 Skill"
+                        : `${draft.readOnly ? "查看" : draft.isNew ? "新增" : "编辑"} ${draft.kind === "mcp" ? "MCP" : "Skill"}`}
+                    </DialogTitle>
+                    <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-[11px] font-medium text-blue-600 dark:bg-blue-500/15 dark:text-blue-400">
+                      {draft.kind === "install"
+                        ? "本地导入"
+                        : draft.kind === "mcp"
+                          ? "MCP 服务"
+                          : "SKILL.md"}
+                    </span>
+                  </div>
+                  <DialogDescription>
+                    {draft.kind === "install"
+                      ? "选择本地 Skill 目录或 ZIP 文件进行安装。"
+                      : draft.kind === "mcp"
+                        ? draft.isNew
+                          ? "配置并添加新的 MCP 服务，保存后自动启用并刷新 Codex。"
+                          : "查看或修改当前 MCP 服务配置。"
+                        : draft.isNew
+                          ? "编写 SKILL.md 定义技能元数据与提示词说明，保存后生效。"
+                          : draft.readOnly
+                            ? "查看当前 Skill 的 SKILL.md 配置与说明内容。"
+                            : "编辑当前 Skill 的 SKILL.md 文件，保存后将更新本地文件。"}
+                  </DialogDescription>
+                </div>
+              </div>
             </DialogHeader>
-            <div className="max-h-[70vh] overflow-y-auto px-6 pb-6">
+            <div className="max-h-[72vh] overflow-y-auto pt-2">
               <ExtensionEditor
                 draft={draft}
                 busy={busy || loading}
@@ -699,34 +730,36 @@ export function CodexExtensionsPage({
                 ].includes(controller.busyAction)}
               />
               {loading && (
-                <p role="status" className="text-xs text-muted">
+                <p role="status" className="mt-2 text-xs text-muted">
                   正在重新读取当前范围，草稿已保留…
                 </p>
               )}
               {controller.uncertain && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={busy || loading}
-                  onClick={() => void controller.refresh()}
-                >
-                  刷新确认上次操作结果
-                </Button>
+                <div className="mt-3">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy || loading}
+                    onClick={() => void controller.refresh()}
+                  >
+                    刷新确认上次操作结果
+                  </Button>
+                </div>
               )}
               {comparison && (
                 <section
-                  className="mt-4 space-y-3 rounded-lg border border-default p-4"
+                  className="mt-4 space-y-3 rounded-xl border border-black/[0.08] bg-black/[0.02] p-4 dark:border-white/[0.08] dark:bg-white/[0.03]"
                   aria-label="与最新配置比对"
                 >
-                  <h4 className="m-0 text-sm">最新保存内容</h4>
-                  <p className="text-xs text-muted">
+                  <h4 className="m-0 text-sm font-semibold">最新保存内容</h4>
+                  <p className="m-0 text-xs text-muted">
                     上方保留了你的草稿。请对照下方最新内容手动合并，确认后再保存。
                   </p>
                   <textarea
                     aria-label="最新保存内容"
                     readOnly
                     value={comparison.content}
-                    className="min-h-40 w-full rounded-lg border border-default bg-transparent p-3 font-mono text-xs"
+                    className="min-h-40 w-full rounded-lg border border-black/[0.12] bg-transparent p-3 font-mono text-xs outline-none dark:border-white/[0.12]"
                   />
                   <Button
                     size="sm"

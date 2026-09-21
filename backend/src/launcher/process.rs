@@ -1832,7 +1832,10 @@ async fn renderer_ready_watch(debug_port: u16, deadline: tokio::time::Instant) {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn require_renderer_ready_error(marker_path: &std::path::Path, platform: &'static str) -> anyhow::Error {
+fn require_renderer_ready_error(
+    marker_path: &std::path::Path,
+    platform: &'static str,
+) -> anyhow::Error {
     let detail = format!(
         "渲染进程已可观测，但 {} 未写入执行记录；该运行时丢弃了 NODE_OPTIONS，本轮按失败处理并切换主进程注入通道",
         marker_path.display()
@@ -2866,9 +2869,11 @@ mod cli_wrapper_tests {
     fn packaged_activation_decides_the_main_process_entry() {
         use crate::electron_fuses::FuseState;
 
-        assert!(windows_app_dir_supports_packaged_activation(std::path::Path::new(
-            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.4065.0_x64__2p2nqsd0c76g0\app"
-        )));
+        assert!(windows_app_dir_supports_packaged_activation(
+            std::path::Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.4065.0_x64__2p2nqsd0c76g0\app"
+            )
+        ));
         assert!(!windows_app_dir_supports_packaged_activation(
             std::path::Path::new(r"C:\Users\tester\AppData\Local\Programs\Codex")
         ));

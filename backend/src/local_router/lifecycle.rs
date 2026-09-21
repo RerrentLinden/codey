@@ -117,37 +117,6 @@ fn official_account_email(route: &RouteTarget) -> Option<&str> {
     route.official_auth.as_ref()?.email.as_deref()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lifecycle_email_comes_only_from_official_route_metadata() {
-        let (config, _, model) = super::super::tests::router_config("https://example.com/v1".into());
-        let snapshot = RouterSnapshot::from_config(&config);
-        let mut route = snapshot
-            .target_for_model(&model)
-            .unwrap()
-            .route
-            .as_ref()
-            .clone();
-        route.official_auth = Some(OfficialRouteAuth {
-            account_id: "local-account".into(),
-            email: Some("member@example.com".into()),
-            path: PathBuf::from("/unused/auth.json"),
-            accepts_incoming_authorization: false,
-        });
-        // 非官方线路即使意外携带账号元数据，也不能将邮箱交给插件。
-        assert!(official_account_email(&route).is_none());
-        route.official_account = true;
-        assert_eq!(official_account_email(&route), Some("member@example.com"));
-        route.official_auth.as_mut().unwrap().email = None;
-        assert_eq!(json!(official_account_email(&route)), Value::Null);
-        route.official_auth = None;
-        assert_eq!(json!(official_account_email(&route)), Value::Null);
-    }
-}
-
 /// 生命周期只允许在尚未向下游写出响应时重发。与 reasoning 回退共享两次发送预算。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
@@ -368,5 +337,37 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
         self.inner
             .try_proxy_upstream_websocket_with_probe(route, headers, body, discard, probe)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_email_comes_only_from_official_route_metadata() {
+        let (config, _, model) =
+            super::super::tests::router_config("https://example.com/v1".into());
+        let snapshot = RouterSnapshot::from_config(&config);
+        let mut route = snapshot
+            .target_for_model(&model)
+            .unwrap()
+            .route
+            .as_ref()
+            .clone();
+        route.official_auth = Some(OfficialRouteAuth {
+            account_id: "local-account".into(),
+            email: Some("member@example.com".into()),
+            path: PathBuf::from("/unused/auth.json"),
+            accepts_incoming_authorization: false,
+        });
+        // 非官方线路即使意外携带账号元数据，也不能将邮箱交给插件。
+        assert!(official_account_email(&route).is_none());
+        route.official_account = true;
+        assert_eq!(official_account_email(&route), Some("member@example.com"));
+        route.official_auth.as_mut().unwrap().email = None;
+        assert_eq!(json!(official_account_email(&route)), Value::Null);
+        route.official_auth = None;
+        assert_eq!(json!(official_account_email(&route)), Value::Null);
     }
 }

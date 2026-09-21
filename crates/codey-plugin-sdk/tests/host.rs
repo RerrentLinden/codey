@@ -239,6 +239,12 @@ async fn complete_native_plugin_lifecycle() {
         .join("host/installed/dev.codey.header-demo")
         .canonicalize()
         .unwrap();
+    assert_eq!(
+        host::plugin_directory("dev.codey.header-demo").unwrap(),
+        plugin_dir
+    );
+    assert!(host::plugin_directory("../dev.codey.header-demo").is_err());
+    assert!(host::plugin_directory("dev.codey.missing").is_err());
     assert_eq!(context["pluginDir"], plugin_dir.to_str().unwrap());
     assert_eq!(
         context["dataDir"],

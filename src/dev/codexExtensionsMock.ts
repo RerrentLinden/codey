@@ -139,7 +139,7 @@ export function createCodexExtensionsPreview(platform: string) {
               name: "skill-creator",
               description: "系统内置的 Skill 编写指南。",
               enabled: true,
-              enabledKnown: false,
+              enabledKnown: true,
               sourcePath: `${home}/.codex/skills/.system/skill-creator`,
               manifestPath: `${home}/.codex/skills/.system/skill-creator/SKILL.md`,
               scope: "system",

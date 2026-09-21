@@ -1551,17 +1551,15 @@ async fn prepare_startup_storage(
 
         // Session repair and catalog use other files. Run them together only
         // after the old Codex writer stops.
-        let (session_maintenance, startup_catalog) = tokio::join!(
-            run_startup_session_maintenance(home),
-            async {
+        let (session_maintenance, startup_catalog) =
+            tokio::join!(run_startup_session_maintenance(home), async {
                 match current_profile {
                     Some(profile) => prepare_startup_model_catalog(config, profile, home, &app_dir)
                         .await
                         .map(Some),
                     None => Ok(None),
                 }
-            }
-        );
+            });
         Ok::<_, anyhow::Error>((
             StartupStorageState {
                 app_dir,
