@@ -52,6 +52,7 @@ export const CODEY_API_COMMANDS = [
   "uninstall_codey_plugin",
   "open_codey_plugin_directory",
   "open_codey_plugin_logs",
+  "clear_codey_plugin_logs",
   "invoke_codey_plugin",
   "codex_extensions",
 ] as const;

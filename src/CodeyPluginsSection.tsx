@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconAlertTriangle,
   IconCheck,
+  IconEraser,
   IconFilePlus,
   IconFolderOpen,
   IconHelpCircle,
@@ -38,6 +39,7 @@ import {
   type CodeyPluginsResult,
 } from "./codeyPlugins";
 import { SettingsPageHeader } from "./SettingsPageHeader";
+import { formatBytes } from "./formatters";
 
 export function CodeyPluginsSection({ container }: { container?: HTMLElement | null }) {
   const [result, setResult] = useState<CodeyPluginsResult | null>(null);
@@ -52,6 +54,8 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const [editId, setEditId] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ kind: "enable" | "uninstall"; plugin: CodeyPlugin } | null>(null);
   const [removeData, setRemoveData] = useState(false);
+  const [clearLogsPlugin, setClearLogsPlugin] = useState<CodeyPlugin | null>(null);
+  const [clearLogsError, setClearLogsError] = useState("");
   const [known, setKnown] = useState(false);
 
   const pending = useRef(false);
@@ -456,8 +460,24 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                   )}
                 </div>
 
-                <div className="flex items-center justify-between gap-2 border-t border-black/[0.06] bg-black/[0.015] px-5 py-2.5 dark:border-white/[0.06] dark:bg-white/[0.02]">
-                  <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-black/[0.06] bg-black/[0.015] px-5 py-2.5 dark:border-white/[0.06] dark:bg-white/[0.02]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="whitespace-nowrap text-[11px] text-muted" title="当前日志及轮转备份的大小，刷新列表时更新">
+                      日志 {plugin.logSizeBytes == null ? "大小未知" : formatBytes(plugin.logSizeBytes)}
+                    </span>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={blocked}
+                      aria-label={`清除 ${plugin.name} 的运行日志`}
+                      onClick={() => {
+                        setClearLogsError("");
+                        setClearLogsPlugin(plugin);
+                      }}
+                    >
+                      <IconEraser size={14} aria-hidden="true" />
+                      <span>清除日志</span>
+                    </Button>
                     {plugin.restartRequired && plugin.enabled ? (
                       <Button
                         size="xs"
@@ -581,6 +601,34 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
         }}
       />
       ) : null}
+
+      {clearLogsPlugin && (
+        <Dialog open onOpenChange={(open) => { if (!open && !busy) setClearLogsPlugin(null); }}>
+          <DialogContent container={container} className="max-w-[460px]" onEscapeKeyDown={(event) => { if (busy) event.preventDefault(); }}>
+            <DialogHeader>
+              <DialogTitle>确认清除运行日志</DialogTitle>
+              <DialogDescription>
+                将清除 {clearLogsPlugin.name} 的现有运行日志及轮转备份，此操作无法恢复。插件配置和数据会保留，运行中的插件仍会继续记录新日志。
+              </DialogDescription>
+            </DialogHeader>
+            {clearLogsError && <p role="alert" className="text-sm text-danger">{clearLogsError}</p>}
+            <DialogFooter>
+              <Button variant="outline" disabled={busy} onClick={() => setClearLogsPlugin(null)}>取消</Button>
+              <Button variant="destructive" disabled={blocked} loading={busy} onClick={() => void run(async () => {
+                setClearLogsError("");
+                try {
+                  const data = await invoke("clear_codey_plugin_logs", { pluginId: clearLogsPlugin.id, confirmed: true });
+                  accept(data);
+                  setNotice(`${clearLogsPlugin.name} 的现有运行日志已清除`);
+                  setClearLogsPlugin(null);
+                } catch (cause) {
+                  setClearLogsError(errorText(cause));
+                }
+              })}>确认清除</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {/* 启用信任 / 卸载确认对话框 */}
       {confirm && (

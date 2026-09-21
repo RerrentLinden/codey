@@ -507,6 +507,7 @@ if (import.meta.env.DEV) {
     const pluginPreviewMode = new URLSearchParams(window.location.search).get("plugins");
     const previewPlugins: CodeyPlugin[] = ["installed", "config-error", "config-invalid", "config-conflict", "config-values"].includes(pluginPreviewMode ?? "") ? [{
       id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
+      logSizeBytes: 1572864,
       description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled", restartRequired: false,
       configPath: "/preview/codey-plugins/installed/dev.codey.header-demo/config.json", capabilities: ["request.lifecycle.v1"],
       pluginDir: "/preview/codey-plugins/installed/dev.codey.header-demo", dataDir: "/preview/codey-plugins/installed/dev.codey.header-demo/data", logDir: "/preview/codey-plugins/installed/dev.codey.header-demo/logs",
@@ -600,6 +601,13 @@ if (import.meta.env.DEV) {
         if (previewPluginLogTerminals.has(plugin.id)) return { status: "already_open" };
         previewPluginLogTerminals.add(plugin.id);
         return { status: "ok" };
+      }
+      if (command === "clear_codey_plugin_logs") {
+        const plugin = previewPlugins.find(item => item.id === args?.pluginId);
+        if (!plugin) throw new Error("预览：插件不存在");
+        if (args?.confirmed !== true) throw new Error("清除插件日志需要确认");
+        plugin.logSizeBytes = 0;
+        return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
       if (command === "select_codey_plugin_package") return structuredClone(previewPluginPackage);
       if (command === "inspect_codey_plugin") {

@@ -4,6 +4,7 @@ export type CodeyPlugin = {
   capabilities: string[]; lastError?: string; restartRequired?: boolean;
   activeVersion?: string | null;
   pluginDir?: string; dataDir?: string; logDir?: string;
+  logSizeBytes?: number | null;
 };
 export type CodeyPluginsResult = { plugins: CodeyPlugin[]; platform: string; arch: string };
 export type CodeyPluginConfigFile = { pluginId: string; version: string; path: string; content: string; sha256: string };

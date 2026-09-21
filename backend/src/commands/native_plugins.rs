@@ -47,6 +47,13 @@ pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String>
             })
             .await
         }
+        "clear_codey_plugin_logs" => {
+            let id = string_argument(args, "pluginId")?;
+            if !argument::<bool>(args, "confirmed")? {
+                return Err("清除插件日志需要确认".into());
+            }
+            blocking(move || codey_plugins::clear_logs(&id)).await
+        }
         "open_codey_plugin_logs" => {
             let id = string_argument(args, "pluginId")?;
             blocking(move || {
@@ -123,6 +130,19 @@ mod tests {
             ("open_codey_plugin_directory", json!({})),
             ("open_codey_plugin_logs", json!({"pluginId":42})),
             ("open_codey_plugin_logs", json!({})),
+            (
+                "clear_codey_plugin_logs",
+                json!({"pluginId":42,"confirmed":true}),
+            ),
+            ("clear_codey_plugin_logs", json!({"pluginId":"demo"})),
+            (
+                "clear_codey_plugin_logs",
+                json!({"pluginId":"demo","confirmed":false}),
+            ),
+            (
+                "clear_codey_plugin_logs",
+                json!({"pluginId":"demo","confirmed":"true"}),
+            ),
         ] {
             assert!(invoke(command, &args).await.is_err(), "{command}");
         }

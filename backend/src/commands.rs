@@ -1368,6 +1368,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
         "open_codey_plugin_directory" => native_plugins::invoke(command, &args).await,
         "open_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
+        "clear_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
         "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };

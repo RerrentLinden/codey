@@ -1,5 +1,6 @@
 //! Codey 原生插件平台。安装不执行代码，用户显式启用后加载可信动态库。
 pub mod lifecycle;
+mod logs;
 mod native;
 mod package;
 
@@ -102,6 +103,7 @@ pub struct PluginInfo {
     pub plugin_dir: PathBuf,
     pub data_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub log_size_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +172,11 @@ pub fn get_config_file(id: &str) -> Result<ConfigFile, String> {
 }
 pub fn plugin_directory(id: &str) -> Result<PathBuf, String> {
     manager()?.plugin_directory(id)
+}
+pub fn clear_logs(id: &str) -> Result<PluginList, String> {
+    let manager = manager()?;
+    logs::clear(&manager.plugin_directory(id)?)?;
+    Ok(manager.list())
 }
 /// 停止接受新调用；已取得实例引用的请求完成后销毁实例。库映射保留至进程退出。
 pub fn shutdown() {
@@ -806,6 +813,10 @@ impl Manager {
                         plugin_dir: self.root.join("installed").join(id),
                         data_dir: self.root.join("installed").join(id).join("data"),
                         log_dir: self.root.join("installed").join(id).join("logs"),
+                        log_size_bytes: self
+                            .plugin_directory(id)
+                            .and_then(|dir| logs::size(&dir))
+                            .ok(),
                     }
                 })
                 .collect(),
