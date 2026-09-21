@@ -1076,7 +1076,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       'developer_instructions="Codey route"',
       'mcp_servers.codey_fastctx.command="C:\\\\Program Files\\\\Codey\\\\codey-fastctx.exe"',
       'agents.default.config_file="D:\\\\Codey\\\\runtime\\\\default.toml"',
-      'hooks.state."C:\\\\Users\\\\Kim\\\\.codex\\\\hooks.json:pre_tool_use:1:0".trusted_hash="sha256:test"',
+      'hooks.state={ "C:\\\\Users\\\\Kim\\\\.codex\\\\hooks.json:pre_tool_use:1:0" = { trusted_hash = "sha256:test" } }',
       `hooks.PreToolUse=[{ hooks = [{ type = "command", command = "'C:\\\\Program Files\\\\Codey\\\\codey.exe' --codey-subagent-gate-hook" }] }]`,
     ];
     const nativeRuntimeConfigOverrides = runtimeConfigOverrides;

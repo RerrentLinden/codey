@@ -2878,6 +2878,43 @@ wire_api = "responses"
 }
 
 #[test]
+fn runtime_hook_trust_override_keeps_paths_in_toml_values() {
+    let paths = [
+        r"C:\Users\LD_moxeii\.codex\hooks.json:pre_tool_use:1:0",
+        r"C:\Users\O'Brien\Codey 数据\.codex\hooks.json:post_tool_use:2:0",
+        "/Users/kim/.codex/hooks.json:pre_tool_use:0:0",
+        "/tmp/codey=tests/quoted\"path/.codex/hooks.json:stop:0:0",
+    ];
+    let entries = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| RuntimeHookTrustEntry {
+            state_key: (*path).to_string(),
+            trusted_hash: format!("sha256:test-{index}"),
+        })
+        .collect::<Vec<_>>();
+    let mut overrides = Vec::new();
+    push_runtime_hook_trust_override(&mut overrides, &entries);
+    assert_eq!(overrides.len(), 1);
+
+    // 按 Codex CLI 的规则分别解析键和值，不能把整条覆盖项当作 TOML 文档。
+    let (key, raw_value) = overrides[0].split_once('=').unwrap();
+    assert_eq!(key.split('.').collect::<Vec<_>>(), ["hooks", "state"]);
+    let parsed = raw_value.parse::<Value>().unwrap();
+    let states = parsed.as_inline_table().unwrap();
+    assert_eq!(states.len(), entries.len());
+    for entry in &entries {
+        let state = states[&entry.state_key].as_inline_table().unwrap();
+        assert_eq!(state.len(), 1);
+        assert_eq!(
+            state["trusted_hash"].as_str(),
+            Some(entry.trusted_hash.as_str())
+        );
+        assert!(!state.contains_key("enabled"));
+    }
+}
+
+#[test]
 fn isolated_fastctx_installs_route_hook_without_subagent_optimization() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -2917,8 +2954,19 @@ wire_api = "responses"
         applied
             .runtime_config_overrides
             .iter()
-            .filter(|entry| entry.starts_with("hooks.state."))
+            .filter(|entry| entry.starts_with("hooks.state="))
             .count(),
+        1
+    );
+    let hook_states = applied
+        .runtime_config_overrides
+        .iter()
+        .find_map(|entry| entry.strip_prefix("hooks.state="))
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+    assert_eq!(
+        hook_states.as_inline_table().unwrap().len(),
         FASTCTX_ROUTE_HOOKS.len()
     );
     assert!(
@@ -3078,10 +3126,14 @@ wire_api = "responses"
         }
     }
     let pre_tool_state_key = format!("{}:pre_tool_use:1:0", home.join("hooks.json").display());
-    let pre_tool_prefix = format!(
-        "hooks.state.{}.trusted_hash=",
-        toml_string_literal(&pre_tool_state_key)
-    );
+    let hook_states = applied
+        .runtime_config_overrides
+        .iter()
+        .find_map(|entry| entry.strip_prefix("hooks.state="))
+        .unwrap()
+        .parse::<Value>()
+        .unwrap();
+    let hook_states = hook_states.as_inline_table().unwrap();
     let hook_commands =
         crate::subagent_gate::hook_commands_for(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)
             .unwrap();
@@ -3096,9 +3148,11 @@ wire_api = "responses"
         selected_command,
         crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     );
-    assert!(applied.runtime_config_overrides.iter().any(|entry| {
-        entry.starts_with(&pre_tool_prefix) && entry.contains(&expected_pre_tool_hash)
-    }));
+    assert_eq!(
+        hook_states[&pre_tool_state_key].as_inline_table().unwrap()["trusted_hash"].as_str(),
+        Some(expected_pre_tool_hash.as_str())
+    );
+    assert_eq!(hook_states.len(), SUBAGENT_GATE_HOOKS.len());
     assert!(
         applied
             .runtime_config_overrides
@@ -3150,9 +3204,9 @@ wire_api = "responses"
         applied
             .runtime_config_overrides
             .iter()
-            .filter(|entry| entry.starts_with("hooks.state."))
+            .filter(|entry| entry.starts_with("hooks.state="))
             .count(),
-        SUBAGENT_GATE_HOOKS.len()
+        1
     );
     for runtime_override in &applied.runtime_config_overrides {
         runtime_override
