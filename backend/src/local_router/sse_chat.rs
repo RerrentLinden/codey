@@ -642,7 +642,7 @@ const CHAT_STREAM_LEGACY_TOOL_SLOT: usize = usize::MAX;
 /// 强行并入会把两个真实的调用拼成一个，静默丢掉其中一个工具。
 pub(crate) fn chat_legacy_tool_slot(indexed_name: Option<&str>) -> usize {
     match indexed_name {
-        Some(name) if name.is_empty() => 0,
+        Some("") => 0,
         _ => CHAT_STREAM_LEGACY_TOOL_SLOT,
     }
 }

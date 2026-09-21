@@ -232,28 +232,22 @@ impl<'a> ResponsesSseState<'a> {
         arguments_delta: Option<&str>,
         fallback_arguments: Option<String>,
     ) -> Result<Vec<Value>> {
-        if !self.tools.contains_key(&upstream_index) {
-            self.tools.insert(
-                upstream_index,
-                ResponsesStreamTool {
-                    item_id: String::new(),
-                    output_index: None,
-                    call_id: String::new(),
-                    name: String::new(),
-                    response_name: None,
-                    arguments: String::new(),
-                    response_input: None,
-                    emitted_arguments: 0,
-                    fallback_arguments: None,
-                    added: false,
-                },
-            );
-        }
         let response_id = self.response_id.clone();
         let tool = self
             .tools
-            .get_mut(&upstream_index)
-            .expect("tool state must exist after insertion");
+            .entry(upstream_index)
+            .or_insert_with(|| ResponsesStreamTool {
+                item_id: String::new(),
+                output_index: None,
+                call_id: String::new(),
+                name: String::new(),
+                response_name: None,
+                arguments: String::new(),
+                response_input: None,
+                emitted_arguments: 0,
+                fallback_arguments: None,
+                added: false,
+            });
         if tool.call_id.is_empty()
             && let Some(call_id) = call_id.filter(|value| !value.is_empty())
         {
