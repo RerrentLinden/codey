@@ -178,6 +178,20 @@ impl StartupInjectionMode {
     }
 }
 
+/// A packaged Electron runtime may drop the inherited `NODE_OPTIONS`, which
+/// leaves the `--require` patch unloaded and its marker file missing while the
+/// fuse scan still reports the flag as enabled. A live renderer debug port is
+/// the counterpart of the Inspector probe's early exit: the main script already
+/// started, so the patch can no longer load and waiting out the readiness
+/// budget only delays the switch to Inspector.
+#[cfg(any(windows, target_os = "macos"))]
+const RENDERER_READY_REQUIRE_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// First delay between renderer debug-port probes of a `--require` attempt;
+/// later probes back off up to 500ms.
+#[cfg(any(windows, target_os = "macos"))]
+const RENDERER_READY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
 /// One automatic fuse repair before the first Windows launch attempt.
 ///
 /// The launcher restarts Codex itself, so a repaired runtime continues with
@@ -219,6 +233,56 @@ async fn repair_main_process_injection_before_launch(
         return fuses;
     }
     crate::electron_fuses::detect_electron_fuses(app_dir.to_path_buf()).await
+}
+
+/// Whether this app directory is launched through Microsoft Store activation.
+///
+/// Such a launch is activated over COM rather than started as a child process,
+/// so the runtime may drop the environment Codey would otherwise inherit, and
+/// its package files are protected against fuse repair. `NODE_OPTIONS` is
+/// therefore not a usable main-process entry there, while Inspector arrives
+/// with the activation arguments.
+///
+/// Windows only: macOS starts a `.app` through `open -n`, which passes the
+/// launch environment explicitly, so a Mac App Store copy needs no separate
+/// channel decision. Never call this from the macOS branch.
+#[cfg(any(windows, test))]
+fn windows_app_dir_supports_packaged_activation(app_dir: &std::path::Path) -> bool {
+    codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir).is_some()
+}
+
+#[cfg(any(windows, test))]
+fn windows_should_repair_main_process_injection(
+    attempt: u32,
+    packaged_activation: bool,
+    fuses: crate::electron_fuses::ElectronFuses,
+) -> bool {
+    // A Store package is a protected copy, so repairing it would neither
+    // succeed nor make `NODE_OPTIONS` survive the activation; it only adds a
+    // failed write and a possible elevation prompt to the first attempt.
+    attempt == 1
+        && !packaged_activation
+        && !fuses.node_options.node_options_possible()
+        && !fuses.node_cli_inspect.inspector_possible()
+}
+
+/// Whether this attempt should prepare the `NODE_OPTIONS --require` payload.
+///
+/// A Store activation cannot observe Codey's environment, so `NODE_OPTIONS` is
+/// dropped and its marker never arrives; the entry is only worth preparing when
+/// Inspector is unavailable and `NODE_OPTIONS` is the last main-process entry
+/// left. Standalone installs keep the existing preference.
+#[cfg(any(windows, test))]
+fn windows_should_prepare_require_patch(
+    packaged_activation: bool,
+    inspect_fuse: crate::electron_fuses::FuseState,
+    options_fuse: crate::electron_fuses::FuseState,
+    retry_without_require: bool,
+) -> bool {
+    if retry_without_require || !options_fuse.node_options_possible() {
+        return false;
+    }
+    !packaged_activation || !inspect_fuse.inspector_possible()
 }
 
 #[cfg_attr(
@@ -264,12 +328,18 @@ pub(super) async fn spawn_codex(
             attempt += 1;
             *app_dir = refresh_windows_packaged_app_dir(app_dir)?;
             error_log::refresh_codex_app_version(Some(app_dir), None);
+            // A Store activation sets the launch environment through the package
+            // debug settings and cannot be observed from Codey's own environment,
+            // so the first attempt must not spend the readiness budget on a
+            // channel the runtime drops silently. Inspector carries the launch
+            // arguments the activation interface does accept, which is why it is
+            // preferred here instead of `NODE_OPTIONS`. Both entries stay fused
+            // as Electron ships them; if an update turns the inspect flags off,
+            // `NODE_OPTIONS` remains the only main-process entry left.
+            let packaged_activation = windows_app_dir_supports_packaged_activation(app_dir);
             let mut fuses =
                 crate::electron_fuses::detect_electron_fuses(app_dir.to_path_buf()).await;
-            if attempt == 1
-                && !fuses.node_options.node_options_possible()
-                && !fuses.node_cli_inspect.inspector_possible()
-            {
+            if windows_should_repair_main_process_injection(attempt, packaged_activation, fuses) {
                 // Both main-process entries are off, so the launcher would fall
                 // back to the CLI wrapper. Repairing the fuse byte now reuses the
                 // restart this launch already performs; the manual repair stays
@@ -277,8 +347,12 @@ pub(super) async fn spawn_codex(
                 fuses = repair_main_process_injection_before_launch(app_dir, fuses).await;
             }
             let inspect_fuse = fuses.node_cli_inspect;
-            let require_wanted =
-                fuses.node_options.node_options_possible() && !retry_without_require;
+            let require_wanted = windows_should_prepare_require_patch(
+                packaged_activation,
+                inspect_fuse,
+                fuses.node_options,
+                retry_without_require,
+            );
             let require_patch = prepare_startup_require_launch(
                 require_wanted,
                 patch_options.clone(),
@@ -395,6 +469,7 @@ pub(super) async fn spawn_codex(
                     "attempt": attempt,
                     "useInspector": use_inspector,
                     "useRequire": use_require,
+                    "packagedActivation": packaged_activation,
                     "inspectorFuse": inspect_fuse.as_str(),
                     "nodeOptionsFuse": fuses.node_options.as_str(),
                     "requirePrepared": require_patch.is_some(),
@@ -1611,11 +1686,24 @@ async fn wait_for_require_patch_with_cli_fallback(
         CliWrapperFailure, CliWrapperMarker, CliWrapperMarkerStatus, loopback_port_accepts,
     };
 
+    // Races the patch marker and the wrapper against the renderer becoming
+    // observable. A live renderer without a marker proves the runtime dropped
+    // `NODE_OPTIONS`, so the attempt must end at the grace period's end instead
+    // of exhausting the whole readiness budget.
     let watch_path = marker_path.clone();
     let mut require_ready = Box::pin(async move {
         tokio::time::timeout_at(deadline, watch_cli_wrapper_marker(&watch_path))
             .await
             .context("等待 Codex 主进程启动补丁确认超时")?
+    });
+    // A launch without a renderer debug port keeps the original two-way wait:
+    // the probe must never resolve on its own, or it would short-circuit the
+    // marker and wrapper channels it is only meant to back up.
+    let mut renderer_ready = Box::pin(async move {
+        match renderer_debug_port {
+            Some(debug_port) => renderer_ready_watch(debug_port, deadline).await,
+            None => std::future::pending().await,
+        }
     });
     let result = if let Some(handshake) = wrapper_handshake {
         let mut wrapper_ready = Box::pin(wait_for_cli_wrapper(handshake, deadline));
@@ -1667,27 +1755,38 @@ async fn wait_for_require_patch_with_cli_fallback(
                     Err(require_error) => Err(combined_startup_error(require_error, wrapper_error)),
                 }
             },
+            _ = &mut renderer_ready => {
+                // The grace period covers the marker write of a runtime that
+                // does honour `NODE_OPTIONS`; the marker future above wins that
+                // race by being polled first.
+                Err(require_renderer_ready_error(&marker_path, platform))
+            },
         }
     } else {
-        match require_ready.as_mut().await {
-            Ok(()) => Ok(StartupInjectionMode::NodeRequire),
-            Err(require_error) => {
-                let renderer_ready = match renderer_debug_port {
-                    Some(debug_port) => loopback_port_accepts(debug_port).await,
-                    None => false,
-                };
-                if renderer_ready {
-                    Err(anyhow::anyhow!(
-                        "Codex 主进程启动补丁未确认：渲染进程已就绪，但 NODE_OPTIONS --require 未写入执行记录：{require_error:#}"
-                    ))
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("主进程启动补丁未确认，渲染进程调试端口未就绪：{require_error:#}"),
-                    )
-                    .into())
+        tokio::select! {
+            require = &mut require_ready => match require {
+                Ok(()) => Ok(StartupInjectionMode::NodeRequire),
+                Err(require_error) => {
+                    let renderer_ready = match renderer_debug_port {
+                        Some(debug_port) => loopback_port_accepts(debug_port).await,
+                        None => false,
+                    };
+                    if renderer_ready {
+                        Err(anyhow::anyhow!(
+                            "Codex 主进程启动补丁未确认：渲染进程已就绪，但 NODE_OPTIONS --require 未写入执行记录：{require_error:#}"
+                        ))
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("主进程启动补丁未确认，渲染进程调试端口未就绪：{require_error:#}"),
+                        )
+                        .into())
+                    }
                 }
-            }
+            },
+            _ = &mut renderer_ready => {
+                Err(require_renderer_ready_error(&marker_path, platform))
+            },
         }
     };
     let remove_script = CliWrapperMarker::read(&marker_path)
@@ -1696,6 +1795,57 @@ async fn wait_for_require_patch_with_cli_fallback(
         .is_some_and(|marker| marker.status == CliWrapperMarkerStatus::Executed);
     cleanup_startup_require_files(&marker_path, remove_script);
     result
+}
+
+/// Watches the renderer debug port of a `NODE_OPTIONS --require` attempt.
+///
+/// Resolves once the port has answered and the grace period passed without the
+/// patch marker. The failure is deliberately retryable: the caller switches to
+/// Inspector instead of waiting out the readiness budget.
+#[cfg(any(windows, target_os = "macos"))]
+async fn renderer_ready_watch(debug_port: u16, deadline: tokio::time::Instant) {
+    let mut delay = RENDERER_READY_PROBE_INTERVAL;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let probe = tokio::time::timeout(
+            remaining,
+            crate::codex_startup_patch::loopback_port_accepts(debug_port),
+        );
+        let ready = match probe.await {
+            Ok(ready) => ready,
+            // Out of budget: the marker future reports the timeout instead.
+            Err(_) => return,
+        };
+        if ready {
+            let grace = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !grace.is_zero() {
+                tokio::time::sleep(grace.min(RENDERER_READY_REQUIRE_GRACE_PERIOD)).await;
+            }
+            return;
+        }
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay.saturating_mul(2), Duration::from_millis(500));
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn require_renderer_ready_error(marker_path: &std::path::Path, platform: &'static str) -> anyhow::Error {
+    let detail = format!(
+        "渲染进程已可观测，但 {} 未写入执行记录；该运行时丢弃了 NODE_OPTIONS，本轮按失败处理并切换主进程注入通道",
+        marker_path.display()
+    );
+    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+        "launcher.require_patch_renderer_ready",
+        serde_json::json!({ "platform": platform, "markerPath": marker_path }),
+    );
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("等待 Codex 主进程启动补丁确认超时: {detail}"),
+    )
+    .into()
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -2662,6 +2812,180 @@ mod cli_wrapper_tests {
         .await
         .unwrap_err();
         assert!(startup_error_allows_retry(&error), "{error:#}");
+        let _ = std::fs::remove_file(marker_path);
+    }
+
+    /// A runtime that drops `NODE_OPTIONS` renders normally while the `--require`
+    /// marker never appears. The attempt must end shortly after the renderer
+    /// becomes observable so the launcher can switch to Inspector inside the
+    /// same startup instead of burning the whole budget.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn renderer_ready_without_require_marker_ends_the_attempt_early() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let renderer_port = listener.local_addr().unwrap().port();
+        let marker_path = std::env::temp_dir().join(format!(
+            "codey-startup-require-renderer-ready-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let started = tokio::time::Instant::now();
+        let error = install_startup_patch_with_cli_fallback(
+            None,
+            test_patch_options(),
+            &[],
+            None,
+            StartupWaitContext {
+                platform: "windows",
+                deadline: started + crate::codex_startup_patch::STARTUP_CLI_READY_TIMEOUT,
+                renderer_debug_port: Some(renderer_port),
+                spawned: None,
+                require_marker: Some(marker_path.clone()),
+            },
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < crate::codex_startup_patch::STARTUP_CLI_READY_TIMEOUT / 2,
+            "the attempt must not wait out the readiness budget: {elapsed:?}"
+        );
+        assert!(startup_error_allows_retry(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("等待 Codex 主进程启动补丁确认超时"),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_file(marker_path);
+    }
+
+    /// Store packages are activated over COM instead of started as a child
+    /// process, which is what makes their `NODE_OPTIONS` unusable: the entry
+    /// must go straight to Inspector rather than spend a whole round on it.
+    #[test]
+    fn packaged_activation_decides_the_main_process_entry() {
+        use crate::electron_fuses::FuseState;
+
+        assert!(windows_app_dir_supports_packaged_activation(std::path::Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.4065.0_x64__2p2nqsd0c76g0\app"
+        )));
+        assert!(!windows_app_dir_supports_packaged_activation(
+            std::path::Path::new(r"C:\Users\tester\AppData\Local\Programs\Codex")
+        ));
+        assert!(!windows_should_prepare_require_patch(
+            true,
+            FuseState::Enabled,
+            FuseState::Enabled,
+            false
+        ));
+    }
+
+    /// Both entries ship enabled, but an update may turn the inspect flags off.
+    /// A Store package then has to fall back to `NODE_OPTIONS` instead of giving
+    /// up on main-process injection.
+    #[test]
+    fn packaged_activation_keeps_require_when_inspector_is_gone() {
+        use crate::electron_fuses::FuseState;
+
+        assert!(windows_should_prepare_require_patch(
+            true,
+            FuseState::Disabled,
+            FuseState::Enabled,
+            false
+        ));
+        assert!(windows_should_prepare_require_patch(
+            true,
+            FuseState::Removed,
+            FuseState::Unknown,
+            false
+        ));
+        assert!(!windows_should_prepare_require_patch(
+            true,
+            FuseState::Disabled,
+            FuseState::Disabled,
+            false
+        ));
+        assert!(windows_should_prepare_require_patch(
+            false,
+            FuseState::Enabled,
+            FuseState::Enabled,
+            false
+        ));
+        assert!(!windows_should_prepare_require_patch(
+            false,
+            FuseState::Enabled,
+            FuseState::Enabled,
+            true
+        ));
+    }
+
+    #[test]
+    fn store_packages_skip_the_protected_fuse_repair() {
+        use crate::electron_fuses::{ElectronFuses, FuseState};
+
+        let blocked = |node_options, node_cli_inspect| ElectronFuses {
+            node_cli_inspect,
+            node_options,
+        };
+        assert!(windows_should_repair_main_process_injection(
+            1,
+            false,
+            blocked(FuseState::Disabled, FuseState::Disabled)
+        ));
+        assert!(!windows_should_repair_main_process_injection(
+            1,
+            true,
+            blocked(FuseState::Disabled, FuseState::Disabled)
+        ));
+        assert!(!windows_should_repair_main_process_injection(
+            2,
+            false,
+            blocked(FuseState::Disabled, FuseState::Disabled)
+        ));
+        assert!(!windows_should_repair_main_process_injection(
+            1,
+            false,
+            blocked(FuseState::Enabled, FuseState::Unknown)
+        ));
+    }
+
+    /// A require marker that lands in time still wins over the renderer probe.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn require_marker_wins_the_race_against_the_renderer_probe() {
+        use crate::codex_startup_patch::{CliWrapperMarker, CliWrapperMarkerStatus};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let renderer_port = listener.local_addr().unwrap().port();
+        let marker_path = std::env::temp_dir().join(format!(
+            "codey-startup-require-renderer-race-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let writer = marker_path.clone();
+        let sender = tokio::spawn(async move {
+            let marker = CliWrapperMarker::new(CliWrapperMarkerStatus::Executed);
+            let _ = marker.write(&writer);
+        });
+        let mode = install_startup_patch_with_cli_fallback(
+            None,
+            test_patch_options(),
+            &[],
+            None,
+            StartupWaitContext {
+                platform: "windows",
+                deadline: tokio::time::Instant::now()
+                    + crate::codex_startup_patch::STARTUP_CLI_READY_TIMEOUT,
+                renderer_debug_port: Some(renderer_port),
+                spawned: None,
+                require_marker: Some(marker_path.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(mode, StartupInjectionMode::NodeRequire);
+        sender.await.unwrap();
         let _ = std::fs::remove_file(marker_path);
     }
 

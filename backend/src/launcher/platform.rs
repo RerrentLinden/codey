@@ -962,9 +962,15 @@ pub(super) struct WindowsCodexInstance {
 /// path: a Store package left running, a standalone copy started by hand or a
 /// build that updated into a new directory while Codey's saved path still
 /// names the old one all make the next launch quit with exit code 0.
-/// `ChatGPT.exe` only counts inside a Codex directory so the ChatGPT desktop
-/// app is left alone; processes whose path cannot be read are skipped because
-/// they cannot be terminated with an identity check either.
+///
+/// A name alone never qualifies. The launcher is `ChatGPT.exe` or `Codex.exe`
+/// inside a Codex directory, and that same directory shape also holds the
+/// bundled `resources\codex.exe` — a CLI child many unrelated tools ship a
+/// copy of, under that same name with that same relative path, so no rule can
+/// tell those apart. It cannot hold the single-instance lock and leaves with
+/// its desktop parent, so it is never an instance. Processes whose path cannot
+/// be read are skipped because they cannot be terminated with an identity
+/// check either.
 #[cfg(any(windows, test))]
 pub(super) fn windows_codex_instances_from_snapshot<'a>(
     app_dir: &Path,
@@ -983,9 +989,8 @@ pub(super) fn windows_codex_instances_from_snapshot<'a>(
             if !WINDOWS_CODEX_EXECUTABLE_NAMES.contains(&name) {
                 return None;
             }
-            let codex_owned = name == "codex.exe"
-                || windows_path_is_within(executable_path, app_dir)
-                || windows_directory_names_codex(directories);
+            let codex_owned = windows_executable_sits_at_app_root(executable_path, app_dir)
+                || windows_executable_is_inside_codex_app(directories);
             codex_owned.then(|| WindowsCodexInstance {
                 process_id,
                 executable_path: executable_path.to_path_buf(),
@@ -994,16 +999,32 @@ pub(super) fn windows_codex_instances_from_snapshot<'a>(
         .collect()
 }
 
-/// True when the executable sits directly in a Codex install directory:
-/// `OpenAI.Codex_<version>_<arch>__<publisher>\app` (Store) or `Codex`
-/// (standalone `Programs\Codex`, `OpenAI\Codex\bin`). Only the two nearest
-/// directories count, so a user account named `codex` does not match.
+/// True for a launcher directly inside the resolved Codex app directory. Only
+/// the directory itself counts, so a bundled CLI below it is not an instance.
 #[cfg(any(windows, test))]
-fn windows_directory_names_codex(normalized_directories: &str) -> bool {
-    normalized_directories
-        .rsplit('\\')
-        .take(2)
-        .any(|segment| segment == "codex" || segment.starts_with("openai.codex"))
+fn windows_executable_sits_at_app_root(executable_path: &Path, app_dir: &Path) -> bool {
+    executable_path
+        .parent()
+        .is_some_and(|parent| normalized_windows_path(parent) == normalized_windows_path(app_dir))
+}
+
+/// True when the launcher sits in an install directory named after Codex:
+/// `Codex\ChatGPT.exe` (standalone), `OpenAI\Codex\Codex.exe` (packaged
+/// standalone) or `OpenAI.Codex_<version>_<arch>__<publisher>\app\ChatGPT.exe`
+/// (Store). Only the two nearest directories are inspected, so a user account
+/// named `codex` deeper in the path does not match, and a CLI under
+/// `...\codex\bin\` is rejected because its parent is `bin`, not the install
+/// directory itself.
+#[cfg(any(windows, test))]
+fn windows_executable_is_inside_codex_app(normalized_directories: &str) -> bool {
+    let names_codex =
+        |segment: &str| segment == "codex" || segment.starts_with("openai.codex");
+    let mut segments = normalized_directories.rsplit('\\');
+    match segments.next() {
+        Some(parent) if names_codex(parent) => true,
+        Some("app") => segments.next().is_some_and(names_codex),
+        _ => false,
+    }
 }
 
 /// Short list for user-facing errors: `PID 1（path）、PID 2（path） 等 N 个进程`.
@@ -1378,8 +1399,69 @@ mod compatibility_tests {
             .iter()
             .map(|instance| instance.process_id)
             .collect::<Vec<_>>();
-        assert_eq!(process_ids, vec![10, 11, 12, 13, 16]);
+        // 16 is the bundled CLI below `app\resources` and 13 is a launcher under
+        // `OpenAI\Codex\bin`: the lock belongs to the directory a Codex install
+        // resolves to, not to every binary that happens to sit in a `bin`.
+        assert_eq!(process_ids, vec![10, 11, 12]);
         assert_eq!(instances[0].executable_path, store_codex);
+    }
+
+    // 【自动化测试】启动 - 单实例锁：第三方工具自带的同名 CLI 不能被当成桌面实例
+    #[test]
+    fn third_party_cli_copies_are_not_codex_instances() {
+        let app_dir = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.4065.0_x64__2p2nqsd0c76g0\app",
+        );
+        // The editor extension keeps the CLI in its own `bin` directory, one
+        // level deeper than any launcher, which is where the old
+        // `name == "codex.exe"` rule dragged it into the stop list.
+        let extension_cli = Path::new(
+            r"C:\Users\27252\.vscode\extensions\openai.chatgpt-26.908.40401-win32-x64\bin\windows-x86_64\codex.exe",
+        );
+        let extension_cli_other_drive =
+            Path::new(r"D:\tools\openai.chatgpt\bin\windows-x86_64\codex.exe");
+        let npm_cli =
+            Path::new(r"C:\Users\27252\AppData\Roaming\npm\node_modules\codex\bin\codex.exe");
+        let user_profile_codex = Path::new(r"C:\Users\codex\bin\codex.exe");
+        let instances = windows_codex_instances_from_snapshot(
+            app_dir,
+            [
+                (20, Some(extension_cli)),
+                (21, Some(extension_cli_other_drive)),
+                (22, Some(npm_cli)),
+                (23, Some(user_profile_codex)),
+            ],
+        );
+        assert!(
+            instances.is_empty(),
+            "unexpected instances: {instances:?}"
+        );
+    }
+
+    // 【自动化测试】启动 - 单实例锁：主程序名或安装目录布局任一变化都不能漏掉桌面实例
+    #[test]
+    fn codex_launchers_are_recognised_in_every_known_install_layout() {
+        let app_dir = Path::new(r"C:\Codex");
+        let standalone = Path::new(r"C:\Codex\Codex.exe");
+        let standalone_chatgpt = Path::new(r"C:\Codex\ChatGPT.exe");
+        let packaged_standalone = Path::new(r"C:\Users\kim\AppData\Local\OpenAI\Codex\Codex.exe");
+        let store_app = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.CodexBeta_26.901.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        let instances = windows_codex_instances_from_snapshot(
+            app_dir,
+            [
+                (30, Some(standalone)),
+                (31, Some(standalone_chatgpt)),
+                (32, Some(packaged_standalone)),
+                (33, Some(store_app)),
+            ],
+        );
+        let process_ids = instances
+            .iter()
+            .map(|instance| instance.process_id)
+            .collect::<Vec<_>>();
+        assert_eq!(process_ids, vec![30, 31, 32, 33]);
     }
 
     #[test]

@@ -58,7 +58,7 @@ test("Windows skips the Inspector when the Electron fuse is off and retries with
   // failed require attempt hands the retry to Inspector instead of repeating.
   assert.match(
     windowsSpawn,
-    /let require_wanted =\s*fuses\.node_options\.node_options_possible\(\) && !retry_without_require;/,
+    /let require_wanted = windows_should_prepare_require_patch\(\s*packaged_activation,\s*inspect_fuse,\s*fuses\.node_options,\s*retry_without_require,?\s*\);/,
   );
   assert.match(windowsSpawn, /let use_require = require_patch\.is_some\(\);/);
   assert.match(
@@ -241,7 +241,7 @@ test("CLI relay provenance records the discovered source before Windows runtime 
   assert.match(launcher, /CLI_WRAPPER_SOURCE_ENV\.to_string\(\),\s*source\.to_string_lossy\(\)\.to_string\(\)/);
 });
 
-test("NODE_OPTIONS require path is preferred when the fuse is on", async () => {
+test("NODE_OPTIONS require path follows platform and fuse availability", async () => {
   const { launcher, macosSpawn, startupPatch, windowsSpawn } = await loadSpawnCodexSections();
 
   assert.match(startupPatch, /pub\(crate\) const STARTUP_PATCH_MARKER_ENV/);
@@ -249,7 +249,11 @@ test("NODE_OPTIONS require path is preferred when the fuse is on", async () => {
   assert.match(startupPatch, /fn prepare_startup_require_in\(/);
   assert.match(startupPatch, /Ok\(format!\("--require=\{rendered\}"\)\)/);
   assert.match(windowsSpawn, /detect_electron_fuses\(app_dir\.to_path_buf\(\)\)\.await/);
-  assert.match(windowsSpawn, /fuses\.node_options\.node_options_possible\(\)/);
+  assert.match(windowsSpawn, /windows_should_prepare_require_patch\(/);
+  const requirePolicy = launcher.match(/fn windows_should_prepare_require_patch\([\s\S]*?\n\}/)?.[0];
+  assert.ok(requirePolicy, "应存在 Windows require 补丁选择函数");
+  assert.match(requirePolicy, /if retry_without_require \|\| !options_fuse\.node_options_possible\(\) \{\s*return false;/);
+  assert.match(requirePolicy, /!packaged_activation \|\| !inspect_fuse\.inspector_possible\(\)/);
   assert.match(windowsSpawn, /let use_require = require_patch\.is_some\(\);/);
   assert.match(
     windowsSpawn,
