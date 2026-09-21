@@ -38,7 +38,7 @@ pub fn timestamp_rfc3339() -> String {
 
 /// Local log timestamp in the compact format used by plugin.log and events.
 pub fn timestamp_log() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// 有界事件日志；目录必须由宿主预先创建，不创建或重建目录。
@@ -405,8 +405,8 @@ mod tests {
         assert_eq!(date.len(), 10);
         let time = rest.split_once(' ').unwrap().0;
         assert_eq!(time.len(), 8);
-        assert_eq!(&time[2..3], "-");
-        assert_eq!(&time[5..6], "-");
+        assert_eq!(&time[2..3], ":");
+        assert_eq!(&time[5..6], ":");
     }
 
     #[cfg(unix)]
