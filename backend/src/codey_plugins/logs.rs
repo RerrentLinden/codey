@@ -6,6 +6,16 @@ use std::{
 
 const LOG_NAMES: [&str; 2] = ["host.log", "plugin.log"];
 
+struct LogLocks(Vec<File>);
+
+impl Drop for LogLocks {
+    fn drop(&mut self) {
+        for lock in &self.0 {
+            let _ = fs2::FileExt::unlock(lock);
+        }
+    }
+}
+
 fn directory(plugin_dir: &Path) -> Result<Option<PathBuf>, String> {
     let plugin_dir = super::checked_directory(plugin_dir)?;
     match fs::symlink_metadata(plugin_dir.join("logs")) {
@@ -44,7 +54,7 @@ pub(super) fn clear(plugin_dir: &Path) -> Result<(), String> {
         return Ok(());
     };
     // 与 SDK 共享稳定的锁文件，先取得全部锁，避免写入忙时只清除部分日志。
-    let mut locks = Vec::new();
+    let mut locks = LogLocks(Vec::new());
     for name in LOG_NAMES {
         let path = directory.join(format!("{name}.lock"));
         file_size(&path)?;
@@ -57,7 +67,7 @@ pub(super) fn clear(plugin_dir: &Path) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|_| "日志正在写入或无法锁定，请稍后重试".to_string())?;
-        locks.push(lock);
+        locks.0.push(lock);
     }
     // 先校验并打开全部目标，再清空内容；保留文件和锁，后续写入仍使用原路径。
     let mut files: Vec<File> = Vec::new();
