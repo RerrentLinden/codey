@@ -167,13 +167,29 @@ pub async fn evaluate_script_with_await_promise(
     script: &str,
     await_promise: bool,
 ) -> anyhow::Result<Value> {
+    evaluate_script_with_await_promise_timeout(
+        websocket_url,
+        script,
+        await_promise,
+        CDP_COMMAND_TIMEOUT,
+    )
+    .await
+}
+
+pub async fn evaluate_script_with_await_promise_timeout(
+    websocket_url: &str,
+    script: &str,
+    await_promise: bool,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
     let response = session
-        .send_command(
+        .send_command_with_timeout(
             1,
             "Runtime.evaluate",
             runtime_evaluate_params_with_await_promise(script, await_promise),
+            timeout,
         )
         .await?;
     ensure_runtime_evaluate_succeeded(response)
@@ -605,6 +621,17 @@ where
         method: &str,
         params: Value,
     ) -> anyhow::Result<Value> {
+        self.send_command_with_timeout(message_id, method, params, CDP_COMMAND_TIMEOUT)
+            .await
+    }
+
+    async fn send_command_with_timeout(
+        &mut self,
+        message_id: u64,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
         self.socket
             .send(Message::Text(
                 json!({
@@ -618,17 +645,14 @@ where
             .await
             .with_context(|| format!("failed to send CDP command {method} id {message_id}"))?;
 
-        tokio::time::timeout(
-            CDP_COMMAND_TIMEOUT,
-            self.wait_for_id(message_id, method.to_string()),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "timed out waiting for CDP command {method} id {message_id} response after {}s",
-                CDP_COMMAND_TIMEOUT.as_secs()
-            )
-        })?
+        tokio::time::timeout(timeout, self.wait_for_id(message_id, method.to_string()))
+            .await
+            .with_context(|| {
+                format!(
+                    "timed out waiting for CDP command {method} id {message_id} response after {}s",
+                    timeout.as_secs()
+                )
+            })?
     }
 
     async fn wait_for_id(&mut self, message_id: u64, method: String) -> anyhow::Result<Value> {

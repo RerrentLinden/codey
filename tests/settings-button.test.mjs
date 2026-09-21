@@ -1267,3 +1267,42 @@ test("repeated scans fast-path an already mounted button without layout reads", 
   assert.equal(codeyButton.dataset.codeyHeaderActions, "true");
   assert.deepEqual(visibleHeader.children, [rightRegion, codeyButton, newRightRegion]);
 });
+
+test("MCP reload bootstrap talks to the patched App Server client", async () => {
+  const requests = [];
+  const window = {
+    __codeyRendererCoreLoaded: true,
+    __codeyAppServerRequestClients: new Map([
+      ["local", {
+        sendRequest(...args) {
+          requests.push(args);
+          return {};
+        },
+      }],
+    ]),
+    addEventListener() {},
+  };
+  window.window = window;
+  runRenderer({
+    console,
+    document: {
+      documentElement: new FakeElement("html"),
+      body: new FakeElement("body"),
+      addEventListener() {},
+      createElement: (tag) => new FakeElement(tag),
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    HTMLElement: FakeElement,
+    location: { pathname: "/", search: "" },
+    MutationObserver: class {
+      disconnect() {}
+      observe() {}
+    },
+    URLSearchParams,
+    window,
+  });
+  assert.equal((await window.__codeyReloadMcpServers()).ok, true);
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
+});

@@ -417,6 +417,22 @@ test("usage-only manager remains available when deletion and reconciliation are 
   assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "unavailable");
 });
 
+test("MCP reload prefers the patched AppServerRequestClient over fiber discovery", async () => {
+  const requests = [];
+  const runtime = loadInjection({ initialSessionId: "" });
+  runtime.window.__codeyAppServerRequestClients = new Map([
+    ["local", {
+      sendRequest(...args) {
+        requests.push(args);
+        return {};
+      },
+    }],
+  ]);
+  assert.equal((await runtime.window.__codeyReloadMcpServers()).ok, true);
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
+  assert.equal(runtime.window.__codeyCodexSessionController, null);
+});
+
 test("MCP reload awaits the native request without restarting or resuming a task", async () => {
   const requests = [];
   let finish;
@@ -435,7 +451,7 @@ test("MCP reload awaits the native request without restarting or resuming a task
     return value;
   });
   await flushMicrotasks();
-  assert.deepEqual(requests, [["config/mcpServer/reload"]]);
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
   assert.equal(completed, false);
   finish({});
   assert.equal((await reload).ok, true);
@@ -462,6 +478,34 @@ test("MCP reload reports an unavailable manager instead of using legacy session 
   runtime.window.__codeyCodexSignalDispatcher = () => { throw new Error("unexpected signal"); };
   await assert.rejects(runtime.window.__codeyReloadMcpServers(), { code: "codey_capability_unavailable" });
   assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "unavailable");
+});
+
+test("MCP reload discovery is not capped by the native session timeout", async () => {
+  const requests = [];
+  const manager = {
+    sendRequest(...args) {
+      requests.push(args);
+      return {};
+    },
+  };
+  const runtime = loadInjection({
+    discoveredAppServerManager: manager,
+    initialSessionId: "",
+  });
+  runtime.window.__codeyCodexSessionController = null;
+  const originalImport = runtime.window.__codeyImportCodexAsset;
+  let release;
+  runtime.window.__codeyImportCodexAsset = (...args) => new Promise((resolve) => {
+    release = () => resolve(originalImport(...args));
+  });
+  const reload = runtime.window.__codeyReloadMcpServers();
+  await flushMicrotasks();
+  runtime.flushTimers();
+  await flushMicrotasks();
+  assert.equal(requests.length, 0);
+  release();
+  assert.equal((await reload).ok, true);
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
 });
 
 test("message deletion preflights resume and refresh before releasing or persisting", async () => {

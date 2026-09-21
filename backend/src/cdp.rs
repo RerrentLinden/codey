@@ -16,6 +16,8 @@ use crate::error_log;
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
+const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
@@ -698,17 +700,45 @@ pub struct ModelWhitelistRefresh {
 }
 
 pub async fn reload_mcp_servers(websocket_url: &str) -> Result<()> {
-    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
+    // 会话工具是按需注入的。若在已阻塞的 awaitPromise 里再走页面桥接去
+    // Runtime.evaluate 注入脚本，部分 Chromium/Electron 会把后续 evaluate 排
+    // 到当前 Promise 之后，形成死等。这里先用独立命令装好刷新入口。
+    ensure_mcp_reload_function_ready(websocket_url).await;
+    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
         websocket_url,
         r#"(async () => {
-  if (typeof window.__codeyReloadMcpServers !== "function") {
-    await window.__codeyLoadSessionTools?.();
+  const pickClient = () => {
+    const clients = window.__codeyAppServerRequestClients;
+    if (!clients || typeof clients.get !== "function") return null;
+    const local = clients.get("local");
+    if (local && typeof local.sendRequest === "function") return local;
+    if (typeof clients.values !== "function") return null;
+    const all = [...clients.values()].filter((client) => typeof client?.sendRequest === "function");
+    return all.length === 1 ? all[0] : null;
+  };
+  for (const delay of [0, 200, 500, 1000, 2000]) {
+    if (delay > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, delay));
+    }
+    try {
+      const client = pickClient();
+      if (client) {
+        await client.sendRequest("config/mcpServer/reload", {});
+        return true;
+      }
+      if (typeof window.__codeyReloadMcpServers === "function") {
+        const result = await window.__codeyReloadMcpServers();
+        if (result?.ok === true) return true;
+      }
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (/unknown method/i.test(message)) return false;
+    }
   }
-  if (typeof window.__codeyReloadMcpServers !== "function") return false;
-  const result = await window.__codeyReloadMcpServers();
-  return result?.ok === true;
+  return false;
 })()"#,
         true,
+        MCP_RELOAD_EVALUATE_TIMEOUT,
     )
     .await
     .context("请求 Codex 刷新 MCP 配置失败")?;
@@ -717,6 +747,37 @@ pub async fn reload_mcp_servers(websocket_url: &str) -> Result<()> {
         "Codex 未确认 MCP 配置刷新"
     );
     Ok(())
+}
+
+async fn mcp_reload_function_available(websocket_url: &str) -> bool {
+    codey_runtime_core::bridge::evaluate_script(
+        websocket_url,
+        r#"typeof window.__codeyReloadMcpServers === "function"
+          || typeof window.__codeyAppServerRequestClients?.get?.("local")?.sendRequest === "function""#,
+    )
+    .await
+    .ok()
+    .and_then(|response| runtime_value(&response).and_then(serde_json::Value::as_bool))
+    .unwrap_or(false)
+}
+
+async fn ensure_mcp_reload_function_ready(websocket_url: &str) {
+    if mcp_reload_function_available(websocket_url).await {
+        return;
+    }
+    let _ = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
+        websocket_url,
+        &prepared_session_tools_load_script(),
+        false,
+        SESSION_TOOLS_INJECT_TIMEOUT,
+    )
+    .await;
+    for delay_ms in [80_u64, 200, 500, 1000] {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if mcp_reload_function_available(websocket_url).await {
+            return;
+        }
+    }
 }
 
 pub async fn refresh_model_whitelist(
@@ -1261,36 +1322,62 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                while let Some(message) = socket.next().await {
-                    let message = message.unwrap();
-                    let Ok(text) = message.to_text() else {
-                        continue;
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
                     };
-                    let request: serde_json::Value = serde_json::from_str(text).unwrap();
-                    let evaluate = request["method"] == "Runtime.evaluate";
-                    let result = if evaluate {
-                        assert_eq!(request["params"]["awaitPromise"], true);
-                        assert!(
-                            request["params"]["expression"]
-                                .as_str()
-                                .unwrap()
-                                .contains("__codeyReloadMcpServers")
-                        );
-                        payload.clone()
-                    } else {
-                        json!({})
-                    };
-                    socket
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            json!({"id":request["id"],"result":result})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await
-                        .unwrap();
-                    if evaluate {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut finished = false;
+                    while let Some(message) = socket.next().await {
+                        let Ok(message) = message else {
+                            break;
+                        };
+                        let Ok(text) = message.to_text() else {
+                            continue;
+                        };
+                        let request: serde_json::Value = serde_json::from_str(text).unwrap();
+                        let evaluate = request["method"] == "Runtime.evaluate";
+                        let result = if evaluate {
+                            let expression = request["params"]["expression"].as_str().unwrap();
+                            let await_promise = request["params"]["awaitPromise"] == true;
+                            if await_promise {
+                                assert!(expression.contains("__codeyReloadMcpServers"));
+                                assert!(
+                                    expression.contains("__codeyAppServerRequestClients"),
+                                    "MCP reload must use the patched AppServerRequestClient before fiber discovery"
+                                );
+                                assert!(
+                                    !expression.contains("__codeyLoadSessionTools"),
+                                    "MCP reload must not nest session-tools loading inside awaitPromise"
+                                );
+                                payload.clone()
+                            } else if expression
+                                .contains("typeof window.__codeyReloadMcpServers === \"function\"")
+                            {
+                                json!({"result":{"type":"boolean","value":true}})
+                            } else {
+                                json!({"result":{"type":"string","value":""}})
+                            }
+                        } else {
+                            json!({})
+                        };
+                        if socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                json!({"id":request["id"],"result":result})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if evaluate && request["params"]["awaitPromise"] == true {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    if finished {
                         break;
                     }
                 }

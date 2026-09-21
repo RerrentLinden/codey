@@ -1195,6 +1195,37 @@
     scheduleScan(root || document);
   };
 
+  const appServerRequestClient = () => {
+    const clients = window.__codeyAppServerRequestClients;
+    if (!clients || typeof clients.get !== "function") return null;
+    const local = clients.get("local");
+    if (local && typeof local.sendRequest === "function") return local;
+    if (typeof clients.values !== "function") return null;
+    const all = [...clients.values()].filter((client) => typeof client?.sendRequest === "function");
+    return all.length === 1 ? all[0] : null;
+  };
+  const bootstrapReloadMcpServers = async () => {
+    const client = appServerRequestClient();
+    if (client) {
+      await client.sendRequest("config/mcpServer/reload", {});
+      return { ok: true };
+    }
+    const loaded = await loadSessionTools();
+    if (
+      loaded
+      && typeof window.__codeyReloadMcpServers === "function"
+      && window.__codeyReloadMcpServers !== bootstrapReloadMcpServers
+    ) {
+      return window.__codeyReloadMcpServers();
+    }
+    const error = new Error("当前 Codex 暂不支持MCP 配置刷新，请稍后重试");
+    error.code = "codey_capability_unavailable";
+    throw error;
+  };
+  if (typeof window.__codeyReloadMcpServers !== "function") {
+    window.__codeyReloadMcpServers = bootstrapReloadMcpServers;
+  }
+
   if (rendererCoreAlreadyLoaded) return;
   window.addEventListener?.(updateAvailableEvent, (event) => {
     const result = "detail" in event

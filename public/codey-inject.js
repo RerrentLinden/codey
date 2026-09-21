@@ -2203,7 +2203,12 @@
     capabilityProbes.set(feature, state);
     if (state.pending) return state.pending;
     if (Date.now() < state.retryAt) throw unavailableCapability(feature);
-    state.pending = waitForNativeSessionOperation(() => discoverCodexSessionController(feature)).then((controller) => {
+    const discover = () => discoverCodexSessionController(feature);
+    // MCP 刷新由宿主 CDP 预算约束；5 秒发现上限会让慢机或尚未 hydrate 的
+    // 页面在导入/启停后误报失败，只能重启 Codex。
+    state.pending = (feature === "mcpReload"
+      ? Promise.resolve().then(discover)
+      : waitForNativeSessionOperation(discover)).then((controller) => {
       if (disposed) throw unavailableCapability(feature);
       state.failures = 0;
       state.retryAt = 0;
@@ -2243,12 +2248,40 @@
   };
   window.__codeyReadAccountRateLimits = readAccountRateLimits;
 
+  const appServerRequestClient = () => {
+    const clients = window.__codeyAppServerRequestClients;
+    if (!clients || typeof clients.get !== "function") return null;
+    const local = clients.get("local");
+    if (local && typeof local.sendRequest === "function") return local;
+    if (typeof clients.values !== "function") return null;
+    const all = [...clients.values()].filter((client) => typeof client?.sendRequest === "function");
+    return all.length === 1 ? all[0] : null;
+  };
+
   const reloadMcpServers = async () => {
-    const controller = await getCodexSessionController("mcpReload");
+    capabilityProbes.delete("mcpReload");
+    const sendReload = async (target) => {
+      // Codex 协议要求 params 为对象；原生实现会把配置应用到已加载会话的下一轮。
+      await target.sendRequest("config/mcpServer/reload", {});
+      publishCapability("mcpReload", true);
+      return { ok: true };
+    };
+    const client = appServerRequestClient();
+    if (client) {
+      try {
+        return await sendReload(client);
+      } catch (error) {
+        if (/unknown method/i.test(String(error?.message || error))) throw error;
+      }
+    }
+    const controller = await loadCodexSessionController({ feature: "mcpReload" });
     if (disposed) throw unavailableCapability("mcpReload");
-    // Codex 的原生刷新接口不接收参数，并负责更新已有会话的 MCP 配置。
-    await controller.manager.sendRequest("config/mcpServer/reload");
-    return { ok: true };
+    try {
+      return await sendReload(controller.manager);
+    } catch (error) {
+      window.__codeyCodexSessionController = null;
+      throw error;
+    }
   };
   window.__codeyReloadMcpServers = reloadMcpServers;
 

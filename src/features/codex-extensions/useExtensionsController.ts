@@ -119,6 +119,16 @@ export function useExtensionsController(
         // 项目 Skill 的启停也写入用户配置，所有范围的清单均需失效。
         invalidateInventory(request);
       }
+      const actionName = String(action.action);
+      const timeoutMs = actionName === "test_mcp"
+        ? 35000
+        : ["save_mcp", "set_mcp_enabled", "set_mcps_enabled", "remove_mcp"].includes(actionName)
+          ? 45000
+          : actionName.startsWith("pick_")
+            ? 120000
+            : mutation
+              ? 30000
+              : 15000;
       try {
         const result = await withTimeout(
           request<T>({
@@ -127,13 +137,7 @@ export function useExtensionsController(
             ...action,
           }),
           mutation,
-          action.action === "test_mcp"
-            ? 35000
-            : String(action.action).startsWith("pick_")
-              ? 120000
-              : mutation
-                ? 30000
-                : 15000,
+          timeoutMs,
         );
         if (!mounted.current) return "failed";
         // 被新的操作或范围切换抢占：后端已落库，但本地状态不能再用这次结果覆盖。

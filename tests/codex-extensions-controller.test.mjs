@@ -182,12 +182,12 @@ test("保存提示按 applyStatus 区分，重启提示不重复后端消息", a
   h.writes[1].resolve({
     inventory: { revision: "r3" },
     applyStatus: "applied",
-    message: "MCP 配置已保存并通知 Codex 重新加载，无需重启。",
+    message: "MCP 配置已保存并通知 Codex 重新加载；当前会话下一轮对话生效。",
   });
   assert.equal(await applying, "ok");
   controller = h.render();
   assert.equal(
     controller.notice,
-    "MCP 配置已保存并通知 Codex 重新加载，无需重启。",
+    "MCP 配置已保存并通知 Codex 重新加载；当前会话下一轮对话生效。",
   );
 });

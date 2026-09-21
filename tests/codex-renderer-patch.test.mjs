@@ -623,6 +623,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       model: "route-mt6lv4lx-i2bfax/gpt-5.5",
       model_provider: "openai",
     }, {});
+    assert.equal(
+      appServerGlobal.__codeyAppServerRequestClients.get("local"),
+      requestClient,
+    );
     assert.deepEqual(requestClient.sent[0].payload.request.params, {
       model: "route-mt6lv4lx-i2bfax/gpt-5.5",
       modelProvider: "codey_router",

@@ -84,6 +84,12 @@ test("renderer core loads session tools after idle time or sidebar use", async (
     /loadCodexSessionController\(\{ requireCompletionReconcile: true \}\)/,
   );
   assert.match(sessionTools, /fallbackDispatcher && !requireCompletionReconcile/);
+  assert.match(sessionTools, /feature === "mcpReload"/);
+  assert.match(sessionTools, /window\.__codeyAppServerRequestClients/);
+  assert.match(sessionTools, /sendRequest\("config\/mcpServer\/reload", \{\}\)/);
+  assert.match(sessionTools, /capabilityProbes\.delete\("mcpReload"\)/);
+  assert.match(inject, /window\.__codeyAppServerRequestClients/);
+  assert.match(inject, /bootstrapReloadMcpServers/);
   assert.doesNotMatch(
     sessionTools,
     /stuckCompletion|stuckRunning|activityRevision|currentTurnRenderFingerprint|rehydrateRunningConversation|\/session\/completion-state/,

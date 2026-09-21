@@ -39,13 +39,14 @@ pub(super) async fn invoke(state: &Arc<AppState>, args: &Value) -> Result<Value,
         if let Some(runtime) = runtime {
             let websocket_url = runtime.renderer_websocket_url().await;
             let reloaded = tokio::time::timeout(
-                std::time::Duration::from_secs(12),
+                std::time::Duration::from_secs(25),
                 crate::cdp::reload_mcp_servers(&websocket_url),
             )
             .await;
             if matches!(reloaded, Ok(Ok(()))) {
                 result["applyStatus"] = json!("applied");
-                result["message"] = json!("MCP 配置已保存并通知 Codex 重新加载，无需重启。");
+                result["message"] =
+                    json!("MCP 配置已保存并通知 Codex 重新加载；当前会话下一轮对话生效。");
             } else {
                 result["applyStatus"] = json!("reload-failed");
                 result["message"] = json!(
