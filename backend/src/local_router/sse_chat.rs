@@ -379,7 +379,7 @@ impl ChatSseAccumulator {
             let object = tool_call
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("Chat stream tool_call delta 必须是对象"))?;
-            let index = object.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = chat_stream_tool_slot(object);
             let state = self.tool_calls.entry(index).or_default();
             if let Some(id) = object
                 .get("id")
@@ -407,7 +407,8 @@ impl ChatSseAccumulator {
         let function = function_call
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Chat stream function_call delta 必须是对象"))?;
-        let state = self.tool_calls.entry(0).or_default();
+        let index = chat_legacy_tool_slot(self.tool_calls.get(&0).map(|tool| tool.name.as_str()));
+        let state = self.tool_calls.entry(index).or_default();
         if let Some(name_delta) = function.get("name").and_then(Value::as_str) {
             state.name.push_str(name_delta);
         }
@@ -419,7 +420,7 @@ impl ChatSseAccumulator {
         Ok(())
     }
 
-    pub(crate) fn into_chat_completion(self, done: bool) -> Result<Value> {
+    pub(crate) fn into_chat_completion(mut self, done: bool) -> Result<Value> {
         if !done
             && self
                 .finish_reason
@@ -427,6 +428,28 @@ impl ChatSseAccumulator {
                 .is_none_or(|reason| reason.trim().is_empty())
         {
             anyhow::bail!("Chat Completions SSE 在 [DONE] 或 finish_reason 前断开");
+        }
+        // 与 Responses 桥保持一致：先丢弃没有任何内容的空槽位，再把被拆成两种形状的同一次
+        // 调用合回一个槽位，最后才校验名字是否完整。
+        self.tool_calls.retain(|_, tool| {
+            !(tool.name.is_empty() && tool.arguments.is_empty() && tool.id.is_empty())
+        });
+        if let Some((target, source)) =
+            chat_tool_merge_pair(&self.tool_calls, |tool| tool.name.is_empty())
+            && let Some(merged) = self.tool_calls.remove(&source)
+        {
+            let tool = self
+                .tool_calls
+                .get_mut(&target)
+                .expect("named tool call exists");
+            if tool.id.is_empty() {
+                tool.id = merged.id;
+            }
+            if tool.arguments.is_empty() {
+                tool.arguments = merged.arguments;
+            } else {
+                tool.arguments.push_str(&merged.arguments);
+            }
         }
         let mut message = serde_json::Map::from_iter([(
             "role".to_string(),
@@ -444,28 +467,27 @@ impl ChatSseAccumulator {
             message.insert("reasoning_content".to_string(), Value::String(reasoning));
         }
         if !self.tool_calls.is_empty() {
-            let tool_calls = self
-                .tool_calls
-                .into_values()
-                .map(|tool_call| {
-                    if tool_call.name.is_empty() {
-                        anyhow::bail!("Chat stream tool_call 缺少 function.name");
+            let mut calls = Vec::new();
+            for tool_call in self.tool_calls.into_values() {
+                if tool_call.name.is_empty() {
+                    anyhow::bail!("Chat stream tool_call 缺少 function.name");
+                }
+                calls.push(json!({
+                    "id": if tool_call.id.is_empty() {
+                        format!("call_codey_{}", Uuid::new_v4())
+                    } else {
+                        tool_call.id
+                    },
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
                     }
-                    Ok(json!({
-                        "id": if tool_call.id.is_empty() {
-                            format!("call_codey_{}", Uuid::new_v4())
-                        } else {
-                            tool_call.id
-                        },
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.name,
-                            "arguments": tool_call.arguments,
-                        }
-                    }))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                }));
+            }
+            if !calls.is_empty() {
+                message.insert("tool_calls".to_string(), Value::Array(calls));
+            }
         }
         let mut chat = json!({
             "id": self.id,
@@ -601,6 +623,61 @@ where
     Ok(())
 }
 
+/// `tool_calls` 增量用 `index` 定位槽位。
+fn chat_stream_tool_slot(object: &serde_json::Map<String, Value>) -> usize {
+    object
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(0)
+}
+
+/// legacy `function_call` 增量没有索引语义，一次响应里最多只有一个函数调用，默认使用
+/// 独立槽位；只有 0 号索引槽位已经建立、还在等名字时才并入它，见 [`chat_legacy_tool_slot`]。
+const CHAT_STREAM_LEGACY_TOOL_SLOT: usize = usize::MAX;
+
+/// 上游有时把同一次调用拆成两种形状：索引式增量先给出调用 ID 和参数，legacy 增量再补
+/// 名字。此时 0 号槽位正等着名字，legacy 增量并入它，调用 ID 和名字才能落在同一次调用上。
+/// 其余情况 legacy 增量使用独立槽位：0 号槽位已经带有别的名字，或者还没有索引式槽位，
+/// 强行并入会把两个真实的调用拼成一个，静默丢掉其中一个工具。
+pub(crate) fn chat_legacy_tool_slot(indexed_name: Option<&str>) -> usize {
+    match indexed_name {
+        Some(name) if name.is_empty() => 0,
+        _ => CHAT_STREAM_LEGACY_TOOL_SLOT,
+    }
+}
+
+/// 判断两种形状是否指向同一次工具调用：恰好一个 legacy 槽位与一个索引式槽位，且其中
+/// 只有一个已经拿到名字时，返回 `(保留槽位, 并入槽位)`。缺名字的槽位还没有向下游发出
+/// 任何事件，并入不会与已下发的事件冲突；其他组合保持原样，由收尾逻辑决定是否报错。
+pub(crate) fn chat_tool_merge_pair<T>(
+    tools: &BTreeMap<usize, T>,
+    name_is_empty: impl Fn(&T) -> bool,
+) -> Option<(usize, usize)> {
+    let mut legacy_named = Vec::new();
+    let mut legacy_nameless = Vec::new();
+    let mut indexed_named = Vec::new();
+    let mut indexed_nameless = Vec::new();
+    for (index, tool) in tools {
+        match (*index == CHAT_STREAM_LEGACY_TOOL_SLOT, name_is_empty(tool)) {
+            (true, false) => legacy_named.push(*index),
+            (true, true) => legacy_nameless.push(*index),
+            (false, false) => indexed_named.push(*index),
+            (false, true) => indexed_nameless.push(*index),
+        }
+    }
+    match (
+        legacy_named.as_slice(),
+        legacy_nameless.as_slice(),
+        indexed_named.as_slice(),
+        indexed_nameless.as_slice(),
+    ) {
+        ([legacy], [], [], [indexed]) => Some((*legacy, *indexed)),
+        ([], [legacy], [indexed], []) => Some((*indexed, *legacy)),
+        _ => None,
+    }
+}
+
 fn validate_chat_stream_tool_type(call_type: Option<&Value>) -> Result<()> {
     // 部分上游会在工具参数增量中重复发送空类型，按字段省略处理。
     if let Some(call_type) = call_type.and_then(Value::as_str)
@@ -657,11 +734,7 @@ where
                     .as_object()
                     .ok_or_else(|| anyhow::anyhow!("Chat stream tool_call delta 必须是对象"))?;
                 validate_chat_stream_tool_type(tool_call.get("type"))?;
-                let index = tool_call
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok())
-                    .unwrap_or(0);
+                let index = chat_stream_tool_slot(tool_call);
                 let function = tool_call.get("function").and_then(Value::as_object);
                 let arguments_delta = function
                     .and_then(|function| function.get("arguments"))
@@ -687,7 +760,7 @@ where
                 .get("arguments")
                 .and_then(|arguments| json_value_as_chat_string(Some(arguments)));
             events.extend(output.tool_delta(
-                usize::MAX,
+                chat_legacy_tool_slot(output.tools.get(&0).map(|tool| tool.name.as_str())),
                 None,
                 function_call.get("name").and_then(Value::as_str),
                 arguments_delta.as_deref(),

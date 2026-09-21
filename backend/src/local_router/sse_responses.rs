@@ -28,7 +28,9 @@ pub(crate) struct ResponsesStreamMessage {
 #[derive(Debug)]
 pub(crate) struct ResponsesStreamTool {
     pub(crate) item_id: String,
-    pub(crate) output_index: usize,
+    /// 在真正向下游发出 `response.output_item.added` 时才分配：被丢弃或合并掉的槽位
+    /// 不应该占用编号，否则下游会看到从中间开始的 `output_index`。
+    pub(crate) output_index: Option<usize>,
     pub(crate) call_id: String,
     pub(crate) name: String,
     pub(crate) response_name: Option<ResponsesToolName>,
@@ -231,13 +233,11 @@ impl<'a> ResponsesSseState<'a> {
         fallback_arguments: Option<String>,
     ) -> Result<Vec<Value>> {
         if !self.tools.contains_key(&upstream_index) {
-            let output_index = self.next_output_index;
-            self.next_output_index += 1;
             self.tools.insert(
                 upstream_index,
                 ResponsesStreamTool {
                     item_id: String::new(),
-                    output_index,
+                    output_index: None,
                     call_id: String::new(),
                     name: String::new(),
                     response_name: None,
@@ -248,8 +248,6 @@ impl<'a> ResponsesSseState<'a> {
                     added: false,
                 },
             );
-            self.output_order
-                .push(StreamOutputKind::Tool(upstream_index));
         }
         let response_id = self.response_id.clone();
         let tool = self
@@ -289,11 +287,16 @@ impl<'a> ResponsesSseState<'a> {
             if tool.item_id.is_empty() {
                 tool.item_id = responses_tool_call_item_id(response_name);
             }
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
+            tool.output_index = Some(output_index);
             tool.added = true;
+            self.output_order
+                .push(StreamOutputKind::Tool(upstream_index));
             events.push(json!({
                 "type":"response.output_item.added",
                 "response_id":response_id,
-                "output_index":tool.output_index,
+                "output_index":output_index,
                 "item":responses_tool_call_item_with_id(
                     response_name,
                     tool.item_id.clone(),
@@ -315,7 +318,7 @@ impl<'a> ResponsesSseState<'a> {
                 "type":"response.function_call_arguments.delta",
                 "response_id":response_id,
                 "item_id":tool.item_id,
-                "output_index":tool.output_index,
+                "output_index":tool.output_index.expect("added tool owns an output index"),
                 "delta":delta,
             }));
             tool.emitted_arguments = tool.arguments.len();
@@ -344,6 +347,42 @@ impl<'a> ResponsesSseState<'a> {
     {
         if self.terminal_started {
             return Ok(());
+        }
+        // 上游可能先发一个空的 tool_calls 槽位（例如 `tool_calls:[{}]`）再把内容补写
+        // 到别的槽位，这里会剩下既无名字、也无参数和调用 ID 的空槽位。它没有任何可
+        // 序列化的内容，直接丢弃，避免让整条流在收尾阶段失败。
+        let ghosts = self
+            .tools
+            .iter()
+            .filter(|(_, tool)| {
+                tool.name.is_empty() && tool.arguments.is_empty() && tool.call_id.is_empty()
+            })
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        for index in &ghosts {
+            self.tools.remove(index);
+        }
+        if !ghosts.is_empty() {
+            self.output_order.retain(
+                |kind| !matches!(kind, StreamOutputKind::Tool(index) if ghosts.contains(index)),
+            );
+        }
+        // 上游把同一次调用拆成两种形状时（索引式增量给出 id 和参数、legacy 增量补名字，
+        // 或相反），把缺名字的槽位并入唯一已命名的另一种形状。缺名字的槽位还没有向下游
+        // 发出任何事件，因此这一步不会与已下发的事件冲突。
+        if let Some((target, source)) =
+            chat_tool_merge_pair(&self.tools, |tool| tool.name.is_empty())
+            && let Some(merged) = self.tools.remove(&source)
+        {
+            let tool = self.tools.get_mut(&target).expect("named tool exists");
+            if tool.call_id.is_empty() {
+                tool.call_id = merged.call_id;
+            }
+            if tool.arguments.is_empty() {
+                tool.arguments = merged.arguments;
+            } else {
+                tool.arguments.push_str(&merged.arguments);
+            }
         }
         let mut events = Vec::new();
         if let Some(reasoning) = self.reasoning.as_ref() {
@@ -429,11 +468,14 @@ impl<'a> ResponsesSseState<'a> {
                 tool.item_id = responses_tool_call_item_id(response_name);
             }
             if !tool.added {
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                tool.output_index = Some(output_index);
                 tool.added = true;
                 events.push(json!({
                     "type":"response.output_item.added",
                     "response_id":self.response_id,
-                    "output_index":tool.output_index,
+                    "output_index":output_index,
                     "item":responses_tool_call_item_with_id(
                         response_name,
                         tool.item_id.clone(),
@@ -443,6 +485,7 @@ impl<'a> ResponsesSseState<'a> {
                     )
                 }));
             }
+            let output_index = tool.output_index.expect("added tool owns an output index");
             if response_name.is_custom() {
                 let input = tool.response_input.as_deref().unwrap_or_default();
                 if !input.is_empty() {
@@ -450,7 +493,7 @@ impl<'a> ResponsesSseState<'a> {
                         "type":"response.custom_tool_call_input.delta",
                         "response_id":self.response_id,
                         "item_id":tool.item_id,
-                        "output_index":tool.output_index,
+                        "output_index":output_index,
                         "delta":input,
                     }));
                 }
@@ -458,7 +501,7 @@ impl<'a> ResponsesSseState<'a> {
                     "type":"response.custom_tool_call_input.done",
                     "response_id":self.response_id,
                     "item_id":tool.item_id,
-                    "output_index":tool.output_index,
+                    "output_index":output_index,
                     "input":input,
                 }));
             } else if response_name.is_function() {
@@ -468,7 +511,7 @@ impl<'a> ResponsesSseState<'a> {
                         "type":"response.function_call_arguments.delta",
                         "response_id":self.response_id,
                         "item_id":tool.item_id,
-                        "output_index":tool.output_index,
+                        "output_index":output_index,
                         "delta":delta,
                     }));
                     tool.emitted_arguments = tool.arguments.len();
@@ -477,14 +520,14 @@ impl<'a> ResponsesSseState<'a> {
                     "type":"response.function_call_arguments.done",
                     "response_id":self.response_id,
                     "item_id":tool.item_id,
-                    "output_index":tool.output_index,
+                    "output_index":output_index,
                     "arguments":tool.arguments,
                 }));
             }
             events.push(json!({
                 "type":"response.output_item.done",
                 "response_id":self.response_id,
-                "output_index":tool.output_index,
+                "output_index":output_index,
                 "item":stream_tool_item(tool)?,
             }));
         }

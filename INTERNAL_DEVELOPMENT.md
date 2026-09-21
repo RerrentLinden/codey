@@ -40,7 +40,7 @@
 
 ## 协议转发与恢复
 
-- 原生 Responses 保留同线路 reasoning 与加密状态，跨线路时清理上一供应商状态。Chat Completions、Anthropic Messages 转换消息、工具、图片、用量和流式事件；无法表达的必要内容在发送前拒绝，不裁剪历史或补造思考内容。
+- 原生 Responses 保留同线路 reasoning 与加密状态，跨线路时清理上一供应商状态。Chat Completions、Anthropic Messages 转换消息、工具、图片、用量和流式事件；流式工具增量的 legacy 与索引式形状只在同一次调用上合并，没有内容的空槽位丢弃；无法表达的必要内容在发送前拒绝，不裁剪历史或补造思考内容。
 - HTTP 透传端到端响应头。线路可独立配置 HTTP、HTTPS 或 SOCKS5 代理，用于转发、模型同步和额度查询，并禁用该线路上游 WebSocket；其他线路遵循系统代理。
 - 连接按线路、配置和认证身份隔离复用；HTTP/2 使用固定流量窗口，WSS 保留证书校验并禁用 0-RTT。WebSocket 能力探测去重，缓存不支持 WebSocket 的探测结果，其他失败退避。
 - WebSocket 仅在握手或发送前失败时回退同线路 HTTP；一旦尝试发送，不自动重放或跨供应商切换。第三方原生 Responses 因缺少 reasoning 明文被拒绝时，可补占位文本后向同线路重发一次，官方线路及已发送的 WebSocket 请求除外。
