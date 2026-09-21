@@ -26,18 +26,9 @@ impl Native {
         // Even entry-point/initialization failures may leave native callbacks running.
         // Keep every successfully opened mapping until process exit.
         let library = Box::leak(Box::new(library));
-        let (entry, input) =
-            match unsafe { library.get::<EntryPoint>(b"codey_plugin_entry_with_context_v1\0") } {
-                Ok(entry) => (
-                    entry,
-                    serde_json::json!({"config": config, "context": context}),
-                ),
-                Err(_) => (
-                    unsafe { library.get::<EntryPoint>(b"codey_plugin_entry_v1\0") }
-                        .map_err(|e| format!("缺少 ABI 入口: {e}"))?,
-                    config,
-                ),
-            };
+        let entry = unsafe { library.get::<EntryPoint>(b"codey_plugin_entry_v1\0") }
+            .map_err(|e| format!("缺少 ABI 入口 codey_plugin_entry_v1: {e}"))?;
+        let input = serde_json::json!({"config": config, "context": context});
         let api = unsafe { entry() };
         if api.is_null() {
             return Err("插件返回了空 ABI 表".into());

@@ -116,11 +116,12 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     {
         return Err("librarySha256 必须是小写 SHA-256".into());
     }
-    if manifest
-        .capabilities
-        .iter()
-        .any(|s| s != "request.beforeSend")
-    {
+    let lifecycle = super::lifecycle::enabled(manifest);
+    let mut capabilities = HashSet::new();
+    if manifest.capabilities.iter().any(|s| {
+        !["request.lifecycle.v1", "request.lifecycle.auth"].contains(&s.as_str())
+            || !capabilities.insert(s)
+    }) {
         return Err("插件声明了尚未支持的扩展能力".into());
     }
     if manifest
@@ -130,13 +131,46 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     {
         return Err("插件声明了禁止修改或无效的请求头".into());
     }
-    if !manifest.header_names.is_empty()
-        && !manifest
+    if !manifest.header_names.is_empty() && !lifecycle {
+        return Err("headerNames 需要请求扩展能力".into());
+    }
+    if !["abort", "continue"].contains(
+        &manifest
+            .lifecycle_failure_policy
+            .as_deref()
+            .unwrap_or("abort"),
+    ) || !(1..=600_000).contains(&manifest.lifecycle_max_wait_ms.unwrap_or(30_000))
+    {
+        return Err("生命周期失败策略或等待时间无效".into());
+    }
+    if !lifecycle
+        && (manifest
             .capabilities
             .iter()
-            .any(|s| s == "request.beforeSend")
+            .any(|s| s == "request.lifecycle.auth")
+            || !manifest.response_header_names.is_empty()
+            || manifest.lifecycle_failure_policy.is_some()
+            || manifest.lifecycle_max_wait_ms.is_some())
     {
-        return Err("headerNames 需要 request.beforeSend 能力".into());
+        return Err("生命周期字段需要 request.lifecycle.v1 能力".into());
+    }
+    for (names, response) in [
+        (&manifest.header_names, false),
+        (&manifest.response_header_names, true),
+    ] {
+        let mut seen = HashSet::new();
+        if names.len() > 32
+            || names.iter().any(|name| {
+                !seen.insert(name.to_ascii_lowercase())
+                    || if response {
+                        !super::lifecycle::allowed_response_header_name(name)
+                    } else {
+                        !super::allowed_header_name(name)
+                    }
+            })
+        {
+            return Err("请求头或响应头声明无效、重复或超过 32 项".into());
+        }
     }
     Ok(())
 }
@@ -222,20 +256,10 @@ pub fn read(path: &Path) -> Result<Package, String> {
     if digest(library) != manifest.library_sha256 {
         return Err("插件动态库 SHA-256 不匹配".into());
     }
-    let default_config = if manifest
-        .legacy_config_schema
-        .as_ref()
-        .and_then(serde_json::Value::as_str)
-        == Some(super::CONFIG_FILE)
-    {
-        "{}\n".to_owned()
-    } else if let Some(bytes) = files.get(super::CONFIG_FILE) {
-        let content = std::str::from_utf8(bytes).map_err(|_| "配置文件必须为 UTF-8")?;
-        super::parse_config(content)?;
-        content.to_owned()
-    } else {
-        "{}\n".to_owned()
-    };
+    let config = files.get(super::CONFIG_FILE).ok_or("缺少 config.json")?;
+    let content = std::str::from_utf8(config).map_err(|_| "配置文件必须为 UTF-8")?;
+    super::parse_config(content)?;
+    let default_config = content.to_owned();
     Ok(Package {
         inspection: Inspection {
             path: path.to_string_lossy().into(),
@@ -250,6 +274,52 @@ pub fn read(path: &Path) -> Result<Package, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifecycle_manifest_dependencies_and_header_lists_are_checked() {
+        let base = serde_json::to_value(super::super::tests::fixture_package().inspection.manifest)
+            .unwrap();
+        for field in ["lifecycleFailurePolicy", "lifecycleMaxWaitMs"] {
+            let mut value = base.clone();
+            value[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<Manifest>(value).is_err());
+        }
+        for fields in [
+            serde_json::json!({"capabilities":["request.beforeSend"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1","request.beforeSend"]}),
+            serde_json::json!({"headerNames":["x-test"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.auth"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1","request.lifecycle.v1"]}),
+            serde_json::json!({"lifecycleFailurePolicy":"abort"}),
+            serde_json::json!({"lifecycleMaxWaitMs":30000}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"lifecycleMaxWaitMs":0}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"lifecycleMaxWaitMs":600001}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"lifecycleFailurePolicy":"ignore"}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"responseHeaderNames":["set-cookie"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"responseHeaderNames":["x-test","X-Test"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"headerNames":["x-test","X-Test"]}),
+        ] {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let manifest: Manifest = serde_json::from_value(value).unwrap();
+            assert!(validate_manifest(&manifest).is_err());
+        }
+        for fields in [
+            serde_json::json!({"capabilities":["request.lifecycle.v1"],"headerNames":["x-test"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1"]}),
+            serde_json::json!({"capabilities":["request.lifecycle.v1","request.lifecycle.auth"],"responseHeaderNames":["content-type","x-test"],"lifecycleFailurePolicy":"continue","lifecycleMaxWaitMs":600000}),
+        ] {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let manifest: Manifest = serde_json::from_value(value).unwrap();
+            validate_manifest(&manifest).unwrap();
+        }
+    }
     fn package_fixture(
         config: Option<&[u8]>,
         legacy_schema: Option<&str>,
@@ -291,18 +361,25 @@ mod tests {
     }
 
     #[test]
-    fn package_defaults_are_fixed_json_text_and_legacy_metadata_is_ignored() {
+    fn package_requires_json_config_and_rejects_legacy_metadata() {
         let text = b"{\r\n \"value\": 1\r\n}\r\n";
         let package = package_fixture(Some(text), None).unwrap();
         assert_eq!(package.default_config.as_bytes(), text);
-        let legacy = package_fixture(Some(b"not a schema"), Some("config.json")).unwrap();
-        assert_eq!(legacy.default_config.trim(), "{}");
-        let legacy_without_file = package_fixture(None, Some("missing.schema.json")).unwrap();
-        assert_eq!(legacy_without_file.default_config.trim(), "{}");
-        let metadata = serde_json::to_value(legacy.inspection).unwrap();
-        assert!(metadata.get("configSchema").is_none());
-        assert!(metadata["manifest"].get("configSchema").is_none());
-        assert!(metadata["manifest"].get("configUi").is_none());
+        assert!(package_fixture(Some(b"{}"), Some("config.json")).is_err());
+        assert!(package_fixture(None, Some("missing.schema.json")).is_err());
+        assert!(
+            package_fixture(None, None)
+                .err()
+                .unwrap()
+                .contains("缺少 config.json")
+        );
+        for field in ["configSchema", "configUi"] {
+            let mut manifest =
+                serde_json::to_value(super::super::tests::fixture_package().inspection.manifest)
+                    .unwrap();
+            manifest[field] = serde_json::json!({});
+            assert!(serde_json::from_value::<Manifest>(manifest).is_err());
+        }
         for invalid in [b"[]".as_slice(), b"{broken".as_slice(), &[0xff]] {
             assert!(package_fixture(Some(invalid), None).is_err());
         }

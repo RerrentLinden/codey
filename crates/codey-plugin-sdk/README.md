@@ -1,6 +1,6 @@
 # Codey Plugin SDK
 
-此 SDK 用于独立开发 Codey 原生 Rust 插件，不依赖 CPA 或 Codex 插件市场。插件编译为 `cdylib`，通过 `export_plugin!` 同时导出 `codey_plugin_entry_v1` 和可选的 `codey_plugin_entry_with_context_v1`。Rust trait 仅在插件内部使用，动态库边界采用 ABI v1 的 C 布局函数表和字节缓冲区，返回内存由插件自己的释放函数回收。
+此 SDK 用于独立开发 Codey 原生 Rust 插件，不依赖 CPA 或 Codex 插件市场。插件编译为 `cdylib`，通过 `export_plugin!` 导出唯一入口 `codey_plugin_entry_v1`。Rust trait 仅在插件内部使用，动态库边界采用 ABI v1 的 C 布局函数表和字节缓冲区，返回内存由插件自己的释放函数回收。
 
 实现 `Plugin::create` 与 `Plugin::invoke` 后即可使用导出宏。宿主串行调用同一个实例；构造函数和回调应及时返回。自行创建的后台任务必须在实例销毁前停止。SDK 在展开模式下捕获 Rust panic；无法隔离段错误、进程退出或死循环，因此只应安装可信插件。
 
@@ -12,9 +12,9 @@
 
 ## 插件目录与持久数据
 
-每个插件使用 Codey 用户状态目录下的 `codey-plugins/installed/<plugin-id>/`。程序制品位于 `versions/<version-uuid>/`，持久数据位于 `data/`，日志位于 `logs/`，唯一运行配置为插件目录中的 `config.json`。首次安装复制包内模板，升级保留已有配置。旧版直接位于插件目录中的版本制品仍可加载。配置及启用状态由宿主统一管理。
+每个插件使用 Codey 用户状态目录下的 `codey-plugins/installed/<plugin-id>/`。程序制品位于 `versions/<version-uuid>/`，持久数据位于 `data/`，日志位于 `logs/`，唯一运行配置为插件目录中的 `config.json`。首次安装复制包内模板，升级保留已有配置。配置及启用状态由宿主统一管理。
 
-覆盖 `Plugin::create_with_context(config, context)` 可获取 `PluginContext`，包含绝对路径 `plugin_dir`、`data_dir`、`log_dir` 和 `plugin_id`。宿主优先调用新入口，输入为 `{"config":...,"context":{"pluginId":...,"pluginDir":...,"dataDir":...,"logDir":...}}`；原入口仍只接收原配置。默认实现调用 `create(config)`，已有插件无需改动。宿主不会修改全进程工作目录或环境变量。
+实现 `Plugin::create(config, context)` 接收配置及必填的 `PluginContext`，后者包含绝对路径 `plugin_dir`、`data_dir`、`log_dir` 和 `plugin_id`。ABI 初始化输入固定为 `{"config":...,"context":{"pluginId":...,"pluginDir":...,"dataDir":...,"logDir":...}}`，缺失配置或上下文时拒绝初始化。宿主不会修改全进程工作目录或环境变量。
 
 升级、停用、重新启用及重启均保留 data 和 logs。卸载默认保留配置、数据与日志，重装相同 ID 后继续使用；选择清理数据才删除插件目录。仍在执行或销毁的实例会阻止卸载，避免清理后回调重新写入。库映射可能使 Windows 文件清理需要退出 Codey 后再进行，清理失败会明确返回残留路径。
 
@@ -30,9 +30,9 @@
 
 显示说明时优先使用同级字段名，再查找祖先对象的点分隔字段名；数组路径省略下标，例如 `stateConfigs.model` 可说明每项的 `model`。真实的同名含点字段优先，存在歧义时应把说明放在嵌套对象自身的 `_comments` 中。没有对应字段的说明保留在文件中，不生成可编辑项。
 
-首版支持 `request.beforeSend`。此回调收到 `params.metadata`（请求 ID、线路 ID、账号句柄、模型和协议）及 `params.headers`，后者只包含 manifest 的 `headerNames` 声明的现有字段。回调返回 `{"headers":[{"name":"x-example","value":"value"}]}`，value 为 null 表示移除。认证、传输控制及 Codey 内部请求头不可修改。请求体不会发送给插件；核心的路由提示规范化仍在回调后执行。
+请求扩展统一声明 `request.lifecycle.v1`，使用 SDK 的 `lifecycle` 协议类型。宿主在发送前、收到响应头、等待恢复及请求结束时调用插件；插件可修改授权的请求头，或返回等待、受限重发及终止动作。多个插件按 ID 排序执行，返回值整体验证后才应用。处理异常时默认终止请求，可显式声明异常时继续。
 
-多个插件按 ID 排序执行，后一个可以看到前一个对相同授权字段的修改。返回值整体验证后才应用；回调失败的实例退出活动集合，原请求继续处理，用户可在管理界面查看错误并重新启用。其他方法由插件自行定义，可通过 `invoke_codey_plugin` 管理命令调用。
+其他管理方法由插件自行定义，通过 `invoke_codey_plugin` 调用。完整的权限、事件、动作及传输边界见 [请求生命周期协议](REQUEST_LIFECYCLE.md)。
 
 ## 示例
 
@@ -40,7 +40,7 @@
 
 ```sh
 cargo build -p codey-plugin-header-demo
-python3 scripts/package-plugin.py --library target/debug/libcodey_plugin_header_demo.dylib --config examples/plugins/header-demo/config.json --output /tmp/header-demo.codey-plugin --id dev.codey.header-demo --name 请求头示例 --version 0.1.0 --header x-plugin-demo
+python3 scripts/package-plugin.py --library target/debug/libcodey_plugin_header_demo.dylib --config examples/plugins/header-demo/config.json --output /tmp/header-demo.codey-plugin --id dev.codey.header-demo --name 请求头示例 --version 0.1.0 --capability request.lifecycle.v1 --header x-plugin-demo
 ```
 
 示例命令的动态库路径适用于 macOS；其他平台使用对应扩展名。若设置了 Cargo target-dir，应替换制品路径。打包工具不覆盖已有输出，省略 `--config` 时写入空对象模板。示例只添加测试请求头，首次验证建议使用本地模拟上游。

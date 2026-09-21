@@ -24,9 +24,27 @@ parser.add_argument("--version", required=True)
 parser.add_argument("--platform", choices=["macos", "windows", "linux"], default={"Darwin":"macos", "Windows":"windows", "Linux":"linux"}.get(platform.system()))
 parser.add_argument("--arch", default={"arm64":"aarch64", "AMD64":"x86_64"}.get(platform.machine(), platform.machine()))
 parser.add_argument("--header", action="append", default=[])
+parser.add_argument("--capability", action="append", default=[], choices=["request.lifecycle.v1", "request.lifecycle.auth"])
+parser.add_argument("--response-header", action="append", default=[])
+parser.add_argument("--lifecycle-failure-policy", choices=["abort", "continue"])
+parser.add_argument("--lifecycle-max-wait-ms", type=int)
 args = parser.parse_args()
 if args.output.suffix != ".codey-plugin":
     parser.error("输出文件必须使用 .codey-plugin 扩展名")
+capabilities = list(args.capability)
+if len(set(capabilities)) != len(capabilities):
+    parser.error("扩展能力不能重复声明")
+lifecycle = "request.lifecycle.v1" in capabilities
+if not lifecycle and ("request.lifecycle.auth" in capabilities or args.response_header
+                      or args.lifecycle_failure_policy is not None or args.lifecycle_max_wait_ms is not None):
+    parser.error("生命周期参数需要 --capability request.lifecycle.v1")
+if args.lifecycle_max_wait_ms is not None and not 1 <= args.lifecycle_max_wait_ms <= 600000:
+    parser.error("生命周期等待上限必须是 1–600000 毫秒")
+if args.header and not lifecycle:
+    parser.error("请求头参数需要 --capability request.lifecycle.v1")
+for names in (args.header, args.response_header):
+    if len(names) > 32 or len({name.lower() for name in names}) != len(names):
+        parser.error("请求头和响应头各最多声明 32 项，名称不能重复")
 library = args.library.read_bytes()
 config = b"{}\n"
 if args.config is not None:
@@ -65,9 +83,15 @@ manifest = {
     "id": args.id, "name": args.name, "version": args.version,
     "abiVersion": 1, "platform": args.platform, "arch": args.arch,
     "entry": entry, "librarySha256": hashlib.sha256(library).hexdigest(),
-    "capabilities": ["request.beforeSend"] if args.header else [],
+    "capabilities": capabilities,
     "headerNames": args.header
 }
+if lifecycle:
+    manifest["responseHeaderNames"] = args.response_header
+    if args.lifecycle_failure_policy is not None:
+        manifest["lifecycleFailurePolicy"] = args.lifecycle_failure_policy
+    if args.lifecycle_max_wait_ms is not None:
+        manifest["lifecycleMaxWaitMs"] = args.lifecycle_max_wait_ms
 args.output.parent.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(args.output, "x", compression=zipfile.ZIP_DEFLATED) as package:
     package.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))

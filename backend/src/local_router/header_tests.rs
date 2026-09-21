@@ -226,7 +226,7 @@ fn codey_plugin_header_patches_preserve_authentication_and_support_removal() {
     headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer fixture"));
     headers.insert("x-plugin-demo", HeaderValue::from_static("old"));
     headers.insert("x-remove-demo", HeaderValue::from_static("remove"));
-    super::responses::apply_codey_plugin_header_patches(
+    super::lifecycle::apply_codey_plugin_header_patches(
         &mut headers,
         vec![
             crate::codey_plugins::HeaderPatch {
@@ -253,7 +253,7 @@ fn codey_plugin_invalid_patch_does_not_partially_change_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-plugin-demo", HeaderValue::from_static("original"));
         let original = headers.clone();
-        super::responses::apply_codey_plugin_header_patches(
+        super::lifecycle::apply_codey_plugin_header_patches(
             &mut headers,
             vec![
                 crate::codey_plugins::HeaderPatch {

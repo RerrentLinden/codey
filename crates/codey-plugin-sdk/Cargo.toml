@@ -21,6 +21,7 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tempfile = "3"
+tokio = { workspace = true, features = ["sync"] }
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

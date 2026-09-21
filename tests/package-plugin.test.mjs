@@ -41,7 +41,7 @@ with zipfile.ZipFile(sys.argv[1]) as package:
 test("plugin package preserves library, config text and manifest without overwriting output", options, t => {
   const f = fixture(t);
   writeFileSync(f.config, '{\n  "_comments": {"value":"示例值", "_comments":"{\\"_comments\\":null} // 代码示例", "":""},\n  "value" : "示例",\n  "rules": [{"_comments":{"state":"说明"}, "nested":[[{"_comments":{}}]]}],\n  "_comment": null, "__comments": false, "_commentsExtra": [1], "text": "_comments"\n}\n');
-  assert.equal(f.run(["--header", "X-Demo", "--config", f.config]).status, 0);
+  assert.equal(f.run(["--capability", "request.lifecycle.v1", "--header", "X-Demo", "--config", f.config]).status, 0);
   const files = archive(f.output), manifest = JSON.parse(files["manifest.json"]);
   assert.deepEqual(Object.keys(files).sort(), ["config.json", "lib/demo.so", "manifest.json"]);
   assert.deepEqual(files["lib/demo.so"], readFileSync(f.library));
@@ -49,8 +49,8 @@ test("plugin package preserves library, config text and manifest without overwri
   assert.deepEqual(manifest, {
     id: "test.demo", name: "打包测试", version: "1.0.0", abiVersion: 1,
     platform: "linux", arch: "x86_64", entry: "lib/demo.so",
-    librarySha256: digest(readFileSync(f.library)), capabilities: ["request.beforeSend"],
-    headerNames: ["X-Demo"],
+    librarySha256: digest(readFileSync(f.library)), capabilities: ["request.lifecycle.v1"],
+    headerNames: ["X-Demo"], responseHeaderNames: [],
   });
   const saved = readFileSync(f.output);
   assert.notEqual(f.run().status, 0);
@@ -74,6 +74,40 @@ test("plugin package defaults to an empty configuration object", options, t => {
   const f = fixture(t);
   assert.equal(f.run().status, 0);
   assert.equal(archive(f.output)["config.json"].toString(), "{}\n");
+});
+
+test("plugin package declares lifecycle controls and permissions", options, t => {
+  const f = fixture(t);
+  const result = f.run(["--capability", "request.lifecycle.v1", "--capability", "request.lifecycle.auth",
+    "--header", "x-example", "--response-header", "content-type", "--lifecycle-failure-policy", "abort",
+    "--lifecycle-max-wait-ms", "45000"]);
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(archive(f.output)["manifest.json"]);
+  assert.deepEqual(manifest.capabilities, ["request.lifecycle.v1", "request.lifecycle.auth"]);
+  assert.deepEqual(manifest.headerNames, ["x-example"]);
+  assert.deepEqual(manifest.responseHeaderNames, ["content-type"]);
+  assert.equal(manifest.lifecycleFailurePolicy, "abort");
+  assert.equal(manifest.lifecycleMaxWaitMs, 45000);
+});
+
+test("plugin package rejects inconsistent lifecycle permissions and limits", options, t => {
+  const f = fixture(t);
+  for (const args of [
+    ["--capability", "request.beforeSend"],
+    ["--header", "x-example"],
+    ["--capability", "request.lifecycle.auth"],
+    ["--response-header", "x-example"],
+    ["--lifecycle-failure-policy", "continue"],
+    ["--lifecycle-max-wait-ms", "1000"],
+    ["--capability", "request.lifecycle.v1", "--lifecycle-max-wait-ms", "0"],
+    ["--capability", "request.lifecycle.v1", "--lifecycle-max-wait-ms", "600001"],
+    ["--capability", "request.lifecycle.v1", "--capability", "request.lifecycle.v1"],
+    ["--capability", "request.lifecycle.v1", "--response-header", "X-Demo", "--response-header", "x-demo"],
+  ]) {
+    const result = f.run(args);
+    assert.notEqual(result.status, 0, args.join(" "));
+    assert.equal(existsSync(f.output), false);
+  }
 });
 
 for (const [name, content] of [["oversized", Buffer.alloc(1024 * 1024 + 1)], ["invalid UTF-8", Buffer.from([0xff])], ["invalid JSON", "invalid"], ["array", "[]"], ["null", "null"], ["NaN", '{"value":NaN}'], ["infinity", '{"value":Infinity}'], ["JSONC", '{ // comment\n "x": 1 }']]) {

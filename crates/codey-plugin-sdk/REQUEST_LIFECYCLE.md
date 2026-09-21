@@ -1,0 +1,109 @@
+# 请求生命周期协议 v1
+
+此协议通过现有 ABI v1 的 `Plugin::invoke` 传递 JSON，宿主负责执行流程，插件负责自己的业务任务。适用于本地路由完成请求解析、线路选择和认证后的 Responses 请求及远程压缩；此前的输入校验失败不进入生命周期。
+
+## 权限声明
+
+在插件 manifest 中声明：
+
+```json
+{
+  "capabilities": ["request.lifecycle.v1"],
+  "headerNames": ["x-example-state"],
+  "responseHeaderNames": ["x-example-state", "content-type"],
+  "lifecycleFailurePolicy": "abort",
+  "lifecycleMaxWaitMs": 30000
+}
+```
+
+`headerNames` 控制可读取和修改的请求头；`responseHeaderNames` 控制可读取的响应头，各最多 32 项且名称不能重复。认证、Cookie 和宿主内部头不能通过这两个列表授权。响应头只读，可声明读取 Content-Type 等传输信息。空名单有效；请求体、URL、路由和认证头不能由此协议修改。
+
+失败策略默认为 `abort`：回调错误、无效动作、实例停用、执行忙或超时会终止本次请求。选择 `continue` 时跳过本阶段出错的插件；插件主动返回的 `abort` 始终生效。等待上限默认为 30000 毫秒，允许 1–600000。这些字段及 `request.lifecycle.auth` 都要求同时声明 `request.lifecycle.v1`。
+
+需要官方账号认证上下文的可信插件可额外声明 `request.lifecycle.auth`。仅在官方线路且已解析到令牌时，控制事件带 `credentials: {accessToken, upstreamAccountId}`；其他情况下省略。该信息只经过后端内存，插件不得放入错误消息、管理方法输出或日志。原生插件本身并不处于沙箱中。
+
+## 事件与顺序
+
+每个逻辑请求固定一份已启用插件实例快照，按插件 ID 顺序调用。运行中启用的新实例只参与后续请求；停用或替换会撤销旧实例在等待中的控制权。同一个实例串行执行回调，正常并发请求异步排队，等待期间不占用原生线程。
+
+| 方法 | 时机 | 返回值 |
+| --- | --- | --- |
+| `request.beforeSend` | 每次上游 HTTP 发送前 | `continue`、`wait`、`abort` |
+| `request.afterHeaders` | 收到上游响应头，下游响应尚未开始 | `continue`、`wait`、`retry`、`abort` |
+| `request.resume` | 宿主轮询同一插件的等待任务 | 沿用原阶段允许的动作 |
+| `request.completed` | HTTP 响应成功传输完成 | 忽略 |
+| `request.failed` | HTTP 错误、传输失败或插件终止 | 忽略 |
+| `request.cancelled` | 可检测的下游取消或请求任务被丢弃 | 忽略 |
+
+请求扩展只有这一条调度路径。`request.beforeSend` 是事件名，manifest 中的能力名统一为 `request.lifecycle.v1`。
+
+控制事件可用 `codey_plugin_sdk::lifecycle::RequestEvent` 解析：
+
+```json
+{
+  "requestId": "request-42",
+  "stage": "afterHeaders",
+  "attempt": 0,
+  "metadata": {
+    "requestId": "request-42",
+    "routeId": "route-example",
+    "officialAccountId": null,
+    "upstreamAccountId": null,
+    "accountType": null,
+    "requestedModel": "model-alias",
+    "model": "actual-model",
+    "protocol": "OpenAI Responses",
+    "stream": true,
+    "requestKind": "responses",
+    "subagent": false
+  },
+  "headers": {"x-example-state": "old"},
+  "response": {"status": 200, "headers": {"x-example-state": "new"}}
+}
+```
+
+`requestId` 在整个逻辑请求内不变，`attempt` 首次为 0，重发时为 1；`stage` 仅为 `beforeSend` 或 `afterHeaders`，轮询仍使用原阶段。`response` 在发送前为 null。请求模型是最终上游模型名。`officialAccountId` 是 Codey 的稳定本地账号 ID，`upstreamAccountId` 是实际上游身份，不能混用。`accountType` 仅在官方令牌有套餐声明时提供；缺失值为 null，插件应自行判断能否处理。`requestKind` 为 `responses` 或 `responses_compact`。
+
+## 控制动作
+
+使用 `codey_plugin_sdk::lifecycle::Action` 构造结果，或返回对应 JSON：
+
+```json
+{"action":"continue","headers":[{"name":"x-example-state","value":"ready"}]}
+```
+
+发送前可修改声明过的请求头，`value: null` 表示删除；后面的插件能看到已通过校验的修改。响应头阶段的 `continue` 只能返回空头列表，不能修改已发出的请求。
+
+```json
+{"action":"wait","token":"job-7","pollAfterMs":100}
+```
+
+插件先创建自己的后台任务并迅速返回。宿主保留当前请求或未消费的响应，异步等待后调用同一实例的 `request.resume`，参数保留原事件并增加 `token`。默认轮询间隔为 100 毫秒，实际限制在 50–1000 毫秒。同一次等待不能更换 token；后续 `wait` 不刷新截止时间。token 最长 256 字节且不能包含控制字符，插件应结合 `requestId`、`stage` 和 `attempt` 查找任务，不能只凭 token 跨请求恢复。
+
+```json
+{"action":"retry","headers":[{"name":"x-example-state","value":"ready"}]}
+```
+
+仅响应头阶段可返回 `retry`。宿主丢弃当前响应，将头修改应用到下一次发送，再运行各插件的 `beforeSend`。正文复用原始编码字节；宿主既有的协议修复回退可调整其负责的正文，但与插件共享最多一次重发额度。达到额度或下游已经开始输出时拒绝重发。重发可能产生额外上游计费。
+
+```json
+{"action":"abort","status":502,"code":"resource_unavailable","message":"当前资源不可用"}
+```
+
+`status` 默认 502，只允许 400–599；`code` 默认 `plugin_aborted`，最长 128 字节；`message` 默认提示插件终止请求，最长 2048 字节。两者不能包含控制字符。动作严格校验，未知字段不会被静默忽略。
+
+## 时间、取消与传输边界
+
+每次回调的异步排队和原生执行共用最多 3 秒期限；同一插件阶段从首次 `wait` 开始按 manifest 的上限计时。每个逻辑请求所有插件、阶段及重试的累计回调和等待预算最多 600 秒。原生代码无法被强制终止；超时后执行权保持占用直到该回调返回，后续请求只在异步层有限等待，不继续堆积阻塞任务。
+
+结束事件可用 SDK 的 `TerminalEvent` 解析，只包含元数据、最近阶段、attempt、可用的 token、最终 HTTP status 和错误 code，不携带凭证或头部值。每个请求只提交一次终态通知；通知在后台尽力执行，回调忙、线程异常或进程退出时可能无法送达。插件后台任务仍须有自己的超时，并在插件销毁时停止。
+
+启用生命周期插件的请求使用 HTTP/SSE 上游，以便在每次逻辑响应开始前检查响应头；下游 WebSocket 及其历史恢复仍可使用。未启用生命周期插件时沿用原有原生 WebSocket 路径。v1 不提供正文或流式块修改，`completed` 只表示传输完成，不保证原生 SSE 正文中的业务任务成功。
+
+WebSocket 下游关闭可中断等待。HTTP 的 FIN 与合法写半关闭无法区分，宿主不会将其直接作为取消；可检测的连接写入失败和请求任务丢弃会结束生命周期，其他等待受期限约束。
+
+## 打包
+
+打包脚本支持 `--capability request.lifecycle.v1`、重复的 `--header` 与 `--response-header`、`--lifecycle-failure-policy` 和 `--lifecycle-max-wait-ms`。头名单及生命周期参数必须显式搭配生命周期能力，缺失时直接报错。需要认证上下文时另加 `--capability request.lifecycle.auth`。安装包必须包含 `config.json`；打包时省略 `--config` 会生成空对象模板。
+
+此协议只提供请求控制。账号卡片、代理管理等界面需要独立的前端扩展接口，生命周期声明不会自动挂载插件界面。

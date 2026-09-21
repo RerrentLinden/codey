@@ -506,7 +506,7 @@ if (import.meta.env.DEV) {
     const previewPlugins = ["installed", "config-error", "config-invalid", "config-conflict", "config-values"].includes(pluginPreviewMode ?? "") ? [{
       id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
       description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled", restartRequired: false,
-      configPath: "/preview/codey-plugins/installed/dev.codey.header-demo/config.json", capabilities: ["request.beforeSend"],
+      configPath: "/preview/codey-plugins/installed/dev.codey.header-demo/config.json", capabilities: ["request.lifecycle.v1"],
       pluginDir: "/preview/codey-plugins/installed/dev.codey.header-demo", dataDir: "/preview/codey-plugins/installed/dev.codey.header-demo/data", logDir: "/preview/codey-plugins/installed/dev.codey.header-demo/logs",
     }] : [];
     let pluginConfigContent = pluginPreviewMode === "config-invalid" ? '{ "value": ' : pluginPreviewMode === "config-values" ? JSON.stringify({

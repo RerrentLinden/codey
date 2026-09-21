@@ -4,6 +4,8 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
+pub mod lifecycle;
+
 pub use serde_json;
 use serde_json::Value;
 use std::{fs, io::Write, path::PathBuf};
@@ -113,10 +115,7 @@ pub type EntryPoint = unsafe extern "C" fn() -> *const PluginApiV1;
 
 /// 单个实例的调用被串行化。插件必须在 Drop 中结束自己启动的任务。
 pub trait Plugin: Send + 'static + Sized {
-    fn create(config: Value) -> Result<Self, String>;
-    fn create_with_context(config: Value, _context: PluginContext) -> Result<Self, String> {
-        Self::create(config)
-    }
+    fn create(config: Value, context: PluginContext) -> Result<Self, String>;
     fn invoke(&mut self, method: &str, params: Value) -> Result<Value, String>;
 }
 
@@ -153,7 +152,7 @@ fn output(result: Result<Value, String>, out: *mut Buffer) -> i32 {
 }
 
 /// # Safety
-/// 指针必须指向宿主拥有且在调用期间有效的内存。
+/// 输入必须包含 config 与 context；指针须在调用期间有效。
 pub unsafe extern "C" fn create<P: Plugin>(
     data: *const u8,
     len: usize,
@@ -167,37 +166,14 @@ pub unsafe extern "C" fn create<P: Plugin>(
         *instance = std::ptr::null_mut();
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let config = unsafe { read_json(data, len)? };
-        let plugin = P::create(config)?;
-        unsafe {
-            *instance = Box::into_raw(Box::new(Mutex::new(plugin))).cast();
-        }
-        Ok(Value::Null)
-    }))
-    .unwrap_or_else(|_| Err("插件初始化发生 panic".into()));
-    output(result, out)
-}
-
-/// # Safety
-/// 与 create 相同；输入为包含 config 与 context 的 JSON 对象。
-pub unsafe extern "C" fn create_with_context<P: Plugin>(
-    data: *const u8,
-    len: usize,
-    instance: *mut *mut c_void,
-    out: *mut Buffer,
-) -> i32 {
-    if instance.is_null() {
-        return output(Err("实例输出指针为空".into()), out);
-    }
-    unsafe {
-        *instance = std::ptr::null_mut();
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| {
         let input = unsafe { read_json(data, len)? };
+        let fields = input.as_object().ok_or("初始化参数必须是对象")?;
+        if fields.keys().any(|key| key != "config" && key != "context") {
+            return Err("初始化参数只允许 config 和 context".into());
+        }
         let context = serde_json::from_value(input.get("context").cloned().ok_or("缺少 context")?)
             .map_err(|e| e.to_string())?;
-        let plugin =
-            P::create_with_context(input.get("config").cloned().ok_or("缺少 config")?, context)?;
+        let plugin = P::create(input.get("config").cloned().ok_or("缺少 config")?, context)?;
         unsafe {
             *instance = Box::into_raw(Box::new(Mutex::new(plugin))).cast();
         }
@@ -261,18 +237,6 @@ pub unsafe extern "C" fn free_buffer(buffer: Buffer) {
 macro_rules! export_plugin {
     ($plugin:ty) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn codey_plugin_entry_with_context_v1() -> *const $crate::PluginApiV1 {
-            static API: $crate::PluginApiV1 = $crate::PluginApiV1 {
-                abi_version: $crate::ABI_VERSION,
-                struct_size: std::mem::size_of::<$crate::PluginApiV1>() as u32,
-                create: $crate::create_with_context::<$plugin>,
-                invoke: $crate::invoke::<$plugin>,
-                destroy: $crate::destroy::<$plugin>,
-                free_buffer: $crate::free_buffer,
-            };
-            &API
-        }
-        #[unsafe(no_mangle)]
         pub extern "C" fn codey_plugin_entry_v1() -> *const $crate::PluginApiV1 {
             static API: $crate::PluginApiV1 = $crate::PluginApiV1 {
                 abi_version: $crate::ABI_VERSION,
@@ -320,7 +284,7 @@ mod tests {
 
     struct PanicPlugin;
     impl Plugin for PanicPlugin {
-        fn create(_: Value) -> Result<Self, String> {
+        fn create(_: Value, _: PluginContext) -> Result<Self, String> {
             Ok(Self)
         }
         fn invoke(&mut self, _: &str, _: Value) -> Result<Value, String> {
@@ -332,8 +296,9 @@ mod tests {
     fn panic_stays_inside_abi_and_buffers_are_released_by_plugin() {
         let mut instance = std::ptr::null_mut();
         let mut result = Buffer::default();
+        let input = br#"{"config":{},"context":{"pluginId":"test","pluginDir":"plugin","dataDir":"data","logDir":"logs"}}"#;
         assert_eq!(
-            unsafe { create::<PanicPlugin>(b"{}".as_ptr(), 2, &mut instance, &mut result) },
+            unsafe { create::<PanicPlugin>(input.as_ptr(), input.len(), &mut instance, &mut result) },
             0
         );
         unsafe {
@@ -366,6 +331,37 @@ mod tests {
         assert!(instance.is_null());
         unsafe {
             free_buffer(result);
+        }
+    }
+
+    #[test]
+    fn initialization_requires_the_complete_envelope_without_extra_fields() {
+        let context = serde_json::json!({
+            "pluginId": "test", "pluginDir": "plugin", "dataDir": "data", "logDir": "logs"
+        });
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"config": {}}),
+            serde_json::json!({"context": context}),
+            serde_json::json!({"config": {}, "context": null}),
+            serde_json::json!({"config": {}, "context": {"pluginId": "test"}}),
+            serde_json::json!({"config": {}, "context": context, "extra": true}),
+            serde_json::json!([]),
+        ] {
+            let bytes = serde_json::to_vec(&input).unwrap();
+            let mut instance = std::ptr::null_mut();
+            let mut result = Buffer::default();
+            assert_eq!(
+                unsafe {
+                    create::<PanicPlugin>(bytes.as_ptr(), bytes.len(), &mut instance, &mut result)
+                },
+                1,
+                "{input}"
+            );
+            assert!(instance.is_null());
+            unsafe {
+                free_buffer(result);
+            }
         }
     }
 
