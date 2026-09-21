@@ -31,11 +31,9 @@ use crate::local_router::{self, RuntimeRouterEndpoint};
 
 mod fastctx;
 mod fs_io;
-mod locale_migration;
 mod repair;
 mod runtime_role_transaction;
 
-pub(crate) use locale_migration::migrate_legacy_default_locale;
 pub(crate) use repair::{ConfigRepairFailure, repair_codex_config};
 
 use fastctx::{

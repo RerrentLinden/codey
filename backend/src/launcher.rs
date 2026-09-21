@@ -387,45 +387,6 @@ fn record_reserved_provider_repair_failure(
     );
 }
 
-/// 旧版默认语言遗留值不清理只是让界面语言保持原样，因此失败只记诊断信息。
-fn record_locale_migration_failure(home: &std::path::Path, error: String, task_join_failed: bool) {
-    error_log::record_failure_with_metadata(
-        "locale_migration_failed",
-        "migrate_legacy_default_locale",
-        error,
-        error_log::FailureMetadata {
-            stage: Some("startup.locale_migration".to_string()),
-            recoverable: Some(true),
-        },
-        serde_json::json!({
-            "codexHome": home,
-            "taskJoinFailed": task_join_failed,
-        }),
-    );
-}
-
-async fn run_startup_locale_migration(home: &std::path::Path) {
-    // 语言迁移只清理旧版留下的默认值，属于非关键维护：失败时记录真实原因
-    // 并继续启动。阻断启动会让一处无关的配置问题（例如 base_url 非非空字符串）
-    // 表现为「迁移语言失败」，用户既看不到真实原因也无法进入 Codex。未写入
-    // 的迁移标记会在下次启动重试。只碰 config.toml 和迁移标记，可与会话修复、
-    // catalog 并行。
-    let locale_home = home.to_path_buf();
-    match tokio::task::spawn_blocking(move || {
-        crate::codex_config::migrate_legacy_default_locale(&locale_home)
-    })
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            record_locale_migration_failure(home, format!("{error:#}"), false);
-        }
-        Err(error) => {
-            record_locale_migration_failure(home, format!("{error}"), true);
-        }
-    }
-}
-
 async fn run_startup_session_maintenance(
     home: &std::path::Path,
 ) -> Result<SessionMaintenanceSummary> {
@@ -1588,10 +1549,9 @@ async fn prepare_startup_storage(
         // before any permanent maintenance is applied.
         prepare_codex_for_launch(&app_dir).await?;
 
-        // Locale writes config.toml + a marker; session repair and catalog use
-        // other files. Run them together only after the old Codex writer stops.
-        let ((), session_maintenance, startup_catalog) = tokio::join!(
-            run_startup_locale_migration(home),
+        // Session repair and catalog use other files. Run them together only
+        // after the old Codex writer stops.
+        let (session_maintenance, startup_catalog) = tokio::join!(
             run_startup_session_maintenance(home),
             async {
                 match current_profile {
