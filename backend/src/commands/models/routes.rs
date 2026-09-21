@@ -16,7 +16,7 @@ pub async fn set_route_enabled(
         config = config.normalize();
     }
     // 启停只保存线路及其模型依赖，不重新配置通知、日志保护等无关功能。
-    save_config_to_store(state, &config).await?;
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     drop(config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
@@ -71,7 +71,7 @@ pub async fn delete_route(
     ensure_route_revision(&previous, expected_revision)?;
     let route_id = route_id.trim();
     let config = config_after_route_deletion(&previous, route_id)?;
-    save_config_to_store(state, &config).await?;
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     let model_state = current_model_state_async(&config).await?;
     drop(_config_write_guard);
@@ -224,9 +224,14 @@ pub async fn fetch_route_models(
         }
     };
     timings.mark("prepareModelsMs");
-    if let Err(error) = save_config_to_store(state, &latest).await {
-        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
-    }
+    let latest = match save_config_to_store(state, latest).await {
+        Ok(latest) => latest,
+        Err(error) => {
+            return Err(
+                rollback_model_catalog_after_config_save_async(catalog_refresh, error).await,
+            );
+        }
+    };
     *state.config.write().await = latest.clone();
     drop(_config_write_guard);
     timings.mark("saveConfigMs");

@@ -57,6 +57,7 @@ import {
 } from "./routeShortNames";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
 import { invoke } from "./api";
+import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
 
 type ModelSectionProps = {
@@ -269,7 +270,7 @@ function ModelSectionComponent({
   // 官方线路的线路名、短名称和代理保存在所属账号记录里，保存入口在线路卡片上。
   const refreshOfficialAccounts = useCallback(async () => {
     try {
-      const result = await invoke<OfficialAccountsResult>("list_official_accounts");
+      const result = await listOfficialAccounts();
       setOfficialAccounts(result.accounts ?? []);
     } catch {
       setOfficialAccounts(null);
@@ -278,7 +279,10 @@ function ModelSectionComponent({
 
   const handleOfficialAccountsChanged = useCallback(
     (result: OfficialAccountsResult) => {
-      if (Array.isArray(result.accounts)) setOfficialAccounts(result.accounts);
+      if (Array.isArray(result.accounts)) {
+        rememberOfficialAccounts(result);
+        setOfficialAccounts(result.accounts);
+      }
       onOfficialAccountsChanged(result);
     },
     [onOfficialAccountsChanged],

@@ -18,9 +18,10 @@ import {
   IconX,
 } from "@tabler/icons-react";
 
-import type { Config, OfficialAccount, OfficialAccountsResult, Profile } from "./App.types";
+import type { Config, OfficialAccount, Profile } from "./App.types";
 import requestLogStyles from "./styles.request-log.css?inline";
 import { invoke } from "./api";
+import { listOfficialAccounts } from "./officialAccountsRequests";
 import { loadRequestLogModels, type ModelPage } from "./requestLogModels";
 import { errorText } from "./appUtils";
 import { formatBytes, formatTimestamp } from "./formatters";
@@ -200,6 +201,19 @@ function PortalScope({ container, children }: { container: HTMLElement | null | 
 
 type RequestLogTableColumn<Row> = { title: string; width: number; render: (record: Row) => React.ReactNode };
 type RequestLogTableRow = { key: string; item: RouteRequestLogItem; cells: React.ReactNode[] };
+const REQUEST_LOG_TABLE_COLUMNS: RequestLogTableColumn<RequestLogTableRow>[] = [
+  { title: "时间 / 请求 ID", width: 180, render: (record) => record.cells[0] },
+  { title: "会话 ID", width: 190, render: (record) => record.cells[1] },
+  { title: "供应商 / 上游", width: 180, render: (record) => record.cells[2] },
+  { title: "模型", width: 232, render: (record) => record.cells[3] },
+  { title: "思考强度", width: 100, render: (record) => record.cells[4] },
+  { title: "上游协议", width: 100, render: (record) => record.cells[5] },
+  { title: "状态", width: 120, render: (record) => record.cells[6] },
+  { title: "耗时", width: 150, render: (record) => record.cells[7] },
+  { title: "Token 用量", width: 230, render: (record) => record.cells[8] },
+  { title: "缓存 Token", width: 130, render: (record) => record.cells[9] },
+];
+
 function RequestLogTable({ columns, rows = [], onRowAction }: {
   columns: RequestLogTableColumn<RequestLogTableRow>[];
   rows?: RequestLogTableRow[];
@@ -413,6 +427,267 @@ function unavailableMessage(reason?: string) {
   return "当前请求日志存储暂不可查询，请稍后重试。";
 }
 
+function buildRequestLogRow(
+  item: RouteRequestLogItem,
+  copiedId: string | null,
+  officialAccountLabel: (accountId?: string | null) => string,
+  handleCopyId: (requestId: string) => void,
+): RequestLogTableRow {
+   const presentation = statusPresentation[item.status] ?? { label: item.status || "未知", variant: "secondary" as const };
+   const hasUpstreamError = [item.statusCode, item.upstreamStatusCode].some((statusCode) => statusCode != null && (statusCode < 200 || statusCode >= 300));
+   const upstreamErrorSummary = item.upstreamErrorSummary || item.errorCode || "上游未提供具体错误信息";
+   const upstreamErrorPreview = upstreamErrorSummary.length > 512
+     ? `${upstreamErrorSummary.slice(0, 512)}…（完整内容见详情）`
+     : upstreamErrorSummary;
+   const usageUnavailable = usageUnavailablePresentation(item.usageUnavailableReason);
+   const cacheHitRate = formatCacheHitRate(item.inputTokens, item.cachedInputTokens);
+   const cancellation = cancellationPresentation(item);
+   const displayedTtft = item.downstreamFirstContentMs ?? item.ttftMs;
+   const timingTitle = item.downstreamFirstContentMs == null
+     ? `首字耗时 (旧指标，上游首包): ${formatDuration(item.ttftMs)}`
+     : `端到端首内容: ${formatDuration(item.downstreamFirstContentMs)} · 路由前置: ${formatDuration(item.routerPreUpstreamMs)} · 上游首包: ${formatDuration(item.upstreamFirstByteMs)}`;
+   // 请求模型是 Codey 发往上游的模型；实际模型是上游响应里回报的模型。
+   const sentModel = (item.model ?? "").trim() || item.requestedModel.trim();
+   const upstreamModel = (item.upstreamResponseModel ?? "").trim();
+   const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);
+return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
+                          <div className="grid min-w-36 max-w-44 gap-0.5 font-mono">
+                            <span className="whitespace-nowrap text-[11px] text-[var(--codey-text,#1d1d1f)]">
+                              {formatTimestamp(item.timestampUnixMs)}
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="xs"
+                              aria-label={`复制请求 ID：${item.requestId}`}
+                              className="group h-auto min-h-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-subtle,#8e8e93)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
+                              title={`请求 ID: ${item.requestId}（点击复制）`}
+                              onClick={() => handleCopyId(item.requestId)}
+                            >
+                              <span className="truncate select-all">
+                                {copiedId === item.requestId ? "已复制" : item.requestId}
+                              </span>
+                              {copiedId === item.requestId ? (
+                                <IconCheck size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                              ) : (
+                                <IconCopy size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100" aria-hidden="true" />
+                              )}
+                            </Button>
+                          </div>
+                        </div>,
+<div className="w-40 max-w-40 overflow-hidden">
+                          {item.codexSessionId ? (
+                            <div className="flex w-36 max-w-36 items-center gap-1.5 overflow-hidden">
+                              {item.codexSessionIsParent ? (
+                                <Badge
+                                  variant="secondary"
+                                  className="shrink-0 whitespace-nowrap"
+                                >
+                                  父
+                                </Badge>
+                              ) : null}
+                              <Button
+                                variant="ghost"
+                                size="xs"
+                                className="group h-auto min-h-0 min-w-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-muted,#6e6e73)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
+                                title={`${item.codexSessionIsParent ? "父会话" : "会话"} ID: ${item.codexSessionId}（点击复制）`}
+                                aria-label={`复制${item.codexSessionIsParent ? "父会话" : "会话"} ID：${item.codexSessionId}`}
+                                onClick={() => handleCopyId(item.codexSessionId!)}
+                              >
+                                <span className="truncate select-all">
+                                  {copiedId === item.codexSessionId ? "已复制" : item.codexSessionId}
+                                </span>
+                                {copiedId === item.codexSessionId ? (
+                                  <IconCheck size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                                ) : (
+                                  <IconCopy size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" aria-hidden="true" />
+                                )}
+                              </Button>
+                            </div>
+                          ) : (
+                            <span className="text-[var(--codey-subtle,#8e8e93)]">—</span>
+                          )}
+                        </div>,
+                        <div>
+                          <div className="grid min-w-32 max-w-56 gap-0.5">
+                            <div className="flex min-w-0 items-center gap-1">
+                              {item.officialAccountId ? (
+                                <span
+                                  className="shrink-0 rounded bg-blue-50 dark:bg-blue-950 px-1 py-px text-[10px] font-medium text-blue-600 dark:text-blue-400"
+                                  title="官方账号"
+                                >
+                                  官
+                                </span>
+                              ) : null}
+                              <strong
+                                className="truncate font-semibold text-[var(--codey-text,#1d1d1f)]"
+                                title={item.providerName || item.provider || undefined}
+                              >
+                                {item.providerName || item.provider || "—"}
+                              </strong>
+                            </div>
+                            {item.officialAccountId ? (
+                              <span
+                                className="truncate text-[10px] text-[var(--codey-text-soft,#48484a)]"
+                                title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
+                              >
+                                {officialAccountLabel(item.officialAccountId)}
+                              </span>
+                            ) : null}
+                            {!item.officialAccountId && item.upstreamAuthority ? (
+                              <span
+                                className="truncate font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]"
+                                title={`上游: ${item.upstreamAuthority}`}
+                              >
+                                {item.upstreamAuthority}
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>,
+<div className="grid min-w-32 max-w-56 gap-0.5">
+                          <span
+                            className="truncate font-medium text-[var(--codey-text,#1d1d1f)]"
+                            title={sentModel ? `请求模型（发往上游）：${sentModel}` : undefined}
+                          >
+                            {sentModel || "—"}
+                          </span>
+                          {upstreamModelDiffers ? (
+                            <span
+                              className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--codey-subtle,#8e8e93)]"
+                              title={`上游实际使用模型：${upstreamModel}`}
+                            >
+                              <span className="shrink-0">实际</span>
+                              <span className="truncate">{upstreamModel}</span>
+                            </span>
+                          ) : null}
+                        </div>,
+<div className="whitespace-nowrap text-[var(--codey-text-soft,#48484a)]">{reasoningLabel(item)}</div>,
+<div>
+                          <Badge
+                            variant="secondary"
+                            className={`request-log-protocol ${protocolTagClass(item.upstreamTransport)}`}
+                          >
+                            {item.upstreamTransport === "http_sse" ? "SSE" : (item.upstreamTransport || "—").toUpperCase()}
+                          </Badge>
+                        </div>,
+<div>
+                          <div className="grid min-w-20 gap-1">
+                            <div className="flex items-center gap-1">
+                              <Badge variant={presentation.variant} className="request-log-status">
+                                {presentation.label}
+                              </Badge>
+                              {hasUpstreamError ? (
+                                <Tooltip
+                                  content={(
+                                    <span className="block max-w-[420px] break-words whitespace-normal">
+                                      {upstreamErrorPreview}
+                                    </span>
+                                  )}
+                                  position="top"
+                                >
+                                  <Button
+                                    size="xs"
+                                    variant="ghost"
+                                    aria-label="查看上游错误信息"
+                                  >
+                                    <IconQuestionMark size={12} aria-hidden="true" />
+                                  </Button>
+                                </Tooltip>
+                              ) : null}
+                              {cancellation ? (
+                                <Tooltip
+                                  content={(
+                                    <span className="block max-w-[420px] break-words whitespace-normal">
+                                      {cancellation.message}
+                                    </span>
+                                  )}
+                                  position="top"
+                                >
+                                  <Button
+                                    size="xs"
+                                    variant="ghost"
+                                    aria-label={`查看中断原因：${cancellation.message}`}
+                                  >
+                                    <IconQuestionMark size={12} aria-hidden="true" />
+                                  </Button>
+                                </Tooltip>
+                              ) : null}
+                            </div>
+                            {item.statusCode != null || item.errorCode || cancellation ? (
+                              <small className="whitespace-nowrap font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]">
+                                {item.statusCode != null
+                                  ? `HTTP ${item.statusCode}`
+                                  : cancellation?.label || item.errorCode}
+                                {cancellation && item.statusCode != null
+                                  ? ` · ${cancellation.label}`
+                                  : null}
+                              </small>
+                            ) : null}
+                          </div>
+                        </div>,
+<div className="whitespace-nowrap tabular-nums">
+                          <div className="grid gap-0.5 text-[11px] leading-4">
+                            <div
+                              className="flex items-center gap-1"
+                              title={timingTitle}
+                            >
+                              <span className="text-[var(--codey-muted,#6e6e73)]">首字</span>
+                              <span className="text-[11px] font-medium text-[var(--codey-text,#1d1d1f)] tabular-nums">
+                                {formatDuration(displayedTtft)}
+                              </span>
+                            </div>
+                            <div
+                              className="flex items-center gap-1"
+                              title={`总耗时: ${formatDuration(item.totalDurationMs)}`}
+                            >
+                              <span className="text-[var(--codey-muted,#6e6e73)]">总用时</span>
+                              <span className="text-[11px] text-[var(--codey-text-soft,#48484a)] tabular-nums">
+                                {formatDuration(item.totalDurationMs)}
+                              </span>
+                            </div>
+                          </div>
+                        </div>,
+<div className="grid gap-0.5 whitespace-nowrap tabular-nums">
+                          <div className="flex items-center gap-1">
+                            <span className="text-[11px] text-[var(--codey-muted,#6e6e73)]">总计:</span>
+                          {item.totalTokens == null ? (
+                            <div className="flex min-w-20 items-center gap-1">
+                              <span className="text-[10px] font-medium text-[var(--codey-subtle,#8e8e93)]">
+                                {usageUnavailable.label}
+                              </span>
+                              <Tooltip
+                                content={(
+                                  <span className="block max-w-[360px] whitespace-normal">
+                                    {usageUnavailable.message}
+                                  </span>
+                                )}
+                                position="top"
+                              >
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  aria-label={`Token 使用量不可用：${usageUnavailable.message}`}
+                                >
+                                  <IconQuestionMark size={12} aria-hidden="true" />
+                                </Button>
+                              </Tooltip>
+                            </div>
+                          ) : (
+                            <strong className="text-sm font-bold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.totalTokens)}</strong>
+                          )}
+                          </div>
+                          <div className="text-[10px] leading-4 text-[var(--codey-muted,#6e6e73)]">
+                            输入: {formatTokens(item.inputTokens)} <span aria-hidden="true" className="text-[var(--codey-subtle,#c7c7cc)]">|</span> 输出: {formatTokens(item.outputTokens)}
+                          </div>
+                          <div className="text-[10px] leading-4 text-[var(--codey-muted,#6e6e73)]">推理: {formatTokens(item.reasoningOutputTokens)}</div>
+                        </div>,
+<div className="grid gap-0.5 whitespace-nowrap tabular-nums" title="缓存命中率 = 缓存输入 Token / 输入 Token；未上报或无法计算时显示 —">
+                          <strong className="text-sm font-bold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.cachedInputTokens)}</strong>
+                          <span className={`text-[10px] font-semibold leading-4 ${cacheHitRate === "—" ? "text-[var(--codey-muted,#6e6e73)]" : "text-[var(--codey-red,#c74735)]"}`}>
+                            {cacheHitRate} 命中
+                          </span>
+                        </div>] }
+}
+
 export function RequestLogDialog({
   catalog,
   container,
@@ -482,6 +757,7 @@ export function RequestLogDialog({
     });
   };
   const [usedModels, setUsedModels] = useState<string[]>([]);
+  const [modelsCatalogNeeded, setModelsCatalogNeeded] = useState(false);
   const copyToastTimer = useRef<number | null>(null);
   useEffect(
     () => () => {
@@ -495,7 +771,7 @@ export function RequestLogDialog({
   const modelsTask = useRef(Promise.resolve());
   const clearInFlight = useRef(false);
 
-  const handleCopyId = (requestId: string, customLabel?: string, toastSubtext = requestId) => {
+  const handleCopyId = useCallback((requestId: string, customLabel?: string, toastSubtext = requestId) => {
     if (!navigator.clipboard) return;
     void navigator.clipboard.writeText(requestId).then(
       () => {
@@ -517,7 +793,7 @@ export function RequestLogDialog({
       },
       () => undefined,
     );
-  };
+  }, []);
 
   const rangeEnd = useMemo(() => Date.now(), [opened, refreshRevision, timeRange, customTo]);
   const toUnixMs = timeRange === "custom" ? new Date(customTo).getTime() : rangeEnd;
@@ -565,7 +841,7 @@ export function RequestLogDialog({
   useEffect(() => {
     if (!opened || !officialRoutesPresent) return;
     let active = true;
-    void invoke<OfficialAccountsResult>("list_official_accounts").then(
+    void listOfficialAccounts().then(
       (result) => { if (active) setOfficialAccounts(result.accounts ?? []); },
       () => { if (active) setOfficialAccounts([]); },
     );
@@ -609,6 +885,7 @@ export function RequestLogDialog({
 
   useEffect(() => {
     if (!opened || !validRange) return;
+    if (!modelsCatalogNeeded && model === "all") return;
     let active = true;
     setUsedModels([]);
     modelsTask.current = modelsTask.current.then(async () => {
@@ -629,7 +906,7 @@ export function RequestLogDialog({
     return () => {
       active = false;
     };
-  }, [opened, fromUnixMs, toUnixMs, provider, officialAccount, validRange, refreshRevision]);
+  }, [opened, fromUnixMs, toUnixMs, provider, officialAccount, validRange, refreshRevision, modelsCatalogNeeded, model]);
 
   // 搜索内容未变时保留分页，避免挂载时清空首页查询刚写入的下一页游标。
   useEffect(() => {
@@ -798,6 +1075,11 @@ export function RequestLogDialog({
     setPageJumpInput(String(nextPage));
     setPage(nextPage);
   };
+
+  const requestLogRows = useMemo(
+    () => (result?.items ?? []).map((item) => buildRequestLogRow(item, copiedId, officialAccountLabel, handleCopyId)),
+    [result?.items, copiedId, officialAccountLabel, handleCopyId],
+  );
 
   if (!opened) return null;
 
@@ -976,6 +1258,9 @@ export function RequestLogDialog({
               filter
               optionList={modelOptions}
               value={model}
+              onOpenChange={(open) => {
+                if (open) setModelsCatalogNeeded(true);
+              }}
               onChange={(value) => {
                 setModel(String(value ?? "all"));
                 resetPagination();
@@ -1407,272 +1692,8 @@ export function RequestLogDialog({
           ) : (
             <div className={`min-h-0 flex-1 overflow-auto ${loading && result ? "opacity-75 transition-opacity" : ""}`} aria-busy={loading}>
               <RequestLogTable
-                columns={[
-                  { title: "时间 / 请求 ID", width: 180, render: (record) => record.cells[0] },
-                  { title: "会话 ID", width: 190, render: (record) => record.cells[1] },
-                  { title: "供应商 / 上游", width: 180, render: (record) => record.cells[2] },
-                  { title: "模型", width: 232, render: (record) => record.cells[3] },
-                  { title: "思考强度", width: 100, render: (record) => record.cells[4] },
-                  { title: "上游协议", width: 100, render: (record) => record.cells[5] },
-                  { title: "状态", width: 120, render: (record) => record.cells[6] },
-                  { title: "耗时", width: 150, render: (record) => record.cells[7] },
-                  { title: "Token 用量", width: 230, render: (record) => record.cells[8] },
-                  { title: "缓存 Token", width: 130, render: (record) => record.cells[9] },
-                ]}
-                rows={result?.items.map((item) => {
-   const presentation = statusPresentation[item.status] ?? { label: item.status || "未知", variant: "secondary" as const };
-   const hasUpstreamError = [item.statusCode, item.upstreamStatusCode].some((statusCode) => statusCode != null && (statusCode < 200 || statusCode >= 300));
-   const upstreamErrorSummary = item.upstreamErrorSummary || item.errorCode || "上游未提供具体错误信息";
-   const upstreamErrorPreview = upstreamErrorSummary.length > 512
-     ? `${upstreamErrorSummary.slice(0, 512)}…（完整内容见详情）`
-     : upstreamErrorSummary;
-   const usageUnavailable = usageUnavailablePresentation(item.usageUnavailableReason);
-   const cacheHitRate = formatCacheHitRate(item.inputTokens, item.cachedInputTokens);
-   const cancellation = cancellationPresentation(item);
-   const displayedTtft = item.downstreamFirstContentMs ?? item.ttftMs;
-   const timingTitle = item.downstreamFirstContentMs == null
-     ? `首字耗时 (旧指标，上游首包): ${formatDuration(item.ttftMs)}`
-     : `端到端首内容: ${formatDuration(item.downstreamFirstContentMs)} · 路由前置: ${formatDuration(item.routerPreUpstreamMs)} · 上游首包: ${formatDuration(item.upstreamFirstByteMs)}`;
-   // 请求模型是 Codey 发往上游的模型；实际模型是上游响应里回报的模型。
-   const sentModel = (item.model ?? "").trim() || item.requestedModel.trim();
-   const upstreamModel = (item.upstreamResponseModel ?? "").trim();
-   const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);
-return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
-                          <div className="grid min-w-36 max-w-44 gap-0.5 font-mono">
-                            <span className="whitespace-nowrap text-[11px] text-[var(--codey-text,#1d1d1f)]">
-                              {formatTimestamp(item.timestampUnixMs)}
-                            </span>
-                            <Button
-                              variant="ghost"
-                              size="xs"
-                              aria-label={`复制请求 ID：${item.requestId}`}
-                              className="group h-auto min-h-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-subtle,#8e8e93)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
-                              title={`请求 ID: ${item.requestId}（点击复制）`}
-                              onClick={() => handleCopyId(item.requestId)}
-                            >
-                              <span className="truncate select-all">
-                                {copiedId === item.requestId ? "已复制" : item.requestId}
-                              </span>
-                              {copiedId === item.requestId ? (
-                                <IconCheck size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
-                              ) : (
-                                <IconCopy size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100" aria-hidden="true" />
-                              )}
-                            </Button>
-                          </div>
-                        </div>,
-<div className="w-40 max-w-40 overflow-hidden">
-                          {item.codexSessionId ? (
-                            <div className="flex w-36 max-w-36 items-center gap-1.5 overflow-hidden">
-                              {item.codexSessionIsParent ? (
-                                <Badge
-                                  variant="secondary"
-                                  className="shrink-0 whitespace-nowrap"
-                                >
-                                  父
-                                </Badge>
-                              ) : null}
-                              <Button
-                                variant="ghost"
-                                size="xs"
-                                className="group h-auto min-h-0 min-w-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-muted,#6e6e73)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
-                                title={`${item.codexSessionIsParent ? "父会话" : "会话"} ID: ${item.codexSessionId}（点击复制）`}
-                                aria-label={`复制${item.codexSessionIsParent ? "父会话" : "会话"} ID：${item.codexSessionId}`}
-                                onClick={() => handleCopyId(item.codexSessionId!)}
-                              >
-                                <span className="truncate select-all">
-                                  {copiedId === item.codexSessionId ? "已复制" : item.codexSessionId}
-                                </span>
-                                {copiedId === item.codexSessionId ? (
-                                  <IconCheck size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
-                                ) : (
-                                  <IconCopy size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" aria-hidden="true" />
-                                )}
-                              </Button>
-                            </div>
-                          ) : (
-                            <span className="text-[var(--codey-subtle,#8e8e93)]">—</span>
-                          )}
-                        </div>,
-                        <div>
-                          <div className="grid min-w-32 max-w-56 gap-0.5">
-                            <div className="flex min-w-0 items-center gap-1">
-                              {item.officialAccountId ? (
-                                <span
-                                  className="shrink-0 rounded bg-blue-50 dark:bg-blue-950 px-1 py-px text-[10px] font-medium text-blue-600 dark:text-blue-400"
-                                  title="官方账号"
-                                >
-                                  官
-                                </span>
-                              ) : null}
-                              <strong
-                                className="truncate font-semibold text-[var(--codey-text,#1d1d1f)]"
-                                title={item.providerName || item.provider || undefined}
-                              >
-                                {item.providerName || item.provider || "—"}
-                              </strong>
-                            </div>
-                            {item.officialAccountId ? (
-                              <span
-                                className="truncate text-[10px] text-[var(--codey-text-soft,#48484a)]"
-                                title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
-                              >
-                                {officialAccountLabel(item.officialAccountId)}
-                              </span>
-                            ) : null}
-                            {!item.officialAccountId && item.upstreamAuthority ? (
-                              <span
-                                className="truncate font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]"
-                                title={`上游: ${item.upstreamAuthority}`}
-                              >
-                                {item.upstreamAuthority}
-                              </span>
-                            ) : null}
-                          </div>
-                        </div>,
-<div className="grid min-w-32 max-w-56 gap-0.5">
-                          <span
-                            className="truncate font-medium text-[var(--codey-text,#1d1d1f)]"
-                            title={sentModel ? `请求模型（发往上游）：${sentModel}` : undefined}
-                          >
-                            {sentModel || "—"}
-                          </span>
-                          {upstreamModelDiffers ? (
-                            <span
-                              className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--codey-subtle,#8e8e93)]"
-                              title={`上游实际使用模型：${upstreamModel}`}
-                            >
-                              <span className="shrink-0">实际</span>
-                              <span className="truncate">{upstreamModel}</span>
-                            </span>
-                          ) : null}
-                        </div>,
-<div className="whitespace-nowrap text-[var(--codey-text-soft,#48484a)]">{reasoningLabel(item)}</div>,
-<div>
-                          <Badge
-                            variant="secondary"
-                            className={`request-log-protocol ${protocolTagClass(item.upstreamTransport)}`}
-                          >
-                            {item.upstreamTransport === "http_sse" ? "SSE" : (item.upstreamTransport || "—").toUpperCase()}
-                          </Badge>
-                        </div>,
-<div>
-                          <div className="grid min-w-20 gap-1">
-                            <div className="flex items-center gap-1">
-                              <Badge variant={presentation.variant} className="request-log-status">
-                                {presentation.label}
-                              </Badge>
-                              {hasUpstreamError ? (
-                                <Tooltip
-                                  content={(
-                                    <span className="block max-w-[420px] break-words whitespace-normal">
-                                      {upstreamErrorPreview}
-                                    </span>
-                                  )}
-                                  position="top"
-                                >
-                                  <Button
-                                    size="xs"
-                                    variant="ghost"
-                                    aria-label="查看上游错误信息"
-                                  >
-                                    <IconQuestionMark size={12} aria-hidden="true" />
-                                  </Button>
-                                </Tooltip>
-                              ) : null}
-                              {cancellation ? (
-                                <Tooltip
-                                  content={(
-                                    <span className="block max-w-[420px] break-words whitespace-normal">
-                                      {cancellation.message}
-                                    </span>
-                                  )}
-                                  position="top"
-                                >
-                                  <Button
-                                    size="xs"
-                                    variant="ghost"
-                                    aria-label={`查看中断原因：${cancellation.message}`}
-                                  >
-                                    <IconQuestionMark size={12} aria-hidden="true" />
-                                  </Button>
-                                </Tooltip>
-                              ) : null}
-                            </div>
-                            {item.statusCode != null || item.errorCode || cancellation ? (
-                              <small className="whitespace-nowrap font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]">
-                                {item.statusCode != null
-                                  ? `HTTP ${item.statusCode}`
-                                  : cancellation?.label || item.errorCode}
-                                {cancellation && item.statusCode != null
-                                  ? ` · ${cancellation.label}`
-                                  : null}
-                              </small>
-                            ) : null}
-                          </div>
-                        </div>,
-<div className="whitespace-nowrap tabular-nums">
-                          <div className="grid gap-0.5 text-[11px] leading-4">
-                            <div
-                              className="flex items-center gap-1"
-                              title={timingTitle}
-                            >
-                              <span className="text-[var(--codey-muted,#6e6e73)]">首字</span>
-                              <span className="text-[11px] font-medium text-[var(--codey-text,#1d1d1f)] tabular-nums">
-                                {formatDuration(displayedTtft)}
-                              </span>
-                            </div>
-                            <div
-                              className="flex items-center gap-1"
-                              title={`总耗时: ${formatDuration(item.totalDurationMs)}`}
-                            >
-                              <span className="text-[var(--codey-muted,#6e6e73)]">总用时</span>
-                              <span className="text-[11px] text-[var(--codey-text-soft,#48484a)] tabular-nums">
-                                {formatDuration(item.totalDurationMs)}
-                              </span>
-                            </div>
-                          </div>
-                        </div>,
-<div className="grid gap-0.5 whitespace-nowrap tabular-nums">
-                          <div className="flex items-center gap-1">
-                            <span className="text-[11px] text-[var(--codey-muted,#6e6e73)]">总计:</span>
-                          {item.totalTokens == null ? (
-                            <div className="flex min-w-20 items-center gap-1">
-                              <span className="text-[10px] font-medium text-[var(--codey-subtle,#8e8e93)]">
-                                {usageUnavailable.label}
-                              </span>
-                              <Tooltip
-                                content={(
-                                  <span className="block max-w-[360px] whitespace-normal">
-                                    {usageUnavailable.message}
-                                  </span>
-                                )}
-                                position="top"
-                              >
-                                <Button
-                                  size="xs"
-                                  variant="ghost"
-                                  aria-label={`Token 使用量不可用：${usageUnavailable.message}`}
-                                >
-                                  <IconQuestionMark size={12} aria-hidden="true" />
-                                </Button>
-                              </Tooltip>
-                            </div>
-                          ) : (
-                            <strong className="text-sm font-bold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.totalTokens)}</strong>
-                          )}
-                          </div>
-                          <div className="text-[10px] leading-4 text-[var(--codey-muted,#6e6e73)]">
-                            输入: {formatTokens(item.inputTokens)} <span aria-hidden="true" className="text-[var(--codey-subtle,#c7c7cc)]">|</span> 输出: {formatTokens(item.outputTokens)}
-                          </div>
-                          <div className="text-[10px] leading-4 text-[var(--codey-muted,#6e6e73)]">推理: {formatTokens(item.reasoningOutputTokens)}</div>
-                        </div>,
-<div className="grid gap-0.5 whitespace-nowrap tabular-nums" title="缓存命中率 = 缓存输入 Token / 输入 Token；未上报或无法计算时显示 —">
-                          <strong className="text-sm font-bold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.cachedInputTokens)}</strong>
-                          <span className={`text-[10px] font-semibold leading-4 ${cacheHitRate === "—" ? "text-[var(--codey-muted,#6e6e73)]" : "text-[var(--codey-red,#c74735)]"}`}>
-                            {cacheHitRate} 命中
-                          </span>
-                        </div>] };})}
+                columns={REQUEST_LOG_TABLE_COLUMNS}
+                rows={requestLogRows}
                 onRowAction={(key) => {
                   const record = result?.items.find((item) => `${item.timestampUnixMs}:${item.requestId}` === key);
                   if (record) setSelectedItem(record);

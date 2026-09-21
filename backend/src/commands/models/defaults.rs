@@ -1,3 +1,6 @@
+use super::super::official_accounts::{
+    refresh_official_route_after_account_change, write_official_account_route_settings,
+};
 use super::*;
 
 pub async fn save_default_model(
@@ -36,7 +39,7 @@ pub async fn save_default_model(
     config = config.normalize();
     config.settings_revision = config.settings_revision.saturating_add(1);
     let model_state = current_model_state_async(&config).await?;
-    save_config_to_store(state, &config).await?;
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
@@ -52,14 +55,31 @@ pub async fn save_default_model(
 
 // 入口层仍解析 reasoningEfforts / modelContexts 参数，官方线路不接受这两类
 // 变更，所以不再传入本函数。
+pub struct OfficialRouteModelSave {
+    pub route_id: String,
+    pub models: Vec<String>,
+    pub enabled: Option<bool>,
+    pub show_account_usage: Option<bool>,
+    pub upstream_proxy: Option<String>,
+    pub account_id: Option<String>,
+    pub route_name: Option<String>,
+    pub route_short_name: Option<String>,
+}
+
 pub async fn save_official_route_models(
     state: &Arc<AppState>,
-    route_id: String,
-    requested_models: Vec<String>,
-    requested_enabled: Option<bool>,
-    requested_show_account_usage: Option<bool>,
-    requested_upstream_proxy: Option<String>,
+    input: OfficialRouteModelSave,
 ) -> Result<Value, String> {
+    let OfficialRouteModelSave {
+        route_id,
+        models: requested_models,
+        enabled: requested_enabled,
+        show_account_usage: requested_show_account_usage,
+        upstream_proxy: requested_upstream_proxy,
+        account_id,
+        route_name,
+        route_short_name,
+    } = input;
     let mut timings = ModelOperationTimings::new("save_official_route_models");
     validate_requested_model_list_bounds("官方模型", &requested_models)?;
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -82,7 +102,7 @@ pub async fn save_official_route_models(
     }
     // 参数缺席表示保持现状；空字符串表示清除代理。地址合法性由配置校验把关。
     let mut mirrored_proxy: Option<String> = None;
-    if let Some(upstream_proxy) = requested_upstream_proxy {
+    if let Some(upstream_proxy) = requested_upstream_proxy.as_deref() {
         let upstream_proxy = upstream_proxy.trim().to_string();
         config.profiles[profile_index].upstream_proxy = upstream_proxy.clone();
         mirrored_proxy = Some(upstream_proxy);
@@ -132,9 +152,14 @@ pub async fn save_official_route_models(
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     config = config.normalize();
     config.settings_revision = config.settings_revision.saturating_add(1);
-    if let Err(error) = save_config_to_store(state, &config).await {
-        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
-    }
+    let config = match save_config_to_store(state, config).await {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(
+                rollback_model_catalog_after_config_save_async(catalog_refresh, error).await,
+            );
+        }
+    };
     // 官方线路在每次启动准备时按账号记录重新派生，因此代理还要写回该线路自己
     // 的账号记录，否则重启后会被派生结果覆盖。失败只降级为提示，不影响已经
     // 生效的配置。
@@ -144,28 +169,65 @@ pub async fn save_official_route_models(
         .iter()
         .find(|profile| profile.id == route_id)
         .and_then(|profile| profile.official_account_id.clone());
-    if let Some(upstream_proxy) = mirrored_proxy
+    let mut saved_account_id = None;
+    if let Some(account_id) = account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+    {
+        match write_official_account_route_settings(
+            state,
+            account_id.to_string(),
+            route_name.unwrap_or_default(),
+            route_short_name.unwrap_or_default(),
+            requested_upstream_proxy.clone().unwrap_or_default(),
+        )
+        .await
+        {
+            Ok(account_id) => saved_account_id = Some(account_id),
+            Err(error) => return Err(error),
+        }
+    } else if let Some(upstream_proxy) = mirrored_proxy
         && let Some(account_id) = route_account_id
         && let Err(error) = persist_official_account_proxy(state, account_id, upstream_proxy).await
     {
         account_override_warning = Some(format!("线路代理未能写入官方账号记录：{error}"));
     }
     *state.config.write().await = config.clone();
-    let public_config = redacted_config(&config);
     drop(_config_write_guard);
     timings.mark("saveConfigMs");
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
-    timings.mark("modelDeliveryMs");
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
-    timings.mark("subagentReloadMs");
-    let restart_required = runtime_config_requires_restart(state, &config).await;
-    let mut response = hot_reload.add_to_response(json!({
-        "status":"ok",
-        "config":public_config,
-        "modelState":model_state,
-        "customContextsRestored":custom_contexts_restored,
-        "restartRequired":restart_required,
-    }));
+    let (mut response, subagent_hot_reload) = if saved_account_id.is_some() {
+        let refresh = refresh_official_route_after_account_change(state).await?;
+        timings.mark("modelDeliveryMs");
+        let config = state.config.read().await.clone();
+        let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+        timings.mark("subagentReloadMs");
+        let mut response = refresh;
+        if let Some(object) = response.as_object_mut() {
+            object.insert(
+                "customContextsRestored".to_string(),
+                Value::Bool(custom_contexts_restored),
+            );
+            object.insert("accountId".to_string(), json!(saved_account_id));
+        }
+        (response, subagent_hot_reload)
+    } else {
+        let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+        timings.mark("modelDeliveryMs");
+        let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+        timings.mark("subagentReloadMs");
+        let restart_required = runtime_config_requires_restart(state, &config).await;
+        (
+            hot_reload.add_to_response(json!({
+                "status":"ok",
+                "config":redacted_config(&config),
+                "modelState":model_state,
+                "customContextsRestored":custom_contexts_restored,
+                "restartRequired":restart_required,
+            })),
+            subagent_hot_reload,
+        )
+    };
     if let Some(warning) = account_override_warning
         && let Some(object) = response.as_object_mut()
     {

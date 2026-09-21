@@ -3,6 +3,7 @@ import { IconBrandOpenai, IconCheck, IconLogin2 as IconLogin, IconPlus, IconRefr
 
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
+import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Tooltip } from "./components/ui";
 import { maskEmail } from "./sensitiveText";
 import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
@@ -194,15 +195,18 @@ export function OfficialAccountsPanel({
 
   const applyResult = useCallback(
     (result: OfficialAccountsResult) => {
-      if (Array.isArray(result.accounts)) setAccounts(result.accounts);
+      if (Array.isArray(result.accounts)) {
+        rememberOfficialAccounts(result);
+        setAccounts(result.accounts);
+      }
       onAccountsChanged(result);
     },
     [onAccountsChanged],
   );
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (force = false) => {
     try {
-      const result = await invoke<OfficialAccountsResult>("list_official_accounts");
+      const result = await listOfficialAccounts({ force });
       const loaded = result.accounts ?? [];
       if (!Array.isArray(loaded)) throw new Error("官方账号列表格式无效，请重新加载");
       setAccounts(loaded);
@@ -387,7 +391,7 @@ export function OfficialAccountsPanel({
     } catch (error) {
       onNotice({ tone: "error", text: errorText(error) });
       // 失败原因可能是账号已失效，重读列表即可显示失效标识并收起切换入口。
-      void refresh();
+      void refresh(true);
     } finally {
       setPending(null);
     }

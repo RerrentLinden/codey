@@ -1,13 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Spinner, Table } from "@heroui/react";
 import { IconRefresh } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
+import { listOfficialAccounts } from "./officialAccountsRequests";
 import { formatTimestamp } from "./formatters";
 import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Select } from "./components/ui";
 import { estimateQuota, loadQuotaUsage, periodRows, PRICING_CHECKED, PRICING_SOURCE, quotaRows, sumQuotaRows, WEEK_MS } from "./quotaEstimate";
 import type { AccountUsageSnapshot, QuotaEstimate, QuotaPage, QuotaRow } from "./quotaEstimate";
-import type { OfficialAccount, OfficialAccountsResult } from "./App.types";
+import type { OfficialAccount } from "./App.types";
 import { maskEmail } from "./sensitiveText";
 import { createAccountUsageReader } from "./accountUsageRequests";
 
@@ -81,6 +82,50 @@ const integer = (value: number) => value.toLocaleString("en-US", { maximumFracti
 const money = (value: number | null) => value == null ? "—" : value.toLocaleString("en-US", {
   style: "currency", currency: "USD", minimumFractionDigits: 4, maximumFractionDigits: 4,
 });
+const metrics = (items: ReadonlyArray<readonly [string, string, string?]>) => <dl className="m-0 grid gap-0.5 text-xs tabular-nums">
+  {items.map(([label, value, colorClass]) => <div key={label} className="flex items-center justify-between gap-2">
+    <dt className="font-normal text-gray-500 dark:text-gray-400">{label}</dt>
+    <dd className={`m-0 font-medium whitespace-nowrap ${colorClass ?? "text-gray-800 dark:text-gray-300"}`}>{value}</dd>
+  </div>)}
+</dl>;
+const columnsFor = (group: EstimateGroup) => {
+  const total = group.total;
+  const period = group.estimate?.period ?? null;
+  const result = group.estimate?.result ?? null;
+  return [
+    { title: "模型名称", key: "model", width: 155, render: (_: unknown, row: QuotaRow) => <div className="break-words">
+      <div className="font-semibold text-gray-900 dark:text-gray-300">{row.model}</div>
+      {row.unpriced > 0 && <div className="mt-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">{row.note}，未计价</div>}
+    </div> },
+    { title: "档位 / 上下文", key: "rules", width: 155, render: (_: unknown, row: QuotaRow) => <div className="text-xs">
+      <div className="font-medium text-gray-800 dark:text-gray-300">{row.tier}{row.context && ` · ${row.context}`}</div>
+      <div className="mt-0.5 text-gray-500 dark:text-gray-400">{row.source}</div>
+    </div> },
+    { title: "调用次数", key: "calls", width: 85, align: "right" as const,
+      render: (_: unknown, row: QuotaRow) => <span className="font-medium tabular-nums text-gray-800 dark:text-gray-300">{integer(row.calls)}</span> },
+    { title: "Token 用量", key: "tokens", width: 175, render: (_: unknown, row: QuotaRow) => metrics([
+      ["输入", integer(row.input)], ["输出", integer(row.output)], ["总计", integer(row.tokens)],
+    ]) },
+    { title: "缓存用量", key: "cache", width: 185, render: (_: unknown, row: QuotaRow) => <>
+      {metrics([["命中次数", integer(row.hits)], ["读取 Token", integer(row.cached)], ["写入 Token", integer(row.writes)]])}
+      {row.missingWrites > 0 && <div className="mt-1 text-[11px] font-medium text-amber-600 dark:text-amber-400">{integer(row.missingWrites)} 次未记录写入量</div>}
+    </> },
+    { title: "费用明细 (USD)", key: "fees", width: 210, render: (_: unknown, row: QuotaRow) => metrics(([
+      ["inputCost", "非缓存输入"], ["outputCost", "输出"], ["readCost", "缓存读取"],
+      ["writeCost", "缓存写入"], ["cacheSaving", "缓存节省（参考）"],
+    ] as const).map(([key, label]) => [
+      label,
+      money(row.calls > 0 && row.unpriced === row.calls ? null : row[key]),
+      key === "cacheSaving" && (row.cacheSaving ?? 0) > 0 ? "text-emerald-600 dark:text-emerald-400 font-semibold" : undefined,
+    ])) },
+    { title: "额度估算 (USD)", key: "estimate", width: 215, render: (_: unknown, row: QuotaRow) => metrics([
+      ["当前已消耗", money(row.calls > 0 && row.unpriced === row.calls ? null : row.cost), "text-blue-600 dark:text-blue-400 font-bold"],
+      ["折算周限份额", money(result?.limit == null || !period || row.unpriced === row.calls && row.calls > 0 ? null : row.cost / (period.usedPercent / 100))],
+      ["预计周消耗", money(result && period && !(row.calls > 0 && row.unpriced === row.calls) ? row.cost * WEEK_MS / (period.toUnixMs - period.fromUnixMs) : null)],
+      ["占本账号消耗", row.calls > 0 && row.unpriced === row.calls ? "—" : `${(total.cost > 0 ? row.cost / total.cost * 100 : 0).toFixed(2)}%`, "text-blue-600 dark:text-blue-400 font-semibold"],
+    ]) },
+  ];
+};
 // 与账号列表一致，逐个账号顺序读取额度，两次请求之间留出间隔，避免同时向官方接口发起多个请求。
 const USAGE_QUERY_STAGGER_MS = 200;
 
@@ -104,7 +149,7 @@ export function QuotaEstimateDialog({ container, onClose }: {
     setRangeEnd(windowEnd);
     void (async () => {
       try {
-        const result = await invoke<OfficialAccountsResult>("list_official_accounts");
+        const result = await listOfficialAccounts();
         if (!active) return;
         const targets = estimateTargets(result.accounts ?? []);
         const stats = await invoke<{ queryable: boolean; recordingHealth?: {
@@ -186,50 +231,10 @@ export function QuotaEstimateDialog({ container, onClose }: {
     activeTotal.assumed > 0 && `${integer(activeTotal.assumed)} 次请求未经响应确认档位，按请求档位或默认 Standard 估算，并与已确认用量分开。`,
     activeTotal.missingWrites > 0 && `${integer(activeTotal.missingWrites)} 次请求未记录缓存写入量，按 0 展示；对应输入仍按普通输入价计费，额外写入费用可能未计入。`,
   ].filter(Boolean) : (healthWarning ? ["日志记录未完整开启或存在采样、丢弃及写入异常，估算仅覆盖已记录的请求。"] : []);
-  const metrics = (items: ReadonlyArray<readonly [string, string, string?]>) => <dl className="m-0 grid gap-0.5 text-xs tabular-nums">
-    {items.map(([label, value, colorClass]) => <div key={label} className="flex items-center justify-between gap-2">
-      <dt className="font-normal text-gray-500 dark:text-gray-400">{label}</dt>
-      <dd className={`m-0 font-medium whitespace-nowrap ${colorClass ?? "text-gray-800 dark:text-gray-300"}`}>{value}</dd>
-    </div>)}
-  </dl>;
-  const columnsFor = (group: EstimateGroup) => {
-    const total = group.total;
-    const period = group.estimate?.period ?? null;
-    const result = group.estimate?.result ?? null;
-    return [
-      { title: "模型名称", key: "model", width: 155, render: (_: unknown, row: QuotaRow) => <div className="break-words">
-        <div className="font-semibold text-gray-900 dark:text-gray-300">{row.model}</div>
-        {row.unpriced > 0 && <div className="mt-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">{row.note}，未计价</div>}
-      </div> },
-      { title: "档位 / 上下文", key: "rules", width: 155, render: (_: unknown, row: QuotaRow) => <div className="text-xs">
-        <div className="font-medium text-gray-800 dark:text-gray-300">{row.tier}{row.context && ` · ${row.context}`}</div>
-        <div className="mt-0.5 text-gray-500 dark:text-gray-400">{row.source}</div>
-      </div> },
-      { title: "调用次数", key: "calls", width: 85, align: "right" as const,
-        render: (_: unknown, row: QuotaRow) => <span className="font-medium tabular-nums text-gray-800 dark:text-gray-300">{integer(row.calls)}</span> },
-      { title: "Token 用量", key: "tokens", width: 175, render: (_: unknown, row: QuotaRow) => metrics([
-        ["输入", integer(row.input)], ["输出", integer(row.output)], ["总计", integer(row.tokens)],
-      ]) },
-      { title: "缓存用量", key: "cache", width: 185, render: (_: unknown, row: QuotaRow) => <>
-        {metrics([["命中次数", integer(row.hits)], ["读取 Token", integer(row.cached)], ["写入 Token", integer(row.writes)]])}
-        {row.missingWrites > 0 && <div className="mt-1 text-[11px] font-medium text-amber-600 dark:text-amber-400">{integer(row.missingWrites)} 次未记录写入量</div>}
-      </> },
-      { title: "费用明细 (USD)", key: "fees", width: 210, render: (_: unknown, row: QuotaRow) => metrics(([
-        ["inputCost", "非缓存输入"], ["outputCost", "输出"], ["readCost", "缓存读取"],
-        ["writeCost", "缓存写入"], ["cacheSaving", "缓存节省（参考）"],
-      ] as const).map(([key, label]) => [
-        label,
-        money(row.calls > 0 && row.unpriced === row.calls ? null : row[key]),
-        key === "cacheSaving" && (row.cacheSaving ?? 0) > 0 ? "text-emerald-600 dark:text-emerald-400 font-semibold" : undefined,
-      ])) },
-      { title: "额度估算 (USD)", key: "estimate", width: 215, render: (_: unknown, row: QuotaRow) => metrics([
-        ["当前已消耗", money(row.calls > 0 && row.unpriced === row.calls ? null : row.cost), "text-blue-600 dark:text-blue-400 font-bold"],
-        ["折算周限份额", money(result?.limit == null || !period || row.unpriced === row.calls && row.calls > 0 ? null : row.cost / (period.usedPercent / 100))],
-        ["预计周消耗", money(result && period && !(row.calls > 0 && row.unpriced === row.calls) ? row.cost * WEEK_MS / (period.toUnixMs - period.fromUnixMs) : null)],
-        ["占本账号消耗", row.calls > 0 && row.unpriced === row.calls ? "—" : `${(total.cost > 0 ? row.cost / total.cost * 100 : 0).toFixed(2)}%`, "text-blue-600 dark:text-blue-400 font-semibold"],
-      ]) },
-    ];
-  };
+  const estimateColumns = useMemo(
+    () => (activeGroup ? columnsFor(activeGroup) : []),
+    [activeGroup],
+  );
 
   return <Dialog open onOpenChange={open => { if (!open) onClose(); }}>
     <DialogContent container={container} className="quota-estimate-dialog w-full sm:w-[min(1240px,calc(100vw-32px))] max-w-[min(1240px,calc(100vw-32px))]">
@@ -348,7 +353,7 @@ export function QuotaEstimateDialog({ container, onClose }: {
             <Table.ScrollContainer className="max-h-[420px] overflow-auto rounded-xl border border-gray-200 dark:border-gray-700 bg-[var(--codey-surface,#fff)] shadow-2xs">
               <Table.Content aria-label={`${activeGroup.label} 模型额度明细`} className={`min-w-[1180px] ${loading ? "opacity-60" : ""}`}>
                 <Table.Header>
-                  {columnsFor(activeGroup).map((column, index) => <Table.Column key={column.key} isRowHeader={index === 0}
+                  {estimateColumns.map((column, index) => <Table.Column key={column.key} isRowHeader={index === 0}
                     className={`sticky top-0 z-[1] bg-gray-50/95 dark:bg-gray-800/95 text-xs font-semibold text-gray-700 dark:text-gray-300 backdrop-blur-xs border-b border-gray-200 dark:border-gray-700 ${column.align === "right" ? "text-right" : ""}`}
                     style={{ width: column.width, minWidth: column.width }}>{column.title}</Table.Column>)}
                 </Table.Header>
@@ -356,12 +361,12 @@ export function QuotaEstimateDialog({ container, onClose }: {
                   {activeGroup.error ? "数据读取失败，请刷新重试" : "当前周期内没有请求记录"}
                 </div>}>
                   {activeGroup.rows.map((row) => <Table.Row key={row.key} id={row.key} className="hover:bg-blue-50/20 transition-colors border-b border-gray-100 dark:border-gray-700">
-                    {columnsFor(activeGroup).map((column) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
+                    {estimateColumns.map((column) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
                       {column.render(undefined, row)}
                     </Table.Cell>)}
                   </Table.Row>)}
                   <Table.Row id="__total" className="border-t-2 border-blue-200 dark:border-blue-700 bg-blue-50/30 dark:bg-blue-950/30 font-semibold">
-                    {columnsFor(activeGroup).map((column, index) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
+                    {estimateColumns.map((column, index) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
                       {index === 0 ? <strong className="text-blue-900 dark:text-blue-300 font-bold">本账号小计</strong> : column.render(undefined, activeGroup.total)}
                     </Table.Cell>)}
                   </Table.Row>

@@ -49,6 +49,10 @@ const REFRESH_BEFORE_ACTIVATE_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 /// Access tokens that expire within this margin are refreshed before use, so a
 /// request never starts on a token that is about to lapse.
 const TOKEN_REFRESH_MARGIN_SECONDS: u64 = 5 * 60;
+/// Same bound as the local router's proxied upstream clients: a handful of
+/// account proxies keep their TLS pools warm; a rare flood of new addresses
+/// just drops the older pools.
+const MAX_OFFICIAL_PROXY_CLIENTS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -284,6 +288,28 @@ impl OfficialAccountRecord {
     }
 }
 
+fn read_account_record(path: &Path, operation: &str) -> Result<Option<OfficialAccountRecord>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取官方账号文件失败：{}", path.display()));
+        }
+    };
+    match serde_json::from_slice::<OfficialAccountRecord>(&bytes) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) => {
+            crate::error_log::record_failure(
+                "official_account_file_invalid",
+                operation,
+                format!("{error}"),
+                json!({ "path": path.display().to_string() }),
+            );
+            Ok(None)
+        }
+    }
+}
+
 fn sanitize_id(value: &str) -> String {
     let cleaned = value
         .chars()
@@ -328,6 +354,10 @@ pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
         .or_else(|_| URL_SAFE.decode(payload))
         .ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) fn access_token_issued_at(token: &str) -> Option<u64> {
+    jwt_claims(token)?.get("iat").and_then(Value::as_u64)
 }
 
 fn auth_account_id(auth: &Value) -> Option<String> {
@@ -503,18 +533,8 @@ impl OfficialAccountStore {
             {
                 continue;
             }
-            let bytes = fs::read(&path)
-                .with_context(|| format!("读取官方账号文件失败：{}", path.display()))?;
-            match serde_json::from_slice::<OfficialAccountRecord>(&bytes) {
-                Ok(record) => records.push(record),
-                Err(error) => {
-                    crate::error_log::record_failure(
-                        "official_account_file_invalid",
-                        "official_accounts.list",
-                        format!("{error}"),
-                        json!({ "path": path.display().to_string() }),
-                    );
-                }
+            if let Some(record) = read_account_record(&path, "official_accounts.list")? {
+                records.push(record);
             }
         }
         records.sort_by(|a, b| a.added_at.cmp(&b.added_at).then_with(|| a.id.cmp(&b.id)));
@@ -522,7 +542,10 @@ impl OfficialAccountStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<OfficialAccountRecord>> {
-        Ok(self.list()?.into_iter().find(|record| record.id == id))
+        Ok(
+            read_account_record(&self.account_path(id), "official_accounts.get")?
+                .filter(|record| record.id == id),
+        )
     }
 
     pub fn default_account_id(&self) -> Result<Option<String>> {
@@ -913,11 +936,13 @@ fn needs_token_refresh(record: &OfficialAccountRecord) -> bool {
 
 /// Refreshes the account's tokens when the stored access token is expired,
 /// close to expiry, or old enough to matter. Errors are returned so callers can
-/// decide whether to fall back to the stored copy.
-pub async fn refresh_if_stale(
+/// decide whether to fall back to the stored copy. Production callers pass the
+/// shared proxy-client cache so repeated refreshes reuse the TLS pool.
+pub async fn refresh_if_stale_cached(
     client: &reqwest::Client,
     record: &mut OfficialAccountRecord,
     upstream_proxy: Option<&str>,
+    proxied_clients: Option<&Mutex<HashMap<String, reqwest::Client>>>,
 ) -> Result<bool> {
     // 已确认失效的账号不再尝试刷新：官方每次都会拒绝，重复请求只会抬高
     // 风控概率；重新添加账号会写入新凭据并清除失效标记。
@@ -930,18 +955,8 @@ pub async fn refresh_if_stale(
     let Some(refresh_token) = record.refresh_token().map(ToString::to_string) else {
         return Ok(false);
     };
-    let proxy_client = upstream_proxy
-        .filter(|proxy| !proxy.trim().is_empty())
-        .map(|proxy| -> Result<reqwest::Client> {
-            Ok(reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .proxy(reqwest::Proxy::all(proxy.trim()).context("官方账号上游代理无效")?)
-                .build()?)
-        })
-        .transpose()?;
-    let client = proxy_client.as_ref().unwrap_or(client);
-    let response = client
+    let owned_client = official_http_client(client, proxied_clients, upstream_proxy)?;
+    let response = owned_client
         .post(OAUTH_TOKEN_URL)
         .timeout(Duration::from_secs(20))
         .json(&json!({
@@ -967,6 +982,51 @@ pub async fn refresh_if_stale(
     // 刷新成功说明凭据重新可用，之前记录的失效状态随之清除。
     record.clear_invalid();
     Ok(true)
+}
+
+#[cfg(test)]
+pub async fn refresh_if_stale(
+    client: &reqwest::Client,
+    record: &mut OfficialAccountRecord,
+    upstream_proxy: Option<&str>,
+) -> Result<bool> {
+    refresh_if_stale_cached(client, record, upstream_proxy, None).await
+}
+
+fn official_http_client(
+    default_client: &reqwest::Client,
+    proxied_clients: Option<&Mutex<HashMap<String, reqwest::Client>>>,
+    upstream_proxy: Option<&str>,
+) -> Result<reqwest::Client> {
+    let Some(proxy) = upstream_proxy
+        .map(str::trim)
+        .filter(|proxy| !proxy.is_empty())
+    else {
+        return Ok(default_client.clone());
+    };
+    if let Some(cache) = proxied_clients {
+        let mut clients = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(client) = clients.get(proxy) {
+            return Ok(client.clone());
+        }
+        let client = build_official_proxy_client(proxy)?;
+        if clients.len() >= MAX_OFFICIAL_PROXY_CLIENTS {
+            clients.clear();
+        }
+        clients.insert(proxy.to_string(), client.clone());
+        return Ok(client);
+    }
+    build_official_proxy_client(proxy)
+}
+
+fn build_official_proxy_client(proxy: &str) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .proxy(reqwest::Proxy::all(proxy).context("官方账号上游代理无效")?)
+        .build()?)
 }
 
 fn apply_token_response(record: &mut OfficialAccountRecord, payload: &Value) -> Result<()> {
@@ -1454,6 +1514,22 @@ mod tests {
         assert_eq!(record.auth, original);
     }
 
+    #[test]
+    fn official_proxy_clients_are_reused_for_the_same_proxy() {
+        let cache = Mutex::new(HashMap::new());
+        let default_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        official_http_client(&default_client, Some(&cache), Some("http://127.0.0.1:9")).unwrap();
+        official_http_client(&default_client, Some(&cache), Some("http://127.0.0.1:9")).unwrap();
+        official_http_client(&default_client, Some(&cache), Some("http://127.0.0.1:10")).unwrap();
+        assert!(
+            official_http_client(&default_client, Some(&cache), Some("not a proxy url")).is_err()
+        );
+        let cached = cache.lock().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert!(cached.contains_key("http://127.0.0.1:9"));
+        assert!(cached.contains_key("http://127.0.0.1:10"));
+    }
+
     fn unsigned_jwt(payload: Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
@@ -1549,6 +1625,35 @@ mod tests {
         store.remove("acct_2").unwrap();
         assert_eq!(store.default_account_id().unwrap(), None);
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_reads_only_the_requested_account_file() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        fs::write(store.account_path("acct_2"), "{not-json").unwrap();
+        fs::write(
+            store.account_path("acct_3"),
+            serde_json::to_vec(&json!({
+                "id": "someone-else",
+                "addedAt": 1,
+                "auth": { "auth_mode": "chatgpt", "tokens": { "access_token": "x" } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.get("acct_1").unwrap().unwrap();
+        assert_eq!(loaded.id, "acct_1");
+        assert!(store.get("acct_2").unwrap().is_none());
+        assert!(store.get("acct_3").unwrap().is_none());
+        assert!(store.get("missing").unwrap().is_none());
     }
 
     #[test]

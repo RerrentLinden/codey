@@ -25,6 +25,7 @@ test("model and statistics effects load all candidates with only one statistics 
   const context = {
     opened: true, validRange: true, fromUnixMs: 1, toUnixMs: 2000,
     provider: "provider-a", officialAccount: "account-a", refreshRevision: 0,
+    modelsCatalogNeeded: true, model: "all",
     filters: { fromUnixMs: 1, toUnixMs: 2000 }, groupBy: "model",
     modelsTask: { current: Promise.resolve() }, statsTask: { current: Promise.resolve() },
     useEffect: (callback) => callback(),
@@ -52,4 +53,31 @@ test("model and statistics effects load all candidates with only one statistics 
   assert.equal(calls.filter(({ command }) => command === "query_route_request_log_models").length, 2);
   assert.deepEqual(candidates, ["model-a", "model-z"]);
   assert.equal(statistics.total, 123);
+});
+
+test("model catalog stays idle until the model filter is opened", async () => {
+  const calls = [];
+  const context = {
+    opened: true, validRange: true, fromUnixMs: 1, toUnixMs: 2000,
+    provider: "all", officialAccount: "all", refreshRevision: 0,
+    modelsCatalogNeeded: false, model: "all",
+    filters: { fromUnixMs: 1, toUnixMs: 2000 }, groupBy: "model",
+    modelsTask: { current: Promise.resolve() }, statsTask: { current: Promise.resolve() },
+    useEffect: (callback) => callback(),
+    optionalFilter: (value) => value !== "all",
+    loadRequestLogModels,
+    setUsedModels: () => assert.fail("should not load models"),
+    setStats: () => {},
+    setStatsLoading: () => {}, setStatsError: () => {},
+    setError: (error) => assert.fail(error), errorText: String,
+    invoke: async (command) => {
+      calls.push(command);
+      if (command === "query_route_request_log_stats") return { queryable: true, total: 1, groups: [] };
+      assert.fail(`unexpected command ${command}`);
+    },
+  };
+  const compiled = ts.transpileModule(effects.join(";\n"), {}).outputText;
+  new Function(...Object.keys(context), compiled)(...Object.values(context));
+  await Promise.all([context.modelsTask.current, context.statsTask.current]);
+  assert.deepEqual(calls, ["query_route_request_log_stats"]);
 });

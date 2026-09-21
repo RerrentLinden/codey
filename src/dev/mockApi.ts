@@ -1288,6 +1288,21 @@ if (import.meta.env.DEV) {
             defaultModel,
           };
         }
+        const accountId = String(args.accountId || "").trim();
+        const account = accountId
+          ? previewOfficialAccounts.find((item) => item.id === accountId)
+          : undefined;
+        if (accountId) {
+          if (!account) return { status: "failed", message: "找不到官方账号" };
+          const routeOverride = (value: unknown) => {
+            const text = String(value ?? "").trim();
+            return text ? text : undefined;
+          };
+          account.routeName = routeOverride(args.routeName);
+          account.routeShortName = routeOverride(args.routeShortName);
+          account.upstreamProxy = routeOverride(args.upstreamProxy);
+          previewDeriveOfficialProfiles();
+        }
         return {
           status: "ok",
           config: previewConfig,
@@ -1295,6 +1310,14 @@ if (import.meta.env.DEV) {
           restartRequired: false,
           modelHotReloaded: true,
           customContextsRestored: false,
+          ...(account
+            ? {
+                accounts: previewOfficialAccounts,
+                defaultAccountId: previewDefaultOfficialAccountId(),
+                officialAccountAvailable: true,
+                accountId: account.id,
+              }
+            : {}),
         };
       }
       if (command === "restart_codey") {

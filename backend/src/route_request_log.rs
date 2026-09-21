@@ -21,6 +21,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 
 use crate::config::{RouteRequestLogBackend, RouteRequestLogConfig};
+use crate::sqlite_util::table_columns;
 
 const SCHEMA_VERSION: u8 = 12;
 const MAX_LOG_STRING_BYTES: usize = 512;
@@ -2229,6 +2230,7 @@ impl SqliteSink {
              CREATE INDEX IF NOT EXISTS idx_route_request_logs_status_time_id
                 ON route_request_logs(status, timestamp_unix_ms DESC, request_id DESC);",
         )?;
+        let existing_columns = table_columns(&connection, "route_request_logs")?;
         for (column, column_type) in [
             ("requested_service_tier", "TEXT"),
             ("service_tier", "TEXT"),
@@ -2245,11 +2247,7 @@ impl SqliteSink {
             ("upstream_bytes", "INTEGER"),
             ("upstream_response_model", "TEXT"),
         ] {
-            let exists: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = ?1)",
-                [column], |row| row.get(0),
-            )?;
-            if !exists {
+            if !existing_columns.contains(column) {
                 connection.execute_batch(&format!(
                     "ALTER TABLE route_request_logs ADD COLUMN {column} {column_type}"
                 ))?;
@@ -2953,49 +2951,61 @@ fn sqlite_optional_columns(
     static SHAPED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static RESPONSE_HEADER_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static RESPONSE_MODEL_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let tiers_known = sqlite_path_known(&TIERED_PATHS, path);
+    let official_known = sqlite_path_known(&ACCOUNTED_PATHS, path);
+    let shape_known = sqlite_path_known(&SHAPED_PATHS, path);
+    let headers_known = sqlite_path_known(&RESPONSE_HEADER_PATHS, path);
+    let model_known = sqlite_path_known(&RESPONSE_MODEL_PATHS, path);
+    if tiers_known && official_known && shape_known && headers_known && model_known {
+        return Ok(RouteRequestLogOptionalColumns {
+            tiers: true,
+            official_account: true,
+            request_shape: true,
+            response_headers: true,
+            response_model: true,
+        });
+    }
+    let columns = table_columns(connection, "route_request_logs")?;
     Ok(RouteRequestLogOptionalColumns {
-        tiers: sqlite_has_column(connection, path, &TIERED_PATHS, "service_tier")?,
-        official_account: sqlite_has_column(
-            connection,
-            path,
+        tiers: sqlite_remember_column(&TIERED_PATHS, path, columns.contains("service_tier")),
+        official_account: sqlite_remember_column(
             &ACCOUNTED_PATHS,
-            "official_account_id",
-        )?,
-        request_shape: sqlite_has_column(connection, path, &SHAPED_PATHS, "request_bytes")?,
-        response_headers: sqlite_has_column(
-            connection,
             path,
+            columns.contains("official_account_id"),
+        ),
+        request_shape: sqlite_remember_column(
+            &SHAPED_PATHS,
+            path,
+            columns.contains("request_bytes"),
+        ),
+        response_headers: sqlite_remember_column(
             &RESPONSE_HEADER_PATHS,
-            "upstream_response_headers",
-        )?,
-        response_model: sqlite_has_column(
-            connection,
             path,
+            columns.contains("upstream_response_headers"),
+        ),
+        response_model: sqlite_remember_column(
             &RESPONSE_MODEL_PATHS,
-            "upstream_response_model",
-        )?,
+            path,
+            columns.contains("upstream_response_model"),
+        ),
     })
 }
 
-fn sqlite_has_column(
-    connection: &Connection,
-    path: &Path,
-    known_paths: &OnceLock<Mutex<HashSet<PathBuf>>>,
-    column: &str,
-) -> rusqlite::Result<bool> {
+fn sqlite_path_known(known_paths: &OnceLock<Mutex<HashSet<PathBuf>>>, path: &Path) -> bool {
     let known = known_paths.get_or_init(|| Mutex::new(HashSet::new()));
-    if lock_unpoisoned(known).contains(path) {
-        return Ok(true);
-    }
-    let exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = ?1)",
-        [column],
-        |row| row.get(0),
-    )?;
+    lock_unpoisoned(known).contains(path)
+}
+
+fn sqlite_remember_column(
+    known_paths: &OnceLock<Mutex<HashSet<PathBuf>>>,
+    path: &Path,
+    exists: bool,
+) -> bool {
     if exists {
+        let known = known_paths.get_or_init(|| Mutex::new(HashSet::new()));
         lock_unpoisoned(known).insert(path.to_path_buf());
     }
-    Ok(exists)
+    exists
 }
 
 fn open_query_connection(path: &Path) -> rusqlite::Result<Connection> {

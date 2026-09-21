@@ -194,7 +194,7 @@ pub(crate) async fn reconcile_current_subagent_defaults(
         || next.clone(),
         |base| config_with_reconciled_subagent_defaults(base, &next),
     );
-    if let Err(error) = save_config_to_store(state, &persisted).await {
+    if let Err(error) = save_config_to_store(state, persisted).await {
         return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
     *state.config.write().await = next.clone();

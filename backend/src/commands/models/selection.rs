@@ -171,9 +171,14 @@ pub async fn save_selected_models(
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     config = config.normalize();
     config.settings_revision = config.settings_revision.saturating_add(1);
-    if let Err(error) = save_config_to_store(state, &config).await {
-        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
-    }
+    let config = match save_config_to_store(state, config).await {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(
+                rollback_model_catalog_after_config_save_async(catalog_refresh, error).await,
+            );
+        }
+    };
     let model_catalog_fallback = catalog_refresh
         .as_ref()
         .is_some_and(|refresh| refresh.fallback);
@@ -276,7 +281,7 @@ pub(crate) async fn save_native_selected_models(
     next = next.normalize();
     if next != latest {
         next.settings_revision = latest.settings_revision.saturating_add(1);
-        save_config_to_store(state, &next)
+        next = save_config_to_store(state, next)
             .await
             .map_err(|error| format!("保存当前线路模型选择失败：{error}"))?;
         *state.config.write().await = next.clone();

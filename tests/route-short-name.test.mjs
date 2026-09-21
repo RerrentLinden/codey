@@ -130,7 +130,9 @@ test("official route settings are edited on the route card instead of the accoun
   assert.match(panel, /aria-label=\{`移除官方账号 \$\{label\}`\}/);
   assert.doesNotMatch(panel, /IconPencil|validateOutboundProxyUrl/);
 
-  assert.match(app, /"save_official_account_route_settings"/);
+  assert.match(app, /accountId: routeSettings.accountId/);
+  assert.match(app, /routeName: routeSettings.routeName/);
+  assert.match(app, /routeShortName: routeSettings.routeShortName/);
 });
 
 test("official accounts derive numbered default route names and short names", async () => {

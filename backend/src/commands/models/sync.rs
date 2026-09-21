@@ -215,7 +215,7 @@ pub(crate) async fn sync_native_current_provider_models(
     let changed = next != latest;
     if changed {
         next.settings_revision = latest.settings_revision.saturating_add(1);
-        save_config_to_store(state, &next)
+        next = save_config_to_store(state, next)
             .await
             .map_err(|error| format!("保存当前线路模型同步结果失败：{error}"))?;
         *state.config.write().await = next.clone();
@@ -295,7 +295,7 @@ where
             if latest != previous {
                 return Err("Codey 设置在同步线路期间已更新，已忽略过期的同步结果".to_string());
             }
-            save_config_to_store(state, &config)
+            let config = save_config_to_store(state, config)
                 .await
                 .map_err(|error| format!("保存当前线路同步结果失败：{error}"))?;
             *state.config.write().await = config;
@@ -623,10 +623,17 @@ pub(crate) async fn commit_startup_model_sync(
     if !latest.local_router_enabled {
         return latest;
     }
-    if synced && let Err(error) = save_config_to_store(state, &next).await {
-        eprintln!("保存启动时模型同步结果失败，本次启动沿用已持久化模型：{error:#}");
-        return latest;
-    }
+    let next = if synced {
+        match save_config_to_store(state, next).await {
+            Ok(next) => next,
+            Err(error) => {
+                eprintln!("保存启动时模型同步结果失败，本次启动沿用已持久化模型：{error:#}");
+                return latest;
+            }
+        }
+    } else {
+        next
+    };
     *state.config.write().await = next.clone();
     next
 }

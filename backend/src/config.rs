@@ -2475,12 +2475,18 @@ impl ConfigStore {
         Err(primary_error).context(backup_summary)
     }
 
-    pub fn save(&self, config: &CodeyConfig) -> Result<()> {
-        let config = config.clone().normalize();
+    pub(crate) fn persist(&self, config: CodeyConfig) -> Result<CodeyConfig> {
+        let config = config.normalize();
         let bytes = serde_json::to_vec_pretty(&config)?;
         self.rotate_backups_best_effort(&bytes);
         crate::fs_util::atomic_write_private_with_parent(&self.path, &bytes)
-            .with_context(|| format!("替换 Codey 配置失败：{}", self.path.display()))
+            .with_context(|| format!("替换 Codey 配置失败：{}", self.path.display()))?;
+        Ok(config)
+    }
+
+    #[cfg(test)]
+    pub fn save(&self, config: &CodeyConfig) -> Result<()> {
+        self.persist(config.clone()).map(|_| ())
     }
 
     fn backup_path(&self, index: usize) -> PathBuf {

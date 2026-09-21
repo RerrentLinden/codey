@@ -17,7 +17,7 @@ use crate::config::{
 };
 use crate::official_accounts::{
     LoginPhase, OfficialAccountInvalid, OfficialAccountRecord, OfficialAccountStore,
-    refresh_if_stale, start_login,
+    refresh_if_stale_cached, start_login,
 };
 
 fn accounts_payload(store: &OfficialAccountStore) -> Result<Value, String> {
@@ -220,7 +220,14 @@ pub(super) async fn refresh_official_account_tokens(
     }
     let expected = record.clone();
     let proxy = super::official_account_usage_proxy(state, account_id).await;
-    match refresh_if_stale(&state.http_client, &mut record, proxy.as_deref()).await {
+    match refresh_if_stale_cached(
+        &state.http_client,
+        &mut record,
+        proxy.as_deref(),
+        Some(&state.official_proxied_clients),
+    )
+    .await
+    {
         Ok(true) => {
             let refreshed_store = store.clone();
             let refreshed = record.clone();
@@ -307,7 +314,7 @@ pub(super) async fn set_default_official_account(
         if !config.show_account_usage_in_header {
             config.show_account_usage_in_header = true;
             config.settings_revision = config.settings_revision.saturating_add(1);
-            save_config_to_store(state, &config).await?;
+            let config = save_config_to_store(state, config).await?;
             *state.config.write().await = config;
         }
     }
@@ -401,7 +408,7 @@ pub(super) async fn drop_derived_official_routes(state: &Arc<AppState>) -> Resul
     if next.settings_revision == previous.settings_revision {
         next.settings_revision = previous.settings_revision.saturating_add(1);
     }
-    save_config_to_store(state, &next).await?;
+    let next = save_config_to_store(state, next).await?;
     *state.config.write().await = next;
     Ok(())
 }
@@ -416,6 +423,30 @@ pub(super) async fn save_official_account_route_settings(
     route_short_name: String,
     upstream_proxy: String,
 ) -> Result<Value, String> {
+    let account_id = write_official_account_route_settings(
+        state,
+        account_id,
+        route_name,
+        route_short_name,
+        upstream_proxy,
+    )
+    .await?;
+    let payload = refresh_official_route_after_account_change(state).await?;
+    Ok(merge(
+        payload,
+        json!({ "status": "ok", "accountId": account_id }),
+    ))
+}
+
+/// Writes one account's route overrides without re-deriving routes. Callers
+/// that already persist models in the same turn apply the derived routes once.
+pub(crate) async fn write_official_account_route_settings(
+    state: &Arc<AppState>,
+    account_id: String,
+    route_name: String,
+    route_short_name: String,
+    upstream_proxy: String,
+) -> Result<String, String> {
     let account_id = account_id.trim().to_string();
     if account_id.is_empty() {
         return Err("缺少要保存线路设置的官方账号".to_string());
@@ -476,17 +507,12 @@ pub(super) async fn save_official_account_route_settings(
     .await
     .map_err(|error| format!("保存官方账号线路设置任务异常退出：{error}"))?
     .map_err(|error| format!("{error:#}"))?;
-
-    let payload = refresh_official_route_after_account_change(state).await?;
-    Ok(merge(
-        payload,
-        json!({ "status": "ok", "accountId": account_id }),
-    ))
+    Ok(account_id)
 }
 
 /// Re-runs the launch-time route preparation against the account store and
 /// pushes the resulting routes to a running Codex without a restart.
-pub(super) async fn refresh_official_route_after_account_change(
+pub(crate) async fn refresh_official_route_after_account_change(
     state: &Arc<AppState>,
 ) -> Result<Value, String> {
     let prepare_error = prepare_routes_for_current_launch(state).await.err();

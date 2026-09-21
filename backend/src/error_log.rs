@@ -722,7 +722,7 @@ pub fn record_failure_with_metadata(
             }
         }
     }
-    let mut record = ErrorRecord {
+    let record = ErrorRecord {
         timestamp: format_beijing_timestamp(now),
         platform: std::env::consts::OS.to_string(),
         versions: ErrorVersions::current(),
@@ -733,7 +733,6 @@ pub fn record_failure_with_metadata(
         recoverable: metadata.recoverable,
         context,
     };
-    sanitize_record(&mut record);
     if let Err(error) = append_record(&record, now.date_naive()) {
         eprintln!("写入 Codey 错误日志失败：{error}");
     }

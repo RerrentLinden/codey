@@ -13,6 +13,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import { invoke } from "./api";
+import { rememberOfficialAccounts } from "./officialAccountsRequests";
 import { reconcileConfigDraft } from "./configDraft";
 import { ModelPickerDialog } from "./AppDialogs";
 import { SystemSettingsDialog } from "./SystemSettingsDialog";
@@ -108,6 +109,13 @@ function thirdPartyRouteModelState(
 
 function onlyLocalRouterToggleChanged(current: Config, persisted: Config) {
   if (current.localRouterEnabled === persisted.localRouterEnabled) return false;
+  const currentKeys = Object.keys(current) as Array<keyof Config>;
+  if (currentKeys.length === Object.keys(persisted).length
+    && currentKeys.every((key) => (
+      key === "localRouterEnabled" || key === "settingsRevision" || Object.is(current[key], persisted[key])
+    ))) {
+    return true;
+  }
   return JSON.stringify({
     ...current,
     localRouterEnabled: persisted.localRouterEnabled,
@@ -187,12 +195,12 @@ export function App({
     });
   }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
   const configLoaded = config !== null;
-  const pendingNativeRouterToggle = Boolean(
+  const pendingNativeRouterToggle = useMemo(() => Boolean(
     config &&
       persistedConfigRef.current &&
       !config.localRouterEnabled &&
       onlyLocalRouterToggleChanged(config, persistedConfigRef.current),
-  );
+  ), [config]);
   const canSyncCurrentProvider = !dirty || pendingNativeRouterToggle;
   const setPersistedConfig = useCallback((next: Config) => {
     persistedConfigRef.current = next;
@@ -798,7 +806,7 @@ export function App({
         restartRequired?: boolean;
         modelHotReloaded?: boolean;
         customContextsRestored?: boolean;
-      }>("save_official_route_models", {
+      } & import("./App.types").OfficialAccountsResult>("save_official_route_models", {
         routeId,
         models,
         modelContexts,
@@ -806,21 +814,17 @@ export function App({
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
+        // 线路名、短名称和代理写入同一账号记录，避免再打一次派生/热更新。
+        ...(routeSettings
+          ? {
+              accountId: routeSettings.accountId,
+              routeName: routeSettings.routeName,
+              routeShortName: routeSettings.routeShortName,
+            }
+          : {}),
       });
       applyRouteResult(modelResult);
-      // 官方线路的线路名、短名称和代理存放在所属账号记录里，重启派生时会重新读回。
-      if (routeSettings) {
-        const settingsResult = await invoke<import("./App.types").OfficialAccountsResult>(
-          "save_official_account_route_settings",
-          {
-            accountId: routeSettings.accountId,
-            routeName: routeSettings.routeName,
-            routeShortName: routeSettings.routeShortName,
-            upstreamProxy: (upstreamProxy ?? "").trim(),
-          },
-        );
-        handleOfficialAccountsChanged(settingsResult);
-      }
+      if (routeSettings) handleOfficialAccountsChanged(modelResult);
       saved = true;
       const restartNote = modelResult.restartRequired
         ? "，重启 Codex 后完全生效"
@@ -1168,6 +1172,7 @@ export function App({
   });
   const handleOfficialAccountsChanged = useStableEvent(
     (result: import("./App.types").OfficialAccountsResult) => {
+      rememberOfficialAccounts(result);
       if (result.config) {
         applyRouteResult({
           config: result.config,

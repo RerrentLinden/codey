@@ -321,6 +321,7 @@ export interface SelectProps {
   filter?: boolean;
   id?: string;
   onChange?: (value: string | number | null) => void;
+  onOpenChange?: (open: boolean) => void;
   optionList?: SelectOption[];
   placeholder?: string;
   popoverClassName?: string;
@@ -333,7 +334,7 @@ function optionText(option: SelectOption) {
   return typeof option.label === "string" || typeof option.label === "number" ? String(option.label) : String(option.value);
 }
 export function Select({
-  optionList = [], onChange, filter = false, popoverClassName, renderOptionItem, prefix, value, disabled, className, placeholder, searchPlaceholder = "搜索…", id, ...labels
+  optionList = [], onChange, onOpenChange, filter = false, popoverClassName, renderOptionItem, prefix, value, disabled, className, placeholder, searchPlaceholder = "搜索…", id, ...labels
 }: SelectProps) {
   const { contains } = useFilter({ sensitivity: "base" });
   const selectedKey: Key | null = value != null && value !== "" ? String(value) : null;
@@ -372,6 +373,7 @@ export function Select({
         isDisabled={disabled}
         selectedKey={selectedKey}
         onSelectionChange={handleSelectionChange}
+        onOpenChange={onOpenChange}
         menuTrigger="focus"
       >
         <ComboBox.InputGroup>
@@ -400,6 +402,7 @@ export function Select({
       placeholder={placeholder}
       selectedKey={selectedKey}
       onSelectionChange={handleSelectionChange}
+      onOpenChange={onOpenChange}
     >
       <HeroSelect.Trigger id={id} className="min-h-8 md:min-h-8">
         {prefix}
@@ -427,7 +430,7 @@ export function Checkbox({ checked, onCheckedChange, label, disabled, children, 
   return (
     <HeroCheckbox
       {...props}
-      className={cn("items-center", className)}
+      className={cn("items-start", className)}
       isSelected={checked === undefined ? undefined : checked === true}
       isIndeterminate={checked === "indeterminate"}
       isDisabled={disabled}

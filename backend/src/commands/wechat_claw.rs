@@ -654,7 +654,7 @@ async fn persist_wechat_claw_sync_update(
     if !changed {
         return Ok(());
     }
-    save_config_to_store(state, &config).await?;
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config;
     Ok(())
 }

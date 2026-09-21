@@ -292,16 +292,14 @@ impl WebSocketResponsesDownstream {
             .as_ref()
             .filter(|_| cached_matches)
             .map_or(auth_identity, |cached| cached.auth_identity);
-        self.native_history
-            .prepare(native_history_key(route, effective_auth, body), body);
+        // !cached_matches 时 effective_auth 就是请求头身份，prepare 与 restore 共用同一把钥匙。
+        let history_key = native_history_key(route, effective_auth, body);
+        self.native_history.prepare(history_key, body);
         if !cached_matches {
             // A response ID belongs to its original upstream socket. Reconnect
             // with full history only before sending this new request.
             if previous_response_key.is_some()
-                && self
-                    .native_history
-                    .restore(native_history_key(route, auth_identity, body), body)
-                    .is_err()
+                && self.native_history.restore(history_key, body).is_err()
             {
                 return Ok(UpstreamWebSocketAttempt::UseHttp);
             }

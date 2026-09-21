@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -35,10 +36,18 @@ const OFFICIAL_AUTH_REVALIDATE_TTL: Duration = Duration::from_secs(1);
 /// the map without bound.
 const MAX_ACCOUNT_USAGE_CACHES: usize = 24;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct OfficialAuth {
     pub(crate) access_token: String,
     pub(crate) account_id: Option<String>,
+    /// 读盘时解析一次，供路由比较新旧令牌时避免重复解码 JWT。
+    pub(crate) issued_at: Option<u64>,
+}
+
+impl PartialEq for OfficialAuth {
+    fn eq(&self, other: &Self) -> bool {
+        self.access_token == other.access_token && self.account_id == other.account_id
+    }
 }
 
 /// 额度查询结果里表示凭据被官方拒绝的 reason 值，调用方据此标记账号失效。
@@ -76,28 +85,43 @@ fn official_auth_fingerprint(path: &Path) -> Option<OfficialAuthFingerprint> {
 
 #[derive(Debug, Default)]
 pub(crate) struct OfficialAuthCache {
-    cached: Option<std::result::Result<OfficialAuth, String>>,
+    cached: Option<std::result::Result<Arc<OfficialAuth>, String>>,
+    fingerprint: Option<OfficialAuthFingerprint>,
     expires_at: Option<Instant>,
     last_used: u64,
 }
 
 impl OfficialAuthCache {
-    /// Returns the cached auth (or cached read failure) without touching the filesystem.
-    /// Callers that miss can perform the blocking read outside their mutex, then [`Self::store`]
-    /// the result under a short lock.
-    pub(crate) fn get(&self, now: Instant) -> Option<std::result::Result<OfficialAuth, String>> {
-        self.expires_at
-            .filter(|expires_at| now < *expires_at)
-            .and_then(|_| self.cached.clone())
+    /// Returns the cached auth (or cached read failure) without reading the file
+    /// contents. After the short TTL, a matching size/mtime fingerprint still
+    /// reuses the cache so unchanged credentials skip JSON parsing.
+    pub(crate) fn get(
+        &mut self,
+        path: &Path,
+        now: Instant,
+    ) -> Option<std::result::Result<Arc<OfficialAuth>, String>> {
+        if self.expires_at.is_some_and(|expires_at| now < expires_at) {
+            return self.cached.clone();
+        }
+        if self.cached.is_none() || self.fingerprint.is_none() {
+            return None;
+        }
+        if official_auth_fingerprint(path) != self.fingerprint {
+            return None;
+        }
+        self.expires_at = Some(now + OFFICIAL_AUTH_REVALIDATE_TTL);
+        self.cached.clone()
     }
 
     /// Stores an auth-file read result for the short revalidation interval.
     pub(crate) fn store(
         &mut self,
+        path: &Path,
         result: Result<OfficialAuth>,
         now: Instant,
-    ) -> Result<OfficialAuth> {
-        let result = result.map_err(|error| error.to_string());
+    ) -> Result<Arc<OfficialAuth>> {
+        let result = result.map(Arc::new).map_err(|error| error.to_string());
+        self.fingerprint = official_auth_fingerprint(path);
         self.cached = Some(result.clone());
         self.expires_at = Some(now + OFFICIAL_AUTH_REVALIDATE_TTL);
         result.map_err(anyhow::Error::msg)
@@ -105,9 +129,13 @@ impl OfficialAuthCache {
 
     #[cfg(test)]
     fn read_at(&mut self, path: &Path, now: Instant) -> Result<OfficialAuth> {
-        match self.get(now) {
-            Some(result) => result.map_err(anyhow::Error::msg),
-            None => self.store(read_official_auth(path), now),
+        match self.get(path, now) {
+            Some(result) => result
+                .map(|auth| (*auth).clone())
+                .map_err(anyhow::Error::msg),
+            None => self
+                .store(path, read_official_auth(path), now)
+                .map(|auth| (*auth).clone()),
         }
     }
 }
@@ -562,6 +590,7 @@ pub(crate) fn read_official_auth(path: &Path) -> Result<OfficialAuth> {
         });
 
     Ok(OfficialAuth {
+        issued_at: crate::official_accounts::access_token_issued_at(&access_token),
         access_token,
         account_id,
     })
@@ -968,6 +997,7 @@ mod tests {
             OfficialAuth {
                 access_token: "token-value".into(),
                 account_id: Some("account-value".into()),
+                issued_at: None,
             }
         );
     }
@@ -1001,6 +1031,7 @@ mod tests {
             OfficialAuth {
                 access_token: "token-value".into(),
                 account_id: Some("account-value".into()),
+                issued_at: None,
             },
             "非默认账号的凭据保存在账号记录的 auth 字段里"
         );
@@ -1076,6 +1107,26 @@ mod tests {
     }
 
     #[test]
+    fn reads_access_token_issued_at_once_from_the_jwt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let access_token = unsigned_jwt(serde_json::json!({ "iat": 1_700_000_000_u64 }));
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": { "access_token": access_token, "account_id": "acct" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_official_auth(&path).unwrap().issued_at,
+            Some(1_700_000_000)
+        );
+    }
+
+    #[test]
     fn derives_account_id_from_access_token_organization_fallback() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("auth.json");
@@ -1128,6 +1179,36 @@ mod tests {
             .unwrap();
         assert_eq!(refreshed.access_token, "second-token");
         assert_eq!(refreshed.account_id.as_deref(), Some("acct-2"));
+    }
+
+    #[test]
+    fn official_auth_cache_reuses_matching_fingerprint_after_ttl() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"first","account_id":"acct-1"}}"#,
+        )
+        .unwrap();
+        let mut cache = OfficialAuthCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.read_at(&path, now).unwrap().access_token, "first");
+
+        fs::write(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"should-not-read"}}"#,
+        )
+        .unwrap();
+        cache.fingerprint = official_auth_fingerprint(&path);
+        assert_eq!(
+            cache
+                .get(&path, now + OFFICIAL_AUTH_REVALIDATE_TTL)
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "first",
+            "TTL 到期后只要 size/mtime 仍匹配就复用缓存，不再读盘解析"
+        );
     }
 
     #[test]

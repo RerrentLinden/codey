@@ -246,10 +246,10 @@ impl LifecycleRequest {
             });
             let mut params = json!({"metadata":self.metadata,"requestId":self.metadata.get("requestId"),
                 "stage":stage,"attempt":attempt,"headers":selected,"response":selected_response});
-            if plugin.auth {
-                if let Some(credentials) = &self.credentials {
-                    params["credentials"] = credentials.clone();
-                }
+            if plugin.auth
+                && let Some(credentials) = &self.credentials
+            {
+                params["credentials"] = credentials.clone();
             }
             entry.context = Some(params);
             if self.remaining_wait.is_zero() {
