@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconAlertTriangle,
-  IconCheck,
   IconEraser,
   IconFilePlus,
   IconFolderOpen,
@@ -15,7 +14,7 @@ import {
 } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
-import { cn } from "@heroui/react";
+import { cn, toast } from "@heroui/react";
 import {
   Badge,
   Button,
@@ -46,7 +45,9 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const setNotice = useCallback((text: string) => {
+    if (text) toast.success(text);
+  }, []);
   const [searchQuery, setSearchQuery] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [importError, setImportError] = useState("");
@@ -296,12 +297,6 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
         <div role="alert" className="mb-4 flex items-start gap-2 rounded-xl border border-red-200/60 bg-red-50/70 p-3 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
           <IconAlertTriangle size={15} className="mt-0.5 shrink-0" />
           <div className="flex-1 break-words">{error}</div>
-        </div>
-      )}
-      {notice && (
-        <div role="status" className="mb-4 flex items-center gap-2 rounded-xl border border-green-200/60 bg-green-50/70 p-3 text-xs text-green-700 dark:border-green-900/60 dark:bg-green-950/40 dark:text-green-300">
-          <IconCheck size={15} className="shrink-0" />
-          <div className="flex-1">{notice}</div>
         </div>
       )}
 

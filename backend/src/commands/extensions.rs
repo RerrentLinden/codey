@@ -45,17 +45,14 @@ pub(super) async fn invoke(state: &Arc<AppState>, args: &Value) -> Result<Value,
             .await;
             if matches!(reloaded, Ok(Ok(()))) {
                 result["applyStatus"] = json!("applied");
-                result["message"] =
-                    json!("MCP 配置已保存并通知 Codex 重新加载；当前会话下一轮对话生效。");
+                result["message"] = json!("配置已保存，下一轮对话生效。");
             } else {
                 result["applyStatus"] = json!("reload-failed");
-                result["message"] = json!(
-                    "MCP 配置已保存，但未能确认 Codex 自动刷新。请确认 Codex 已连接后重新保存；旧版 Codex 可能需要重启。"
-                );
+                result["message"] = json!("配置已保存，未能确认自动刷新，请重启 Codex。");
             }
         } else {
             result["applyStatus"] = json!("pending-runtime");
-            result["message"] = json!("MCP 配置已保存；Codex 当前未运行，下次启动时自动加载。");
+            result["message"] = json!("配置已保存，Codex 下次启动时生效。");
         }
     }
     Ok(result)

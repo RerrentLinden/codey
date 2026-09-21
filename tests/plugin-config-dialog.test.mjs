@@ -57,7 +57,11 @@ function dialogHarness(initial) {
       return new Promise((resolve, reject) => calls.push({ command, args, resolve, reject }));
     } },
     "./appUtils": { errorText: error => error.message },
-    "./components/ui": Object.fromEntries(["Button", "Dialog", "DialogContent", "DialogDescription", "DialogHeader", "DialogTitle"].map(name => [name, name])),
+    "@tabler/icons-react": new Proxy({}, { get: () => () => null }),
+    "./components/ui": Object.fromEntries([
+      "Badge", "Button", "Dialog", "DialogContent", "DialogDescription", "DialogHeader", "DialogTitle",
+      "Drawer", "DrawerContent", "DrawerDescription", "DrawerFooter", "DrawerHeader", "DrawerTitle",
+    ].map(name => [name, name])),
   };
   const exports = {};
   new Function("require", "exports", compiled)(name => {
@@ -111,6 +115,7 @@ async function load(harness, index = 0, content = text, version = "1", pluginId 
 const button = (h, name) => h.find("Button").find(node => node.props.children === name);
 const field = (h, name) => [...h.find("input"), ...h.find("textarea"), ...h.find("select")].find(node => node.props["aria-label"] === name);
 const edit = (h, value, name = "text") => { field(h, name).props.onChange({ target: { value } }); h.render(); };
+const dismiss = h => (h.find("Drawer")[0] ?? h.find("Dialog")[0]).props.onOpenChange(false);
 
 test("saves only changed values with digest and preserves annotations and whitespace", async () => {
   const h = dialogHarness(plugin());
@@ -122,7 +127,7 @@ test("saves only changed values with digest and preserves annotations and whites
   const save = button(h, "保存配置").props.onClick; save(); save(); h.render();
   assert.equal(h.calls.length, 2);
   assert.deepEqual(h.calls[1].args, { pluginId: "demo", content: original.replace('"saved"', JSON.stringify('draft "quoted"\nline')), expectedSha256: hash });
-  h.find("Dialog")[0].props.onOpenChange(false);
+  dismiss(h);
   assert.equal(h.closed, 0);
   const result = { plugins: [plugin()], platform: "linux", arch: "x86_64" };
   h.calls[1].resolve(result); await flush();
@@ -176,7 +181,7 @@ test("scalar validation blocks invalid saves and preserves numeric tokens", asyn
 
 test("dirty close and reload require confirmation and keep drafts", async () => {
   const h = dialogHarness(plugin()); await load(h); edit(h, '"draft"');
-  h.find("Dialog")[0].props.onOpenChange(false); h.render();
+  dismiss(h); h.render();
   assert.equal(h.closed, 0); assert.equal(h.find("section").length, 1);
   button(h, "继续编辑").props.onClick(); h.render();
   button(h, "重新加载").props.onClick(); h.render();
@@ -253,7 +258,7 @@ test("invalid raw string drafts are dirty and block keyboard save until correcte
     assert.equal(h.calls.length, 1);
     assert.equal(button(h, "保存配置").props.disabled, true);
     assert.equal(field(h, "text").props["aria-invalid"], true);
-    h.find("Dialog")[0].props.onOpenChange(false); h.render();
+    dismiss(h); h.render();
     assert.equal(h.closed, 0); assert.equal(h.find("section").length, 1);
     button(h, "继续编辑").props.onClick(); h.render();
     edit(h, '"corrected"');
@@ -339,7 +344,7 @@ test("invalid array drafts block button and keyboard saves and remain dirty unti
     assert.equal(field(h, "values").props["aria-invalid"], true);
     button(h, "保存配置").props.onClick();
     assert.equal(h.calls.length, 1);
-    h.find("Dialog")[0].props.onOpenChange(false); h.render();
+    dismiss(h); h.render();
     assert.equal(h.closed, 0);
     assert.equal(h.find("section").length, 1);
     button(h, "继续编辑").props.onClick(); h.render();

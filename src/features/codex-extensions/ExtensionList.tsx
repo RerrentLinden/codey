@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   IconBook2,
   IconDownload,
@@ -15,6 +16,7 @@ export function ExtensionList({
   kind,
   entries,
   busy,
+  busyAction,
   onAction,
   selected = [],
   onSelect,
@@ -25,6 +27,7 @@ export function ExtensionList({
   kind: "mcp" | "skill";
   entries: (McpEntry | SkillEntry)[];
   busy: boolean;
+  busyAction?: string;
   onAction: (action: string, entry: McpEntry | SkillEntry) => void;
   selected?: string[];
   onSelect?: (id: string) => void;
@@ -32,8 +35,19 @@ export function ExtensionList({
   revision?: string;
   filtered?: boolean;
 }) {
+  const [expandedChecks, setExpandedChecks] = useState<Record<string, boolean>>({});
   const isMcp = kind === "mcp";
   const KindIcon = isMcp ? IconServer : IconBook2;
+
+  const isCheckExpanded = (id: string, ok: boolean) => {
+    return expandedChecks[id] !== undefined ? expandedChecks[id] : !ok;
+  };
+  const toggleCheckExpanded = (id: string, ok: boolean) => {
+    setExpandedChecks((current) => ({
+      ...current,
+      [id]: !isCheckExpanded(id, ok),
+    }));
+  };
 
   if (!entries.length) {
     return (
@@ -245,6 +259,72 @@ export function ExtensionList({
                   {entry.error}
                 </div>
               )}
+
+              {checkResult && isCheckExpanded(entry.id, checkResult.ok) && (
+                <div
+                  role={checkResult.ok ? "status" : "alert"}
+                  className={`mt-2.5 rounded-lg border p-3 text-xs ${
+                    checkResult.ok
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-950 dark:text-emerald-200"
+                      : "border-amber-500/30 bg-amber-500/10 text-amber-950 dark:text-amber-200"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5">
+                    <span className="flex items-center gap-1.5 font-medium">
+                      <span
+                        className={`size-1.5 rounded-full shrink-0 ${
+                          checkResult.ok ? "bg-emerald-500" : "bg-amber-500"
+                        }`}
+                      />
+                      <span>
+                        {checkResult.ok ? "检查通过" : "存在异常"}：
+                        {checkResult.summary}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="cursor-pointer text-[11px] opacity-70 hover:opacity-100 transition-opacity"
+                      onClick={() => toggleCheckExpanded(entry.id, checkResult.ok)}
+                      aria-label="收起检查详情"
+                    >
+                      收起
+                    </button>
+                  </div>
+                  {checkResult.revision !== revision && (
+                    <p className="mt-1 mb-0 text-[11px] text-amber-700 dark:text-amber-300">
+                      配置已变化，此检查结果已失效。
+                    </p>
+                  )}
+                  {(checkResult.serverInfo?.name ||
+                    checkResult.serverInfo?.version ||
+                    checkResult.protocolVersion) && (
+                    <p className="mt-1 mb-0 text-[11px] text-muted">
+                      服务：{checkResult.serverInfo?.name ?? "未返回名称"}{" "}
+                      {checkResult.serverInfo?.version ?? ""} · 协议：
+                      {checkResult.protocolVersion ?? "未返回"}
+                    </p>
+                  )}
+                  {checkResult.checks && checkResult.checks.length > 0 && (
+                    <ul className="mb-0 mt-1.5 space-y-1 pl-3 text-[11px] text-muted">
+                      {checkResult.checks.map((item, index) => (
+                        <li key={index} className="flex items-start gap-1.5">
+                          <span
+                            className={`mt-1 inline-block size-1.5 shrink-0 rounded-full ${
+                              item.ok ? "bg-emerald-500" : "bg-amber-500"
+                            }`}
+                          />
+                          <span className="break-all leading-relaxed">
+                            <span className="font-medium text-foreground/80">
+                              {item.name}：
+                            </span>
+                            <span>{item.message}</span>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-between gap-2 border-t border-black/[0.06] bg-black/[0.015] px-5 py-2.5 dark:border-white/[0.06] dark:bg-white/[0.02]">
@@ -261,13 +341,22 @@ export function ExtensionList({
                   onClick={() => onAction("check", entry)}
                 >
                   <IconPlugConnected size={13} aria-hidden="true" />
-                  <span>{kind === "mcp" ? "测试连接" : "检查可用性"}</span>
+                  <span>
+                    {busy &&
+                    (busyAction === "test_mcp" || busyAction === "validate_skill")
+                      ? "检查中…"
+                      : kind === "mcp"
+                        ? "测试连接"
+                        : "检查可用性"}
+                  </span>
                 </Button>
 
                 {checkResult && (
-                  <span
+                  <button
+                    type="button"
                     role="status"
-                    className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium truncate shrink-0 ${
+                    onClick={() => toggleCheckExpanded(entry.id, checkResult.ok)}
+                    className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium truncate shrink-0 cursor-pointer transition-opacity hover:opacity-80 ${
                       checkResult.revision !== revision
                         ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
                         : checkResult.ok
@@ -276,7 +365,7 @@ export function ExtensionList({
                     }`}
                     title={
                       checkResult.revision !== revision
-                        ? "上次检查已失效，请重新检查"
+                        ? "上次检查已失效，点击查看详情"
                         : `${checkResult.ok ? "上次检查通过" : "上次检查失败"}${
                             checkResult.checkedAt
                               ? ` · ${new Date(checkResult.checkedAt).toLocaleTimeString("zh-CN", {
@@ -284,7 +373,7 @@ export function ExtensionList({
                                   minute: "2-digit",
                                 })}`
                               : ""
-                          }`
+                          }（点击${isCheckExpanded(entry.id, checkResult.ok) ? "收起" : "展开"}详情）`
                     }
                   >
                     <span className="size-1.5 rounded-full bg-current shrink-0" />
@@ -300,7 +389,7 @@ export function ExtensionList({
                           minute: "2-digit",
                         })}`}
                     </span>
-                  </span>
+                  </button>
                 )}
               </div>
 

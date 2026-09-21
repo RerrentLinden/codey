@@ -27,6 +27,7 @@ export function useExtensionsController(
   const [uncertain, setUncertain] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [noticeSeq, setNoticeSeq] = useState(0);
   const [check, setCheck] = useState<
     (CheckResult & { id: string; revision?: string }) | null
   >(null);
@@ -164,23 +165,27 @@ export function useExtensionsController(
     },
     [request, scope, inventory?.revision, uncertain],
   );
+  const postNotice = useCallback((text: string) => {
+    setNotice(text);
+    setNoticeSeq((current) => current + 1);
+  }, []);
   const mutate = useCallback(
     async (action: Record<string, unknown>) => {
       const outcome = await run<MutationResult>(action, (result) => {
         setInventory(result.inventory);
         // 后端 message 已说明保存结果，这里只在仍需重启时补充生效方式，避免同一句提示重复两遍。
-        setNotice(
+        postNotice(
           result.applyStatus === "restart-required"
-            ? "配置已保存，请重启 Codex 后确认生效；运行时覆盖可能影响最终状态。"
+            ? "配置已保存，重启 Codex 后生效。"
             : result.message,
         );
       });
       // 提交已落库但清单结果被抢占：不能静默丢弃，提示用户刷新确认。
       if (outcome === "superseded")
-        setNotice("操作已提交，请刷新确认最新状态。");
+        postNotice("操作已提交，请刷新确认。");
       return outcome;
     },
-    [run],
+    [postNotice, run],
   );
   const inspect = useCallback(
     (action: Record<string, unknown>) =>
@@ -207,6 +212,7 @@ export function useExtensionsController(
     clearError: () => setError(""),
     error,
     notice,
+    noticeSeq,
     check,
     checks,
     refresh,

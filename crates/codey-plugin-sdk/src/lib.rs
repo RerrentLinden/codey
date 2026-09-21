@@ -31,6 +31,11 @@ impl PluginContext {
     }
 }
 
+/// 带本地时区与毫秒的标准时间，供文件日志和插件事件复用。
+pub fn timestamp_rfc3339() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+}
+
 /// 有界事件日志；目录必须由宿主预先创建，不创建或重建目录。
 pub fn append_log(directory: &std::path::Path, name: &str, event: &str) -> Result<(), String> {
     static LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -66,10 +71,7 @@ pub fn append_log(directory: &std::path::Path, name: &str, event: &str) -> Resul
         .map_err(|e| e.to_string())?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .map_err(|e| format!("日志写入被占用或无法锁定: {e}"))?;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = timestamp_rfc3339();
     let line = format!("{timestamp} {}\n", event.replace(['\r', '\n'], " "));
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) + line.len() as u64 > 1024 * 1024 {
         if backup.exists() {
@@ -387,6 +389,20 @@ mod tests {
         let missing = temp.path().join("missing");
         assert!(append_log(&missing, "plugin.log", "event").is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn event_log_timestamp_is_rfc3339_with_milliseconds_and_timezone() {
+        let temp = tempfile::tempdir().unwrap();
+        append_log(temp.path(), "plugin.log", "timestamp-check").unwrap();
+        let line = fs::read_to_string(temp.path().join("plugin.log")).unwrap();
+        let stamp = line.split_once(' ').unwrap().0;
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamp).unwrap();
+        assert_eq!(
+            stamp,
+            parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+        );
+        assert_eq!(stamp.len(), 29);
     }
 
     #[cfg(unix)]

@@ -1,4 +1,5 @@
 import { useState, useMemo, useDeferredValue, useEffect } from "react";
+import { toast } from "@heroui/react";
 import {
   Button,
   Dialog,
@@ -83,6 +84,17 @@ export function CodexExtensionsPage({
     setPage(1);
     setSelected([]);
   }, [deferredQuery, filter, source, sort, inventory?.revision, scope]);
+  useEffect(() => {
+    if (!controller.notice) return;
+    if (
+      controller.notice.includes("未能") ||
+      controller.notice.includes("失败")
+    ) {
+      toast.warning(controller.notice);
+    } else {
+      toast.success(controller.notice);
+    }
+  }, [controller.notice, controller.noticeSeq]);
   const guard = (next: () => void) => {
     if (busy) return;
     if (draftChanged(draft)) setDiscard(() => next);
@@ -461,11 +473,6 @@ export function CodexExtensionsPage({
             </Button>
           </div>
         )}
-        {controller.notice && (
-          <p role="status" className="rounded-lg bg-emerald-500/10 p-3 text-xs">
-            {controller.notice}
-          </p>
-        )}
         {inventory?.warnings.map((warning, index) => (
           <p
             key={index}
@@ -551,6 +558,7 @@ export function CodexExtensionsPage({
             kind={kind}
             entries={currentPage.entries}
             busy={busy || loading}
+            busyAction={controller.busyAction}
             onAction={onAction}
             selected={selected}
             onSelect={(id) =>
@@ -590,68 +598,6 @@ export function CodexExtensionsPage({
               下一页
             </Button>
           </nav>
-        )}
-        {controller.check && (
-          <div
-            role={controller.check.ok ? "status" : "alert"}
-            className={`codey-card p-4 border-l-4 ${
-              controller.check.ok
-                ? "border-l-emerald-500"
-                : "border-l-amber-500"
-            }`}
-          >
-            <div className="flex items-center gap-2 mb-2">
-              <span
-                className={`codey-badge ${
-                  controller.check.ok
-                    ? "codey-badge-success"
-                    : "codey-badge-warning"
-                }`}
-              >
-                {controller.check.ok ? "检查通过" : "存在异常"}
-              </span>
-              <h3 className="m-0 text-sm font-semibold">
-                {entries.find((entry) => entry.id === controller.check?.id)
-                  ?.name ?? controller.check.id}
-                ：{controller.check.summary}
-              </h3>
-            </div>
-            {controller.check.revision !== inventory?.revision && (
-              <p className="text-xs text-warning">
-                配置已变化，此检查结果已失效。
-              </p>
-            )}
-            {(controller.check.serverInfo?.name ||
-              controller.check.serverInfo?.version ||
-              controller.check.protocolVersion) && (
-              <p className="text-xs text-muted">
-                服务：{controller.check.serverInfo?.name ?? "未返回名称"}{" "}
-                {controller.check.serverInfo?.version ?? ""} · 协议：
-                {controller.check.protocolVersion ?? "未返回"}
-              </p>
-            )}
-            <ul className="mb-0 space-y-1.5 pl-4 text-xs text-muted">
-              {controller.check.checks.map((item, index) => (
-                <li key={index} className="flex items-center gap-2">
-                  <span
-                    className={`inline-block w-1.5 h-1.5 rounded-full ${
-                      item.ok ? "bg-emerald-500" : "bg-amber-500"
-                    }`}
-                  />
-                  <span className="font-medium text-[var(--color-text-secondary)]">
-                    {item.name}：
-                  </span>
-                  <span>{item.message}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {(controller.busyAction === "test_mcp" ||
-          controller.busyAction === "validate_skill") && (
-          <p role="status" className="text-sm text-muted">
-            正在检查资源，请稍候…
-          </p>
         )}
       </div>
       <SkillCacheDialog open={cacheOpen && kind === "skill"} request={request} container={container} onClose={() => setCacheOpen(false)} />
