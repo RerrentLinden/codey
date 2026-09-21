@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{argument, optional_argument, string_argument};
 use crate::codey_plugins;
@@ -39,6 +39,26 @@ pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String>
             let remove_data = optional_argument::<bool>(args, "removeData")?.unwrap_or(false);
             blocking(move || codey_plugins::uninstall(&id, remove_data)).await
         }
+        "open_codey_plugin_directory" => {
+            let id = string_argument(args, "pluginId")?;
+            blocking(move || {
+                super::open_in_file_manager(&codey_plugins::plugin_directory(&id)?)?;
+                Ok(json!({"status": "ok"}))
+            })
+            .await
+        }
+        "open_codey_plugin_logs" => {
+            let id = string_argument(args, "pluginId")?;
+            blocking(move || {
+                let directory = codey_plugins::plugin_directory(&id)?;
+                let status = match crate::plugin_log_terminal::open(&directory)? {
+                    crate::plugin_log_terminal::OpenStatus::Opened => "ok",
+                    crate::plugin_log_terminal::OpenStatus::AlreadyOpen => "already_open",
+                };
+                Ok(json!({"status": status}))
+            })
+            .await
+        }
         "invoke_codey_plugin" => {
             let id = string_argument(args, "pluginId")?;
             let method = string_argument(args, "method")?;
@@ -74,7 +94,7 @@ async fn select_package() -> Result<Value, String> {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 async fn select_package() -> Result<Value, String> {
-    Err("当前平台请使用本地文件路径导入插件".into())
+    Err("当前平台请在导入弹窗中填写插件包路径".into())
 }
 
 #[cfg(test)]
@@ -99,6 +119,10 @@ mod tests {
                 "uninstall_codey_plugin",
                 json!({"pluginId":"demo","removeData":1}),
             ),
+            ("open_codey_plugin_directory", json!({"pluginId":42})),
+            ("open_codey_plugin_directory", json!({})),
+            ("open_codey_plugin_logs", json!({"pluginId":42})),
+            ("open_codey_plugin_logs", json!({})),
         ] {
             assert!(invoke(command, &args).await.is_err(), "{command}");
         }

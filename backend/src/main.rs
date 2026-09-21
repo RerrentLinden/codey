@@ -1,6 +1,14 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() {
+    match codey_lib::run_plugin_log_terminal_if_requested() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("插件日志终端运行失败：{error:#}");
+            std::process::exit(1);
+        }
+    }
     if let Some(code) = codey_lib::run_elevated_node_options_helper_if_requested() {
         std::process::exit(code);
     }

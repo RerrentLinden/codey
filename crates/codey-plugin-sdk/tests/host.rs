@@ -7,10 +7,10 @@ mod fs_util;
 #[path = "../../../backend/src/codey_plugins/mod.rs"]
 mod host;
 
-use serde_json::{Value, json};
 use host::lifecycle::{
     LifecycleDecision, LifecycleOutcome, LifecycleRequest, LifecycleResponse, LifecycleStage,
 };
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 
@@ -125,19 +125,19 @@ async fn complete_native_plugin_lifecycle() {
     for (before, after) in [
         (
             "value: String,",
-            "value: String,\n    received_config: Value,\n    last_terminal: Option<String>,",
+            "value: String,\n    received_config: Value,",
         ),
         (
             "value: value.into(),",
-            "value: value.into(),\n            received_config: config.clone(),\n            last_terminal: None,",
+            "value: value.into(),\n            received_config: config.clone(),",
         ),
         (
             "match method {",
-            "match method {\n            \"config.received\" => Ok(self.received_config.clone()),\n            \"terminal.received\" => Ok(json!(self.last_terminal)),",
+            "match method {\n            \"config.received\" => Ok(self.received_config.clone()),",
         ),
         (
             "\"request.completed\" | \"request.failed\" | \"request.cancelled\" => Ok(json!({})),",
-            "\"request.completed\" | \"request.failed\" | \"request.cancelled\" => { self.last_terminal = Some(method.into()); Ok(json!({})) },",
+            "\"request.completed\" | \"request.failed\" | \"request.cancelled\" => { std::fs::write(self.context.data_dir.join(\"terminal-received.txt\"), method).map_err(|e| e.to_string())?; Ok(json!({})) },",
         ),
     ] {
         assert_eq!(
@@ -182,8 +182,16 @@ async fn complete_native_plugin_lifecycle() {
     let library = fs::read(target.join("debug").join(name)).unwrap();
     unsafe {
         let library = libloading::Library::new(target.join("debug").join(name)).unwrap();
-        assert!(library.get::<codey_plugin_sdk::EntryPoint>(b"codey_plugin_entry_v1").is_ok());
-        assert!(library.get::<codey_plugin_sdk::EntryPoint>(b"codey_plugin_entry_with_context_v1").is_err());
+        assert!(
+            library
+                .get::<codey_plugin_sdk::EntryPoint>(b"codey_plugin_entry_v1")
+                .is_ok()
+        );
+        assert!(
+            library
+                .get::<codey_plugin_sdk::EntryPoint>(b"codey_plugin_entry_with_context_v1")
+                .is_err()
+        );
     }
     let path = temp.path().join("demo.codey-plugin");
     package(&path, &library, "1.0.0");
@@ -262,33 +270,45 @@ async fn complete_native_plugin_lifecycle() {
         );
     }
     let mut request = LifecycleRequest::new(
-        json!({"requestId":"test-request","accountId":"account-handle"}), None,
+        json!({"requestId":"test-request","accountId":"account-handle"}),
+        None,
     );
     assert!(request.is_active());
-    let LifecycleDecision::Continue(patched) = request.dispatch(
-        LifecycleStage::BeforeSend, 0,
-        BTreeMap::from([("authorization".into(), "Bearer secret".into())]), None,
-    ).await.unwrap() else {
+    let LifecycleDecision::Continue(patched) = request
+        .dispatch(
+            LifecycleStage::BeforeSend,
+            0,
+            BTreeMap::from([("authorization".into(), "Bearer secret".into())]),
+            None,
+        )
+        .await
+        .unwrap()
+    else {
         panic!("expected continue");
     };
     assert_eq!(patched.len(), 1);
     assert_eq!(patched[0].name, "x-plugin-demo");
     assert_eq!(patched[0].value.as_deref(), Some("hello-codey"));
-    assert!(matches!(request.dispatch(LifecycleStage::AfterHeaders, 0, BTreeMap::new(), Some(LifecycleResponse {
+    assert!(
+        matches!(request.dispatch(LifecycleStage::AfterHeaders, 0, BTreeMap::new(), Some(LifecycleResponse {
         status: 200, headers: BTreeMap::new(),
-    })).await.unwrap(), LifecycleDecision::Continue(headers) if headers.is_empty()));
+    })).await.unwrap(), LifecycleDecision::Continue(headers) if headers.is_empty())
+    );
     request.finish(LifecycleOutcome::Completed, Some(200), None);
     assert!(!request.is_active());
+    // 直接调用插件会占用实例锁，可能让尽力发送的终态通知被跳过。
+    // 从夹具文件观察回调结果，避免轮询与终态回调争用实例。
+    let terminal_path = plugin_dir.join("data/terminal-received.txt");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if host::invoke("dev.codey.header-demo", "terminal.received", Value::Null).ok()
-                == Some(json!("request.completed"))
-            {
+            if fs::read_to_string(&terminal_path).ok().as_deref() == Some("request.completed") {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     let comment_edit = INITIAL_CONFIG.replace("用于请求头", "更新说明");
     let configured = host::save_config_file(
         "dev.codey.header-demo",
@@ -417,7 +437,10 @@ async fn complete_native_plugin_lifecycle() {
     host::install(&path, &inspection.sha256).unwrap();
     host::set_enabled("dev.codey.header-demo", true).unwrap();
     let mut request = LifecycleRequest::new(json!({"requestId":"unauthorized-header"}), None);
-    let error = request.dispatch(LifecycleStage::BeforeSend, 0, BTreeMap::new(), None).await.unwrap_err();
+    let error = request
+        .dispatch(LifecycleStage::BeforeSend, 0, BTreeMap::new(), None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "plugin_invalid_headers");
     request.finish(LifecycleOutcome::Failed, None, Some(&error.code));
     package(&path, &library, "1.3.0");

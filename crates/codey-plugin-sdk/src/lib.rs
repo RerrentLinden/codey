@@ -298,7 +298,9 @@ mod tests {
         let mut result = Buffer::default();
         let input = br#"{"config":{},"context":{"pluginId":"test","pluginDir":"plugin","dataDir":"data","logDir":"logs"}}"#;
         assert_eq!(
-            unsafe { create::<PanicPlugin>(input.as_ptr(), input.len(), &mut instance, &mut result) },
+            unsafe {
+                create::<PanicPlugin>(input.as_ptr(), input.len(), &mut instance, &mut result)
+            },
             0
         );
         unsafe {

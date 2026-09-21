@@ -45,10 +45,13 @@ test("源码约束：失效账号在刷新前返回，前端轮询包含失效�
     accountCommands,
     /if record\.invalid\(\) \{\s*return Ok\(record\);\s*\}\s*let expected = record\.clone\(\);\s*let proxy = [^;]+;\s*match refresh_if_stale/,
   );
+  const refresh = store.match(/pub async fn refresh_if_stale_cached\([\s\S]*?\n\}/)?.[0];
+  assert.ok(refresh, "应存在生产使用的令牌刷新函数");
   assert.match(
-    store,
-    /pub async fn refresh_if_stale\([\s\S]{0,400}if record\.invalid\(\) \{\s*return Ok\(false\);\s*\}/,
+    refresh,
+    /if record\.invalid\(\) \{\s*return Ok\(false\);\s*\}\s*if !needs_token_refresh\(record\)/,
   );
+  assert.ok(refresh.indexOf("if record.invalid()") < refresh.indexOf(".post(OAUTH_TOKEN_URL)"));
   // 前端轮询跳过已标记失效的账号，只在失效状态变化时重算线路。
   assert.match(panel, /if \(account\.invalid\) \{[\s\S]{0,200}invalidUsageSnapshot\(account\)/);
   assert.match(panel, /snapshot\.reason === "official_account_invalid" && !known\?\.invalid/);
@@ -72,10 +75,14 @@ test("失效账号的线路随失效标记一起移除", () => {
   // 标记失效后立刻重算线路，并且前端能取回最新的配置与模型状态。
   assert.match(commands, /refresh_official_routes_after_invalid_account/);
   assert.match(commands, /"refresh_official_account_routes" =>/);
-  assert.match(
-    accountCommands,
-    /pub\(super\) async fn refresh_official_route_after_account_change/,
-  );
+  const refreshRoutes = accountCommands.match(
+    /async fn refresh_official_route_after_account_change\([\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(refreshRoutes, "应存在账号变更后的线路刷新函数");
+  assert.match(refreshRoutes, /prepare_routes_for_current_launch\(state\)\.await/);
+  assert.match(refreshRoutes, /hot_reload_runtime_models\(state, &config, &model_state\)\.await/);
+  assert.match(refreshRoutes, /"config": redacted_config\(&config\)/);
+  assert.match(refreshRoutes, /"modelState": model_state/);
   assert.match(
     panel,
     /invoke<OfficialAccountsResult>\("refresh_official_account_routes"\)/,

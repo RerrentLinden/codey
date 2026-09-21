@@ -17,8 +17,9 @@ test("Windows source contract: Codey uses the GUI subsystem", async () => {
     main,
     /^#!\[cfg_attr\(target_os = "windows", windows_subsystem = "windows"\)\]/,
   );
-  assert.doesNotMatch(library, /ShowWindow|GetConsoleWindow/);
-  assert.doesNotMatch(manifest, /Win32_System_Console/);
+  // 插件日志子进程可按需创建控制台，桌面入口仍应直接使用 GUI 子系统。
+  assert.doesNotMatch(main, /AllocConsole|AttachConsole|ShowWindow|GetConsoleWindow/);
+  assert.doesNotMatch(library, /AllocConsole|AttachConsole|ShowWindow|GetConsoleWindow/);
   assert.match(manifest, /Win32_UI_WindowsAndMessaging/);
 });
 
@@ -170,5 +171,13 @@ test("Windows source contract: missing Codex paths recover before startup", asyn
     commands,
     /FileDialog::new\(\)[\s\S]*选择 Codex 桌面应用安装目录[\s\S]*pick_folder\(\)/,
   );
-  assert.match(commands, /save_config_to_store\(state, &config\)/);
+  const recoverPath = commands.match(
+    /async fn ensure_windows_codex_app_path\([\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(recoverPath, "应存在 Windows Codex 路径恢复函数");
+  assert.match(recoverPath, /config\.codex_app_path = app_dir\.to_string_lossy\(\)\.to_string\(\)/);
+  assert.match(
+    recoverPath,
+    /let config = save_config_to_store\(state, config\)\s*\.await\s*\.map_err\([^\n]+\)\?;\s*\*state\.config\.write\(\)\.await = config;/,
+  );
 });

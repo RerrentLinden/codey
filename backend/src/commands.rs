@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 #[cfg(all(test, windows))]
 use std::fs;
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc, Mutex as BlockingMutex,
@@ -1368,6 +1366,8 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "set_codey_plugin_enabled" => native_plugins::invoke(command, &args).await,
         "save_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,
         "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "open_codey_plugin_directory" => native_plugins::invoke(command, &args).await,
+        "open_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
         "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
@@ -1409,6 +1409,69 @@ pub(super) fn open_system_browser(url: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法使用系统默认浏览器打开页面：{error}"))
+}
+
+pub(super) fn open_in_file_manager(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("无法访问目录：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("只能打开普通目录".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(windows)]
+    let mut command = Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+
+    command
+        .arg(file_manager_path(path).as_os_str())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法使用系统文件管理器打开目录：{error}"))
+}
+
+fn file_manager_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+mod file_manager_tests {
+    use super::*;
+
+    #[test]
+    fn open_in_file_manager_rejects_files_and_missing_paths() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = open_in_file_manager(file.path()).unwrap_err();
+        assert!(error.contains("普通目录"), "{error}");
+        let missing = file.path().with_file_name("missing-codey-plugin-dir");
+        let error = open_in_file_manager(&missing).unwrap_err();
+        assert!(error.contains("无法访问目录"), "{error}");
+    }
+
+    #[test]
+    fn file_manager_path_strips_windows_extended_prefix() {
+        assert_eq!(
+            file_manager_path(Path::new(r"\\?\C:\Users\kim\plugin")),
+            PathBuf::from(r"C:\Users\kim\plugin")
+        );
+        assert_eq!(
+            file_manager_path(Path::new(r"\\?\UNC\server\share\plugin")),
+            PathBuf::from(r"\\server\share\plugin")
+        );
+        assert_eq!(
+            file_manager_path(Path::new("/tmp/plugins")),
+            PathBuf::from("/tmp/plugins")
+        );
+    }
 }
 
 pub async fn query_route_request_logs(

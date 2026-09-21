@@ -30,9 +30,9 @@ impl Plugin for HeaderDemo {
 
     fn invoke(&mut self, method: &str, params: Value) -> Result<Value, String> {
         match method {
-            "request.beforeSend" => {
-                Ok(json!({"action":"continue","headers":[{"name":"x-plugin-demo", "value":self.value}]}))
-            }
+            "request.beforeSend" => Ok(
+                json!({"action":"continue","headers":[{"name":"x-plugin-demo", "value":self.value}]}),
+            ),
             "request.afterHeaders" => Ok(json!({"action":"continue"})),
             "request.completed" | "request.failed" | "request.cancelled" => Ok(json!({})),
             "ping" => Ok(json!({"plugin":"header-demo","value":self.value,"params":params})),

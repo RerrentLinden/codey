@@ -50,6 +50,8 @@ export const CODEY_API_COMMANDS = [
   "set_codey_plugin_enabled",
   "save_codey_plugin_config_file",
   "uninstall_codey_plugin",
+  "open_codey_plugin_directory",
+  "open_codey_plugin_logs",
   "invoke_codey_plugin",
   "codex_extensions",
 ] as const;

@@ -16,6 +16,14 @@ use crate::error_log;
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// 发现与选择阶段的失败只付一次 loopback 请求的代价，既不触碰 renderer，也不
+// 留下 CDP 副作用，因此可以用更密的节奏跟随 renderer 就绪。一旦失败进入桥接
+// 安装阶段，每次重试都会重建 WebSocket 并重复注册持久注入脚本，必须保持原有
+// 退避，避免在 Codex 冷启动的 CPU 高峰窗口里叠加负担。
+const DISCOVERY_RETRY_STEP: Duration = Duration::from_millis(50);
+const DISCOVERY_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(200);
+const BRIDGE_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(500);
 const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
@@ -65,6 +73,23 @@ impl InjectionPhase {
             Self::VerifyOverlay => "验证 Codey 浮层",
             Self::ReadStatuses => "读取注入状态",
         }
+    }
+
+    /// 诊断日志用的稳定标识，避免把面向用户的中文文案写进可检索字段。
+    fn key(self) -> &'static str {
+        match self {
+            Self::DiscoverTargets => "discoverTargets",
+            Self::SelectTarget => "selectTarget",
+            Self::InstallBridge => "installBridge",
+            Self::VerifyOverlay => "verifyOverlay",
+            Self::ReadStatuses => "readStatuses",
+        }
+    }
+
+    /// 该阶段的失败是否只花掉一次廉价探测：没有建立 CDP 会话，因而可以安全地
+    /// 用更短的间隔重试。
+    fn is_discovery(self) -> bool {
+        matches!(self, Self::DiscoverTargets | Self::SelectTarget)
     }
 }
 
@@ -427,22 +452,31 @@ pub async fn retry_inject_with_scripts(
     // more than ten seconds before the first injectable page appears. Keep
     // enough budget for the bridge commands after discovery while retaining a
     // hard startup deadline.
-    let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
-    let mut delay = Duration::from_millis(100);
+    let started = tokio::time::Instant::now();
+    let deadline = started + CDP_INJECTION_TIMEOUT;
+    let mut delay = INITIAL_RETRY_INTERVAL;
     let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
     let mut previous_error = None;
+    let mut stats = InjectionRetryStats::default();
     let last_error = loop {
         phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
+        stats.attempts += 1;
+        let attempt_started = tokio::time::Instant::now();
         match tokio::time::timeout_at(
             deadline,
             inject_with_scripts(debug_port, handler.clone(), scripts, &phase),
         )
         .await
         {
-            Ok(Ok(target)) => return Ok(target),
+            Ok(Ok(target)) => {
+                stats.report("injected", started.elapsed());
+                return Ok(target);
+            }
             Ok(Err(error)) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
+                stats.record_failure(current_phase, attempt_started.elapsed());
                 if tokio::time::Instant::now() + delay > deadline {
+                    stats.report("noRetryBudget", started.elapsed());
                     break anyhow::anyhow!(
                         "Codex CDP bridge 注入失败（阶段：{}；{}）",
                         current_phase.label(),
@@ -451,12 +485,11 @@ pub async fn retry_inject_with_scripts(
                 }
                 previous_error = Some(safe_injection_error_summary(&error));
                 tokio::time::sleep(delay).await;
-                // A renderer that becomes injectable mid-sleep should not wait
-                // out a multi-second backoff; a loopback GET every 500 ms is cheap.
-                delay = (delay * 2).min(Duration::from_millis(500));
+                delay = next_injection_retry_delay(delay, current_phase);
             }
             Err(_) => {
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
+                stats.report("deadlineExceeded", started.elapsed());
                 let previous_error = previous_error
                     .as_deref()
                     .map(|error| format!("；最近一次失败：{error}"))
@@ -471,6 +504,54 @@ pub async fn retry_inject_with_scripts(
         }
     };
     Err(InjectionRetryFailure { error: last_error })
+}
+
+/// 下一次重试前的等待时长。发现与选择阶段的失败没有 CDP 副作用，也不触碰
+/// renderer，用小步长逼近 renderer 就绪即可；桥接及之后的阶段每次失败都会重建
+/// WebSocket 并重复注册持久脚本，沿用原来的指数退避。
+fn next_injection_retry_delay(current: Duration, phase: InjectionPhase) -> Duration {
+    if phase.is_discovery() {
+        return (current + DISCOVERY_RETRY_STEP).min(DISCOVERY_RETRY_MAX_INTERVAL);
+    }
+    (current * 2).min(BRIDGE_RETRY_MAX_INTERVAL)
+}
+
+/// 单次注入重试的失败画像：把「注入慢」区分为等待 renderer 还是重复桥接，
+/// 不必只凭重试间隔反推。每次启动只写一条汇总，不随重试次数增长。
+#[derive(Default)]
+struct InjectionRetryStats {
+    attempts: u32,
+    discovery_failures: u32,
+    bridge_failures: u32,
+    failure_expense_ms: u64,
+    last_failure_phase: Option<InjectionPhase>,
+}
+
+impl InjectionRetryStats {
+    fn record_failure(&mut self, phase: InjectionPhase, cost: Duration) {
+        if phase.is_discovery() {
+            self.discovery_failures += 1;
+        } else {
+            self.bridge_failures += 1;
+        }
+        self.failure_expense_ms += cost.as_millis() as u64;
+        self.last_failure_phase = Some(phase);
+    }
+
+    fn report(&self, outcome: &str, elapsed: Duration) {
+        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+            "cdp.injection_retry_summary",
+            serde_json::json!({
+                "outcome": outcome,
+                "attempts": self.attempts,
+                "discoveryFailures": self.discovery_failures,
+                "bridgeFailures": self.bridge_failures,
+                "failureExpenseMs": self.failure_expense_ms,
+                "lastFailurePhase": self.last_failure_phase.map(InjectionPhase::key),
+                "totalMs": elapsed.as_millis() as u64,
+            }),
+        );
+    }
 }
 
 fn summarize_cdp_targets(targets: &[CdpTarget]) -> String {

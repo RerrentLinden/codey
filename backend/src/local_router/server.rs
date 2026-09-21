@@ -976,6 +976,7 @@ pub(crate) struct RouteTarget {
 #[derive(Clone, Debug)]
 pub(crate) struct OfficialRouteAuth {
     pub(crate) account_id: String,
+    pub(crate) email: Option<String>,
     pub(crate) path: PathBuf,
     pub(crate) accepts_incoming_authorization: bool,
 }
@@ -990,11 +991,18 @@ fn official_route_auth(profile: &crate::config::ProviderProfile) -> Option<Offic
         &crate::config::default_config_path(),
     );
     let path = store.credential_path(codex_home, &account_id);
+    // 账号邮箱随路由快照读取，生命周期不接受客户端提供的邮箱。
+    let email = store
+        .get(&account_id)
+        .ok()
+        .flatten()
+        .and_then(|record| record.email);
     // Codex refreshes the default account's copy in place and sends its token
     // with every request; idle accounts keep their own stored document.
     let accepts_incoming_authorization = path == codex_home.join("auth.json");
     Some(OfficialRouteAuth {
         account_id,
+        email,
         path,
         accepts_incoming_authorization,
     })

@@ -29,6 +29,7 @@ mod official_accounts;
 mod overlay_recovery;
 mod pending_approval;
 mod pet_slim_patch;
+mod plugin_log_terminal;
 mod plugin_marketplace;
 mod process_cleanup;
 mod process_tree;
@@ -68,6 +69,10 @@ pub fn run_update_helper_if_requested() -> Result<bool> {
 
 pub fn run_error_log_helper_if_requested() -> Result<bool> {
     error_log::run_helper_if_requested()
+}
+
+pub fn run_plugin_log_terminal_if_requested() -> Result<bool> {
+    plugin_log_terminal::run_if_requested()
 }
 
 pub fn run_codex_cli_wrapper_if_requested() -> Result<bool> {

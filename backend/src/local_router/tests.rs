@@ -2737,11 +2737,13 @@ fn stored_official_account_routes_serve_requests_without_the_default_login() {
 fn codex_login_route_outranks_stored_accounts_for_default_quota() {
     let login = OfficialRouteAuth {
         account_id: "test-default".into(),
+        email: None,
         path: std::path::PathBuf::from("/codex/home/auth.json"),
         accepts_incoming_authorization: true,
     };
     let idle = OfficialRouteAuth {
         account_id: "test-idle".into(),
+        email: None,
         path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
         accepts_incoming_authorization: false,
     };

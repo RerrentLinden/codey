@@ -168,6 +168,9 @@ pub fn list() -> Result<PluginList, String> {
 pub fn get_config_file(id: &str) -> Result<ConfigFile, String> {
     manager()?.get_config_file(id)
 }
+pub fn plugin_directory(id: &str) -> Result<PathBuf, String> {
+    manager()?.plugin_directory(id)
+}
 /// 停止接受新调用；已取得实例引用的请求完成后销毁实例。库映射保留至进程退出。
 pub fn shutdown() {
     let live = if let Ok(mut m) = manager() {
@@ -399,7 +402,7 @@ impl Manager {
             if !package::valid_id(id) || record.manifest.id != *id {
                 return Err("插件状态 ID 无效或不一致".into());
             }
-            package::validate_manifest(&record.manifest)?;
+            // 这里只校验管理操作依赖的路径；兼容性错误由列表展示，加载前仍完整校验。
             validate_artifact_directory(&record.directory)?;
         }
         let errors = state
@@ -661,6 +664,10 @@ impl Manager {
     }
 
     fn config_path(&self, id: &str) -> Result<PathBuf, String> {
+        Ok(self.plugin_directory(id)?.join(CONFIG_FILE))
+    }
+
+    fn plugin_directory(&self, id: &str) -> Result<PathBuf, String> {
         if !package::valid_id(id) {
             return Err("插件 ID 无效".into());
         }
@@ -670,7 +677,7 @@ impl Manager {
         }
         let root = checked_directory(&self.root)?;
         let installed = checked_child_directory(&root, "installed", false)?;
-        Ok(checked_child_directory(&installed, id, false)?.join(CONFIG_FILE))
+        checked_child_directory(&installed, id, false)
     }
 
     fn get_config_file(&self, id: &str) -> Result<ConfigFile, String> {
@@ -774,7 +781,9 @@ impl Manager {
                     let restart_required = live.is_some_and(|p| {
                         p.manifest.version != r.manifest.version || config.as_ref() != Ok(&p.config)
                     });
-                    let last_error = config_error.or_else(|| self.errors.get(id).cloned());
+                    let last_error = config_error
+                        .or_else(|| self.errors.get(id).cloned())
+                        .or_else(|| package::validate_manifest(&r.manifest).err());
                     let status = if last_error.is_some() {
                         "error"
                     } else if live.is_some() {
@@ -1120,6 +1129,73 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_installed_plugin_does_not_block_manager_startup() {
+        for enabled in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut manager = Manager::open(root.path().into()).unwrap();
+            manager.install(fixture_package()).unwrap();
+            let config = manager.get_config_file("test.boundary").unwrap();
+            let mut other = fixture_package();
+            other.inspection.manifest.id = "test.compatible".into();
+            manager.install(other).unwrap();
+
+            // 模拟升级宿主前保存的旧协议插件，绕过新安装包的兼容性检查。
+            let mut state = manager.state.clone();
+            let record = state.plugins.get_mut("test.boundary").unwrap();
+            record.manifest.capabilities = vec!["request.beforeSend".into()];
+            record.enabled = enabled;
+            manager.commit(state).unwrap();
+
+            let mut reopened = Manager::open(root.path().into()).unwrap();
+            reopened.load_enabled().unwrap();
+            let plugins = reopened.list().plugins;
+            assert_eq!(plugins.len(), 2);
+            let obsolete = &plugins[0];
+            assert_eq!(obsolete.id, "test.boundary");
+            assert!(!obsolete.enabled);
+            assert_eq!(obsolete.status, "error");
+            assert!(
+                obsolete
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("尚未支持的扩展能力")
+            );
+            assert_eq!(plugins[1].id, "test.compatible");
+            assert_eq!(plugins[1].status, "disabled");
+            assert!(plugins[1].last_error.is_none());
+            assert!(reopened.live.is_empty());
+            assert!(
+                reopened
+                    .load("test.boundary")
+                    .unwrap_err()
+                    .contains("尚未支持的扩展能力")
+            );
+            assert_eq!(fs::read_to_string(&config.path).unwrap(), config.content);
+
+            let persisted = fs::read(root.path().join("state.json")).unwrap();
+            let mut restarted = Manager::open(root.path().into()).unwrap();
+            restarted.load_enabled().unwrap();
+            assert_eq!(fs::read(root.path().join("state.json")).unwrap(), persisted);
+            assert_eq!(restarted.list().plugins[0].last_error, obsolete.last_error);
+            assert!(!restarted.list().plugins[0].enabled);
+
+            if enabled {
+                let mut upgrade = fixture_package();
+                upgrade.inspection.manifest.version = "1.0.1".into();
+                restarted.install(upgrade).unwrap();
+                let repaired = Manager::open(root.path().into()).unwrap().list();
+                assert_eq!(repaired.plugins[0].status, "disabled");
+                assert!(repaired.plugins[0].last_error.is_none());
+            } else {
+                restarted.uninstall("test.boundary", false).unwrap();
+                assert_eq!(restarted.list().plugins.len(), 1);
+            }
+            assert_eq!(fs::read_to_string(&config.path).unwrap(), config.content);
+        }
+    }
+
+    #[test]
     fn config_file_preserves_text_and_rejects_external_edits() {
         let root = tempfile::tempdir().unwrap();
         let mut manager = Manager::open(root.path().into()).unwrap();
@@ -1163,6 +1239,36 @@ mod tests {
         for removed in ["config", "configSchema", "configUi", "activeConfig"] {
             assert!(info["plugins"][0].get(removed).is_none());
         }
+    }
+
+    #[test]
+    fn plugin_directory_resolves_installed_root_and_rejects_invalid_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let directory = manager.plugin_directory("test.boundary").unwrap();
+        assert_eq!(
+            directory,
+            manager.context("test.boundary", false).unwrap().plugin_dir
+        );
+        assert_eq!(directory, manager.list().plugins[0].plugin_dir);
+        assert_eq!(directory.file_name().unwrap(), "test.boundary");
+        assert_eq!(
+            directory.parent().unwrap().file_name().unwrap(),
+            "installed"
+        );
+        assert!(
+            manager
+                .plugin_directory("../test.boundary")
+                .unwrap_err()
+                .contains("无效")
+        );
+        assert!(
+            manager
+                .plugin_directory("missing")
+                .unwrap_err()
+                .contains("未安装")
+        );
     }
 
     #[test]

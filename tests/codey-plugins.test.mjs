@@ -55,6 +55,39 @@ test("deep configuration validation avoids recursive traversal", () => {
   assert.equal(pluginConfigBusinessValuesEqual(nested, nested.replace("说明", "新说明")), true);
 });
 
+test("plugin package import uses a preview confirmation dialog", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [section, dialog] = await Promise.all([
+    readFile(new URL("../src/CodeyPluginsSection.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/PluginImportDialog.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(section, /PluginImportDialog/);
+  assert.match(section, /select_codey_plugin_package/);
+  assert.match(section, /install_codey_plugin/);
+  assert.doesNotMatch(section, /本地路径导入/);
+  assert.doesNotMatch(section, /收起路径导入/);
+  assert.doesNotMatch(section, /填写本地路径导入/);
+  assert.doesNotMatch(section, /platform !== "linux"/);
+  assert.match(dialog, /选择文件/);
+  assert.match(dialog, /确认导入/);
+  assert.match(dialog, /确认升级/);
+  assert.match(dialog, /检查安装包/);
+});
+
+test("plugin cards can open the plugin directory in a file manager", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [section, api] = await Promise.all([
+    readFile(new URL("../src/CodeyPluginsSection.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/api.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(section, /IconFolderOpen/);
+  assert.match(section, /open_codey_plugin_directory/);
+  assert.match(section, /在文件管理器中打开插件目录/);
+  assert.match(section, /pluginId: plugin\.id/);
+  assert.doesNotMatch(section, /open_codey_plugin_directory[\s\S]{0,200}pluginDir/);
+  assert.match(api, /"open_codey_plugin_directory"/);
+});
+
 test("business comparison ignores only annotations and object key order", () => {
   const active = '{"value":1,"rules":[{"model":"gpt6","_comments":{"model":"说明"}}]}';
   const commentsOnly = '{"_comments":{"value":"参数"},"rules":[{"_comments":{"model":"更新说明"},"model":"gpt6"}],"value":1}';

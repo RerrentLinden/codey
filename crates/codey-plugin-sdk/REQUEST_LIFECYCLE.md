@@ -48,6 +48,7 @@
     "requestId": "request-42",
     "routeId": "route-example",
     "officialAccountId": null,
+    "officialAccountEmail": null,
     "upstreamAccountId": null,
     "accountType": null,
     "requestedModel": "model-alias",
@@ -62,7 +63,7 @@
 }
 ```
 
-`requestId` 在整个逻辑请求内不变，`attempt` 首次为 0，重发时为 1；`stage` 仅为 `beforeSend` 或 `afterHeaders`，轮询仍使用原阶段。`response` 在发送前为 null。请求模型是最终上游模型名。`officialAccountId` 是 Codey 的稳定本地账号 ID，`upstreamAccountId` 是实际上游身份，不能混用。`accountType` 仅在官方令牌有套餐声明时提供；缺失值为 null，插件应自行判断能否处理。`requestKind` 为 `responses` 或 `responses_compact`。
+`requestId` 在整个逻辑请求内不变，`attempt` 首次为 0，重发时为 1；`stage` 仅为 `beforeSend` 或 `afterHeaders`，轮询仍使用原阶段。`response` 在发送前为 null。请求模型是最终上游模型名。`officialAccountId` 是 Codey 的稳定本地账号 ID，`upstreamAccountId` 是实际上游身份，不能混用。`officialAccountEmail` 是官方线路关联的本地账号记录中的登录邮箱，随路由快照读取，不接受客户端请求头提供的邮箱；非官方线路或记录缺少邮箱时为 null。`accountType` 仅在官方令牌有套餐声明时提供；缺失值为 null，插件应自行判断能否处理。`requestKind` 为 `responses` 或 `responses_compact`。
 
 ## 控制动作
 
