@@ -152,6 +152,12 @@ impl InjectedTarget {
         self.websocket_url.clone()
     }
 
+    /// 常驻桥接连接的消息泵是否已经结束。
+    /// 结束时页面内的桥接调用再也无法送达后端，重新注入是唯一出路。
+    pub fn pump_finished(&self) -> bool {
+        self.pump.is_finished()
+    }
+
     pub async fn close(self) {
         self.pump.close().await;
     }
@@ -1178,6 +1184,10 @@ pub enum TargetHealth {
     Healthy,
     Unhealthy,
     Busy,
+    /// 探测连接可用，但页面端点没有在 CDP 命令预算内产生任何回应。
+    /// 页面忙碌时命令仍会被 renderer 排队执行并回包，完全不回应只出现在
+    /// renderer 已被回收或页面重载导致 page target 被替换的情况。
+    Unresponsive,
 }
 
 fn target_health_from_evaluate_response(response: &serde_json::Value) -> TargetHealth {
@@ -1189,14 +1199,27 @@ fn target_health_from_evaluate_response(response: &serde_json::Value) -> TargetH
 }
 
 pub async fn is_target_healthy(websocket_url: &str) -> Result<TargetHealth> {
-    let result = codey_runtime_core::bridge::evaluate_script_with_await_promise(
+    match codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
         bridge_health_check_script(),
         true,
     )
     .await
-    .context("检查 Codey bridge 健康状态失败")?;
-    Ok(target_health_from_evaluate_response(&result))
+    {
+        Ok(result) => Ok(target_health_from_evaluate_response(&result)),
+        Err(error) => {
+            // 探测每次都新建 CDP 连接。命令超时意味着端点收下了连接却不执行
+            // 命令，与"页面忙而桥接仍在"是两种状态：前者只能重新发现 target，
+            // 后者保守等待。这里把超时单独标出来，交给看门狗分级处理。
+            if error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+            {
+                return Ok(TargetHealth::Unresponsive);
+            }
+            Err(error).context("检查 Codey bridge 健康状态失败")
+        }
+    }
 }
 
 pub fn target_health_error_requires_rediscovery(error: &anyhow::Error) -> bool {
@@ -1427,6 +1450,29 @@ assert.equal(nextPage.window.attempts, 1);
 
         let renderer_timeout = anyhow::anyhow!("timed out waiting for CDP command");
         assert!(!target_health_error_requires_rediscovery(&renderer_timeout));
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_answers_no_cdp_command_is_unresponsive_not_busy() {
+        // An endpoint can accept the WebSocket upgrade and still never execute
+        // a command; that is what a replaced page target looks like. It must
+        // not be reported as a busy renderer, because "busy" tells the watchdog
+        // to wait instead of rediscovering the target.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _held = socket;
+            std::future::pending::<()>().await;
+        });
+
+        assert_eq!(
+            is_target_healthy(&format!("ws://{address}")).await.unwrap(),
+            TargetHealth::Unresponsive,
+        );
+
+        server.abort();
     }
 
     #[test]

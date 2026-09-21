@@ -56,13 +56,72 @@ use process::{codex_runtime_arguments, gpu_launch_arguments};
 
 const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
+// 页面端点对 CDP 命令完全没有回应：页面忙碌不成立，target 很可能已被替换。
+// 连续多轮无响应后重新发现 target，而不是一直当作"页面忙"等下去。
+const CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD: u8 = 3;
+// 页面仍活着，只是桥接往返失败（例如常驻连接已死却还没报错）。
+// 保守等待更久以免页面抖动就重建桥接，但必须有终点，
+// 否则这类"半死"状态永远不会自愈。
+const CDP_WATCHDOG_INCONCLUSIVE_LIMIT: u8 = 6;
+// A completely unresponsive endpoint is a stronger signal than a busy page,
+// so it must rebuild sooner.
+const _: () = assert!(CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD < CDP_WATCHDOG_INCONCLUSIVE_LIMIT);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectionHealth {
     Healthy,
     Unhealthy,
     Inconclusive,
+    /// 页面端点对探测命令没有任何回应。
+    Unresponsive,
+    /// 常驻桥接连接已经结束，页面内的调用再也无法送达。
+    BridgeClosed,
     TargetUnavailable,
+}
+
+impl InjectionHealth {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+            Self::Inconclusive => "inconclusive",
+            Self::Unresponsive => "unresponsive",
+            Self::BridgeClosed => "bridge_closed",
+            Self::TargetUnavailable => "target_unavailable",
+        }
+    }
+}
+
+/// Each failure shape keeps its own budget. Letting one shape reset another
+/// would let a bridge that alternates between failures avoid reinjection
+/// forever, which is exactly how a half-dead bridge escapes every trigger.
+/// Only a confirmed healthy probe clears the budgets.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct InjectionFailureCounters {
+    unhealthy: u8,
+    inconclusive: u8,
+    unresponsive: u8,
+}
+
+impl InjectionFailureCounters {
+    fn snapshot(self) -> serde_json::Value {
+        serde_json::json!({
+            "unhealthy": self.unhealthy,
+            "inconclusive": self.inconclusive,
+            "unresponsive": self.unresponsive,
+        })
+    }
+
+    /// Keep every budget one step below its threshold after a failed rebuild so
+    /// the next matching failure retries immediately, without turning the
+    /// watchdog into a tight rebuild loop.
+    fn after_failed_reinjection() -> Self {
+        Self {
+            unhealthy: CDP_WATCHDOG_FAILURE_THRESHOLD.saturating_sub(1),
+            inconclusive: CDP_WATCHDOG_INCONCLUSIVE_LIMIT.saturating_sub(1),
+            unresponsive: CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD.saturating_sub(1),
+        }
+    }
 }
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex 桌面应用";
 pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App 的安装目录，不要选择 codex.exe 命令行程序或第三方 Codex 启动器";
@@ -1210,58 +1269,82 @@ fn spawn_injection_watchdog(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         let mut target = injected_target;
-        let mut consecutive_failures = 0u8;
+        let mut failure_counters = InjectionFailureCounters::default();
+        let mut reported_health: Option<InjectionHealth> = None;
         'watchdog: loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {}
             }
-            let health = tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => break 'watchdog,
-                result = cdp::is_target_healthy(target.websocket_url()) => {
-                    match result {
-                        Ok(cdp::TargetHealth::Healthy) => InjectionHealth::Healthy,
-                        Ok(cdp::TargetHealth::Unhealthy) => InjectionHealth::Unhealthy,
-                        Ok(cdp::TargetHealth::Busy) => {
-                            // The renderer answered CDP but the in-page bridge
-                            // round-trip missed its budget: the bridge is still
-                            // installed, the page is just busy. Reinjecting
-                            // would pile more script work onto a stalled page.
-                            InjectionHealth::Inconclusive
-                        }
-                        Err(error) => {
-                            let requires_rediscovery =
-                                cdp::target_health_error_requires_rediscovery(&error);
-                            error_log::record_failure_async(
-                                "injection_health_check_failed",
-                                "check_cdp_bridge_health",
-                                format!("{error:#}"),
-                                serde_json::json!({
-                                    "websocketUrl": target.websocket_url(),
-                                    "requiresTargetRediscovery": requires_rediscovery,
-                                }),
-                            )
-                            .await;
-                            if requires_rediscovery {
-                                // The saved /devtools/page endpoint no longer
-                                // accepts CDP traffic. Rediscover immediately;
-                                // retrying this URL cannot repair a replaced
-                                // Windows renderer target.
-                                InjectionHealth::TargetUnavailable
-                            } else {
-                                // A busy renderer can miss the diagnostic
-                                // deadline while its bridge remains installed.
-                                // Reinjecting in that state adds more CDP/script
-                                // work to an already stalled page.
+            // A finished message pump means the in-page bridge can no longer
+            // reach the backend at all. Probing again cannot change that, so
+            // rebuild immediately instead of waiting for the next verdict.
+            let health = if target.pump_finished() {
+                InjectionHealth::BridgeClosed
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break 'watchdog,
+                    result = cdp::is_target_healthy(target.websocket_url()) => {
+                        match result {
+                            Ok(cdp::TargetHealth::Healthy) => InjectionHealth::Healthy,
+                            Ok(cdp::TargetHealth::Unhealthy) => InjectionHealth::Unhealthy,
+                            Ok(cdp::TargetHealth::Unresponsive) => InjectionHealth::Unresponsive,
+                            Ok(cdp::TargetHealth::Busy) => {
+                                // The renderer answered CDP but the in-page bridge
+                                // round-trip missed its budget: the bridge is still
+                                // installed, the page is just busy. Reinjecting
+                                // would pile more script work onto a stalled page.
                                 InjectionHealth::Inconclusive
+                            }
+                            Err(error) => {
+                                let requires_rediscovery =
+                                    cdp::target_health_error_requires_rediscovery(&error);
+                                error_log::record_failure_async(
+                                    "injection_health_check_failed",
+                                    "check_cdp_bridge_health",
+                                    format!("{error:#}"),
+                                    serde_json::json!({
+                                        "websocketUrl": target.websocket_url(),
+                                        "requiresTargetRediscovery": requires_rediscovery,
+                                    }),
+                                )
+                                .await;
+                                if requires_rediscovery {
+                                    // The saved /devtools/page endpoint no longer
+                                    // accepts CDP traffic. Rediscover immediately;
+                                    // retrying this URL cannot repair a replaced
+                                    // Windows renderer target.
+                                    InjectionHealth::TargetUnavailable
+                                } else {
+                                    // A busy renderer can miss the diagnostic
+                                    // deadline while its bridge remains installed.
+                                    // Reinjecting in that state adds more CDP/script
+                                    // work to an already stalled page.
+                                    InjectionHealth::Inconclusive
+                                }
                             }
                         }
                     }
                 }
             };
-            if !watchdog_should_reinject(&mut consecutive_failures, health) {
+            // Record every transition once so a stuck bridge leaves a trace in
+            // the runtime log. Probing is periodic, so steady states stay quiet.
+            if reported_health != Some(health) {
+                let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                    "bridge.health_changed",
+                    serde_json::json!({
+                        "health": health.as_str(),
+                        "previous": reported_health
+                            .map_or("startup", InjectionHealth::as_str),
+                        "websocketUrl": target.websocket_url(),
+                        "counters": failure_counters.snapshot(),
+                    }),
+                );
+                reported_health = Some(health);
+            }
+            if !watchdog_should_reinject(&mut failure_counters, health) {
                 continue;
             }
             let reinjection = tokio::select! {
@@ -1278,10 +1361,18 @@ fn spawn_injection_watchdog(
                     let next_statuses = reinjected.injection_statuses();
                     let next_websocket_url = reinjected.websocket_url_arc();
                     let previous = std::mem::replace(&mut target, reinjected);
+                    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                        "bridge.reinjected",
+                        serde_json::json!({
+                            "reason": health.as_str(),
+                            "previousWebsocketUrl": previous.websocket_url(),
+                            "websocketUrl": next_websocket_url.as_ref(),
+                        }),
+                    );
                     *watchdog_statuses.write().await = next_statuses;
                     *watchdog_websocket_url.write().await = next_websocket_url;
                     previous.close().await;
-                    consecutive_failures = 0;
+                    failure_counters = InjectionFailureCounters::default();
                 }
                 Err(error) => {
                     let error_message = format!("{error:#}");
@@ -1301,7 +1392,7 @@ fn spawn_injection_watchdog(
                     *watchdog_statuses.write().await = watchdog_scripts
                         .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
                     eprintln!("Codey CDP bridge 恢复失败：{error_message}");
-                    consecutive_failures = CDP_WATCHDOG_FAILURE_THRESHOLD.saturating_sub(1);
+                    failure_counters = InjectionFailureCounters::after_failed_reinjection();
                 }
             }
         }
@@ -2305,18 +2396,29 @@ fn spawn_crashpad_guard_watcher(
     (shutdown_tx, task)
 }
 
-fn watchdog_should_reinject(consecutive_failures: &mut u8, health: InjectionHealth) -> bool {
+fn watchdog_should_reinject(
+    counters: &mut InjectionFailureCounters,
+    health: InjectionHealth,
+) -> bool {
     match health {
-        InjectionHealth::Healthy | InjectionHealth::Inconclusive => {
-            *consecutive_failures = 0;
+        InjectionHealth::Healthy => {
+            *counters = InjectionFailureCounters::default();
             false
         }
         InjectionHealth::Unhealthy => {
-            *consecutive_failures = consecutive_failures.saturating_add(1);
-            *consecutive_failures >= CDP_WATCHDOG_FAILURE_THRESHOLD
+            counters.unhealthy = counters.unhealthy.saturating_add(1);
+            counters.unhealthy >= CDP_WATCHDOG_FAILURE_THRESHOLD
         }
-        InjectionHealth::TargetUnavailable => {
-            *consecutive_failures = 0;
+        InjectionHealth::Inconclusive => {
+            counters.inconclusive = counters.inconclusive.saturating_add(1);
+            counters.inconclusive >= CDP_WATCHDOG_INCONCLUSIVE_LIMIT
+        }
+        InjectionHealth::Unresponsive => {
+            counters.unresponsive = counters.unresponsive.saturating_add(1);
+            counters.unresponsive >= CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD
+        }
+        InjectionHealth::BridgeClosed | InjectionHealth::TargetUnavailable => {
+            *counters = InjectionFailureCounters::default();
             true
         }
     }

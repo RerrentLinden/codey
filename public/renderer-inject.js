@@ -23,6 +23,13 @@
   const runtimeHealthCheckTimeoutMs = 3_000;
   const runtimeHealthFailureRetryMs = 1_000;
   const runtimeHealthFailureThreshold = 2;
+  // 系统睡眠会同时冻结页面和后端，唤醒瞬间所有进程一起恢复，
+  // 3 秒的往返预算不足以判断 Codey 是否真的退出。排程间隔远超定时器
+  // 周期即视为刚从睡眠恢复，在这段宽限期内放宽超时与失败阈值。
+  const runtimeHealthResumeGapMs = 90_000;
+  const runtimeHealthResumeGraceMs = 120_000;
+  const runtimeHealthResumeTimeoutMs = 8_000;
+  const runtimeHealthResumeFailureThreshold = 4;
   const accountUsageRefreshIntervalMs = 60_000;
   const accountUsageTimeoutMs = 8_000;
   const sessionToolsIdleLoadTimeoutMs = 5_000;
@@ -52,6 +59,8 @@
   let runtimeHealthState = "checking";
   let runtimeHealthMessage = "";
   let runtimeHealthObservedAt = 0;
+  let runtimeHealthLastCheckAt = 0;
+  let runtimeHealthResumeGraceUntil = 0;
   let accountUsageTimer = 0;
   let accountUsageCheckInFlight = false;
   let accountUsagePollingEnabled = true;
@@ -172,9 +181,9 @@
       const updateLabel = hasDetectedUpdate() ? "，另有可用更新" : "";
       button.setAttribute(
         "aria-label",
-        `Codey 进程异常或连接中断，点击查看处理提示${updateLabel}`,
+        `Codey 连接中断，点击查看处理提示${updateLabel}`,
       );
-      button.title = `Codey 进程异常或连接中断：${detail}（点击查看处理提示）${updateLabel}`;
+      button.title = `Codey 连接中断：${detail}（点击查看处理提示）${updateLabel}`;
       return;
     }
     if (hasDetectedUpdate()) {
@@ -266,14 +275,32 @@
     }
     if (runtimeHealthCheckInFlight) return runtimeHealthSnapshot();
     runtimeHealthCheckInFlight = true;
+    const observedAt = Date.now();
+    const observedGap = runtimeHealthLastCheckAt > 0
+      ? observedAt - runtimeHealthLastCheckAt
+      : 0;
+    runtimeHealthLastCheckAt = observedAt;
+    if (observedGap >= runtimeHealthResumeGapMs) {
+      // 页面和后端被系统一起冻结，唤醒后 Codey 需要时间重新建立与
+      // Codex 的连接。恢复前记录的失败不代表当前状态，直接丢弃。
+      runtimeHealthResumeGraceUntil = observedAt + runtimeHealthResumeGraceMs;
+      runtimeHealthFailures = 0;
+    }
+    const resuming = observedAt < runtimeHealthResumeGraceUntil;
+    const checkTimeoutMs = resuming
+      ? runtimeHealthResumeTimeoutMs
+      : runtimeHealthCheckTimeoutMs;
+    const failureThreshold = resuming
+      ? runtimeHealthResumeFailureThreshold
+      : runtimeHealthFailureThreshold;
     try {
       if (typeof window.__codexSessionDeleteBridge !== "function") {
-        runtimeHealthFailures = runtimeHealthFailureThreshold;
+        runtimeHealthFailures = failureThreshold;
         return setRuntimeHealthState("unavailable", "Codey bridge 不可用");
       }
       const result = await withTimeout(
-        callBridge(backendHealthPath, {}, { timeoutMs: runtimeHealthCheckTimeoutMs }),
-        runtimeHealthCheckTimeoutMs + 250,
+        callBridge(backendHealthPath, {}, { timeoutMs: checkTimeoutMs }),
+        checkTimeoutMs + 250,
         "Codey 后端健康检查超时",
       );
       if (result?.status === "ok") {
@@ -286,15 +313,15 @@
     } catch (error) {
       runtimeHealthFailures += 1;
       const immediate = error?.code === "bridge_unavailable";
-      if (immediate) runtimeHealthFailures = runtimeHealthFailureThreshold;
-      if (runtimeHealthFailures >= runtimeHealthFailureThreshold) {
+      if (immediate) runtimeHealthFailures = failureThreshold;
+      if (runtimeHealthFailures >= failureThreshold) {
         return setRuntimeHealthState("unavailable", "Codey 后端未响应");
       }
       return setRuntimeHealthState("checking", "正在确认 Codey 进程状态");
     } finally {
       runtimeHealthCheckInFlight = false;
       const nextDelay = runtimeHealthFailures > 0
-        && runtimeHealthFailures < runtimeHealthFailureThreshold
+        && runtimeHealthFailures < failureThreshold
         ? runtimeHealthFailureRetryMs
         : runtimeHealthCheckIntervalMs;
       scheduleRuntimeHealthCheck(nextDelay);
@@ -869,7 +896,8 @@
   const openSettings = () => {
     if (runtimeHealthState === "unavailable") {
       window.alert(
-        "Codey 进程异常或已退出，当前配置面板无法连接。请退出 Codex 后重新启动 Codey。",
+        "Codey 与 Codex 的连接已中断，当前配置面板无法连接。"
+        + "Codey 会继续尝试自动恢复；若长时间仍未恢复，请退出 Codex 后重新启动 Codey。",
       );
       return;
     }

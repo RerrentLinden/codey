@@ -685,6 +685,7 @@ const createStartupUpdateFixture = (bridge) => {
   const documentElement = new FakeElement("html");
   const elementsById = new Map();
   let nextTimerId = 1;
+  let clock = Date.now();
   const timers = [];
   const events = [];
   const alerts = [];
@@ -693,6 +694,16 @@ const createStartupUpdateFixture = (bridge) => {
   const activeTimers = () => timers.filter((timer) => !timer.cleared);
   const visibleButton = () =>
     elementsById.get("codey-settings-button") || null;
+  // 注入可控时钟：健康检查用排程间隔判断页面是否刚从系统睡眠中恢复。
+  class FixtureDate extends Date {
+    constructor(...args) {
+      super(...(args.length > 0 ? args : [clock]));
+    }
+
+    static now() {
+      return clock;
+    }
+  }
   const document = {
     body: new FakeElement("body"),
     documentElement,
@@ -787,6 +798,7 @@ const createStartupUpdateFixture = (bridge) => {
         this.detail = init.detail;
       }
     },
+    Date: FixtureDate,
     document,
     HTMLElement: FakeElement,
     location: { pathname: "/", search: "" },
@@ -800,6 +812,9 @@ const createStartupUpdateFixture = (bridge) => {
 
   return {
     activeTimers,
+    advanceClock(milliseconds) {
+      clock += milliseconds;
+    },
     alerts,
     document,
     dispatchDocumentEvent(type) {
@@ -984,7 +999,7 @@ test("marks the Codey icon unavailable after consecutive hung health checks and 
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(button.getAttribute("data-codey-runtime-state"), "unavailable");
-  assert.match(button.getAttribute("aria-label"), /Codey 进程异常或连接中断/);
+  assert.match(button.getAttribute("aria-label"), /Codey 连接中断/);
   assert.match(button.title, /Codey 后端未响应/);
   button.dispatchEvent({
     type: "click",
@@ -992,7 +1007,8 @@ test("marks the Codey icon unavailable after consecutive hung health checks and 
     stopPropagation() {},
   });
   assert.deepEqual(fixture.alerts, [
-    "Codey 进程异常或已退出，当前配置面板无法连接。请退出 Codex 后重新启动 Codey。",
+    "Codey 与 Codex 的连接已中断，当前配置面板无法连接。"
+    + "Codey 会继续尝试自动恢复；若长时间仍未恢复，请退出 Codex 后重新启动 Codey。",
   ]);
 
   healthMode = "healthy";
@@ -1039,6 +1055,67 @@ test("pauses Codey health checks while the page is hidden and resumes immediatel
     fixture.activeTimers().some((timer) => timer.delay === 30_000),
     true,
   );
+});
+
+test("widens the health check budget right after the machine resumes from sleep", async () => {
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+    if (path === "/account/usage") return { status: "disabled" };
+    if (path === "/backend/health") return new Promise(() => {});
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const fireLatestTimer = (delay) => {
+    const timer = fixture.activeTimers()
+      .filter((entry) => entry.delay === delay)
+      .at(-1);
+    assert.ok(timer, `expected an armed ${delay}ms timer`);
+    timer.cleared = true;
+    timer.callback();
+  };
+  // 可见性恢复会同时排程健康检查和额度检查，两者都是 0 延迟。
+  const fireImmediateTimers = () => {
+    for (const timer of fixture.activeTimers().filter((entry) => entry.delay === 0)) {
+      timer.cleared = true;
+      timer.callback();
+    }
+  };
+
+  // 常规状态下沿用原预算。
+  assert.ok(fixture.activeTimers().some((entry) => entry.delay === 3_250));
+  fireLatestTimer(3_250);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // 合盖休眠：页面隐藏期间不排程，唤醒后由可见性恢复路径立即重新检查。
+  fixture.document.visibilityState = "hidden";
+  fixture.dispatchDocumentEvent("visibilitychange");
+  fixture.advanceClock(8 * 60 * 60 * 1000);
+  fixture.document.visibilityState = "visible";
+  fixture.dispatchDocumentEvent("visibilitychange");
+  fireImmediateTimers();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // 唤醒瞬间后端同样刚被拉起，检查改用加宽的往返预算。
+  assert.ok(
+    fixture.activeTimers().some((entry) => entry.delay === 8_250),
+    "恢复宽限期内应使用加宽的往返预算",
+  );
+  assert.equal(
+    fixture.activeTimers().some((entry) => entry.delay === 3_250),
+    false,
+  );
+
+  // 宽限期内保留更多失败次数：系统仍在恢复时不能凭三次超时判定后端退出。
+  const button = fixture.document.getElementById("codey-settings-button");
+  assert.ok(button);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    fireLatestTimer(8_250);
+    await new Promise((resolve) => setImmediate(resolve));
+    fireLatestTimer(1_000);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "checking");
 });
 
 test("ignores sidebar nav and main content until top chrome is available", () => {
