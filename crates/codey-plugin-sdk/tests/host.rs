@@ -259,6 +259,8 @@ async fn complete_native_plugin_lifecycle() {
     .unwrap();
     assert!(plugin_dir.join("logs/plugin.log").exists());
     assert!(plugin_dir.join("logs/host.log").exists());
+    let cleared = host::clear_logs("dev.codey.header-demo").unwrap();
+    assert_eq!(cleared.plugins[0].log_size_bytes, Some(0));
     assert_eq!(
         host::invoke("dev.codey.header-demo", "ping", json!({"echo":1})).unwrap()["value"],
         "hello-codey"
