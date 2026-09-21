@@ -58,6 +58,11 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const [clearLogsPlugin, setClearLogsPlugin] = useState<CodeyPlugin | null>(null);
   const [clearLogsError, setClearLogsError] = useState("");
   const [known, setKnown] = useState(false);
+  const [sectionEl, setSectionEl] = useState<HTMLElement | null>(null);
+
+  const configContainer = useMemo(() => {
+    return sectionEl?.closest<HTMLElement>("#codey-settings-content") ?? sectionEl ?? container;
+  }, [sectionEl, container]);
 
   const pending = useRef(false);
   const epoch = useRef(0);
@@ -226,7 +231,7 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const editing = result?.plugins.find((p) => p.id === editId);
 
   return (
-    <section className="secondary-section codey-plugins-section" aria-labelledby="codey-plugins-title">
+    <section ref={setSectionEl} className="secondary-section codey-plugins-section" aria-labelledby="codey-plugins-title">
       <SettingsPageHeader
         id="codey-plugins-title"
         title="Codey 插件"
@@ -803,7 +808,7 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
         <PluginConfigDialog
           key={editing.id}
           plugin={editing}
-          container={container}
+          container={configContainer}
           onClose={() => {
             setEditId(null);
             if (!configurationSaved.current) void run(refresh, true);

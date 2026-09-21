@@ -594,11 +594,24 @@ export function DrawerContent({
     onPointerDownOutside?.(event);
     if (!event.defaultPrevented) drawer.setOpen(false);
   };
+  const isInline = Boolean(container);
   const drawerElement = (
-    <HeroDrawer.Backdrop isOpen={drawer.open} onOpenChange={handleOpenChange} isDismissable className="p-0 bg-black/40 backdrop-blur-xs">
-      <HeroDrawer.Content placement={placement} className="max-h-none h-dvh">
+    <HeroDrawer.Backdrop
+      isOpen={drawer.open}
+      onOpenChange={handleOpenChange}
+      isDismissable
+      className={cn(isInline && "absolute inset-0 h-full w-full z-40 bg-black/30 backdrop-blur-xs")}
+    >
+      <HeroDrawer.Content
+        placement={placement}
+        className={cn(isInline && "absolute inset-0 h-full w-full justify-end z-40")}
+      >
         <HeroDrawer.Dialog
-          className={cn("h-full w-full sm:w-[680px] max-w-[100vw] text-sm relative flex flex-col bg-background shadow-2xl p-0 outline-none", className)}
+          className={cn(
+            placement === "right" && "h-full w-[75%] min-w-[380px] max-w-full border-l border-border/80 shadow-2xl",
+            placement === "bottom" && "sm:max-w-[760px] sm:mx-auto",
+            className
+          )}
           aria-labelledby={labels.titleId}
           aria-describedby={labels.descriptionId}
         >
@@ -607,6 +620,8 @@ export function DrawerContent({
             className="toast-portal-host pointer-events-none absolute inset-x-0 top-0 z-[100] h-0"
             aria-hidden="true"
           />
+          {placement === "bottom" && <HeroDrawer.Handle />}
+          <HeroDrawer.CloseTrigger aria-label="关闭" />
           <DrawerLabelContext.Provider value={labels}>{children}</DrawerLabelContext.Provider>
         </HeroDrawer.Dialog>
       </HeroDrawer.Content>
@@ -614,18 +629,22 @@ export function DrawerContent({
   );
   return container ? <UNSAFE_PortalProvider getContainer={getContainer}>{drawerElement}</UNSAFE_PortalProvider> : drawerElement;
 }
-export function DrawerHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div {...props} className={cn("flex shrink-0 items-center justify-between border-b border-border/70 bg-muted/20 px-6 py-4", className)} />;
+export function DrawerHeader({ className, ...props }: React.ComponentProps<typeof HeroDrawer.Header>) {
+  return <HeroDrawer.Header {...props} className={cn("pr-9", className)} />;
 }
-export function DrawerFooter({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div {...props} className={cn("flex shrink-0 items-center justify-between border-t border-border/70 bg-background/95 backdrop-blur-sm px-6 py-4", className)} />;
+export function DrawerBody({ className, ...props }: React.ComponentProps<typeof HeroDrawer.Body>) {
+  return <HeroDrawer.Body {...props} className={className} />;
+}
+export function DrawerFooter({ className, ...props }: React.ComponentProps<typeof HeroDrawer.Footer>) {
+  return <HeroDrawer.Footer {...props} className={className} />;
 }
 export function DrawerTitle({ id, className, ...props }: React.ComponentProps<typeof HeroDrawer.Heading>) {
   const labels = React.useContext(DrawerLabelContext);
-  return <HeroDrawer.Heading {...props} id={id ?? labels?.titleId} className={cn("text-base font-semibold text-foreground", className)} />;
+  return <HeroDrawer.Heading {...props} id={id ?? labels?.titleId} className={className} />;
 }
 export function DrawerDescription({ id, className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
   const labels = React.useContext(DrawerLabelContext);
-  return <p {...props} id={id ?? labels?.descriptionId} className={cn("m-0 text-xs leading-relaxed text-muted-foreground", className)} />;
+  return <p {...props} id={id ?? labels?.descriptionId} className={cn("m-0 text-xs leading-relaxed text-muted", className)} />;
 }
+
 

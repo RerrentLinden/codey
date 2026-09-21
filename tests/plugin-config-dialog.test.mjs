@@ -60,7 +60,7 @@ function dialogHarness(initial) {
     "@tabler/icons-react": new Proxy({}, { get: () => () => null }),
     "./components/ui": Object.fromEntries([
       "Badge", "Button", "Dialog", "DialogContent", "DialogDescription", "DialogHeader", "DialogTitle",
-      "Drawer", "DrawerContent", "DrawerDescription", "DrawerFooter", "DrawerHeader", "DrawerTitle",
+      "Drawer", "DrawerBody", "DrawerContent", "DrawerDescription", "DrawerFooter", "DrawerHeader", "DrawerTitle",
     ].map(name => [name, name])),
   };
   const exports = {};
@@ -237,7 +237,7 @@ for (const outcome of ["resolve", "reject"]) test(`old save ${outcome} ignored a
 test("runtime refresh preserves draft and restored value closes without warning", async () => {
   const h = dialogHarness(plugin()); await load(h); edit(h, '"draft"'); h.render({ ...plugin(), enabled: false });
   assert.equal(h.calls.length, 1); assert.equal(field(h, "text").props.value, '"draft"');
-  edit(h, '"saved"'); button(h, "返回插件管理").props.onClick(); assert.equal(h.closed, 1);
+  edit(h, '"saved"'); dismiss(h); assert.equal(h.closed, 1);
 });
 
 test("keyboard save uses the latest value before a render", async () => {

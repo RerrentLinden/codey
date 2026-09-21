@@ -1,22 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  IconAdjustments,
-  IconAlertCircle,
-  IconAlertTriangle,
-  IconCheck,
-  IconChevronDown,
-  IconChevronUp,
-  IconCopy,
-  IconFileCode,
-  IconInfoCircle,
-  IconX,
-} from "@tabler/icons-react";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import {
-  Badge,
   Button,
   Drawer,
+  DrawerBody,
   DrawerContent,
   DrawerDescription,
   DrawerFooter,
@@ -61,8 +49,6 @@ function ConfigFileEditor({ plugin, onClose, onChanged, container }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [discard, setDiscard] = useState<"close" | "reload" | null>(null);
-  const [copied, setCopied] = useState(false);
-  const [rulesOpen, setRulesOpen] = useState(false);
   const pending = useRef(false);
   const alive = useRef(false);
   const epoch = useRef(0);
@@ -126,18 +112,6 @@ function ConfigFileEditor({ plugin, onClose, onChanged, container }: Props) {
   }
   const invalid = (entries: PluginConfigEntry[]): boolean => entries.some(entry => edits.has(entry.id) ? !!tokenError(entry, edits.get(entry.id)!) : invalid(entry.children));
 
-  async function copyPath() {
-    const target = file?.path ?? plugin.configPath;
-    if (!target) return;
-    try {
-      await navigator.clipboard.writeText(target);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // 忽略剪贴板写入失败
-    }
-  }
-
   function renderEntry(entry: PluginConfigEntry, last: boolean) {
     const value = edits.get(entry.id) ?? valueToken(entry);
     const validation = edits.has(entry.id) ? tokenError(entry, value) : undefined;
@@ -166,138 +140,67 @@ function ConfigFileEditor({ plugin, onClose, onChanged, container }: Props) {
 
   return (
     <Drawer open onOpenChange={open => { if (!open) request("close"); }}>
-      <DrawerContent container={container} placement="right" className="w-full sm:w-[700px] max-w-[100vw]" onEscapeKeyDown={event => { if (pending.current) event.preventDefault(); }}>
+      <DrawerContent
+        container={container}
+        placement="right"
+        className="w-[75%] min-w-[380px] max-w-full h-full border-l border-border"
+        onEscapeKeyDown={event => { if (pending.current) event.preventDefault(); }}
+      >
         <div className="contents" onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); void save(); } }}>
-          <DrawerHeader className="px-5 py-3.5 bg-muted/30 border-b border-border/60">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <IconAdjustments size={18} aria-hidden="true" />
-              </div>
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <DrawerTitle className="truncate text-sm font-semibold">{plugin.name} · 配置</DrawerTitle>
-                  <Badge variant="outline" className="shrink-0 text-[11px] font-mono px-1.5 py-0 h-5">v{plugin.version}</Badge>
-                </div>
-                <DrawerDescription className="text-[11px] text-muted-foreground truncate">
-                  管理插件运行参数与规则配置
-                </DrawerDescription>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => request("close")}
-              disabled={saving}
-              aria-label="关闭"
-              className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-            >
-              <IconX size={16} aria-hidden="true" />
-            </button>
+          <DrawerHeader>
+            <DrawerTitle>{plugin.name} · 配置</DrawerTitle>
+            <DrawerDescription>
+              按 JSON 格式修改值：字符串带双引号，数字和 true / false 不加引号。数值、文本等值数组可直接增删项；含对象的数组逐项修改字段值。字段名和说明只读。保存后重新启用插件生效。
+            </DrawerDescription>
           </DrawerHeader>
 
-          {error && (
-            <div className="mx-5 mt-4 flex items-start gap-2.5 rounded-xl border border-red-500/20 bg-red-500/10 p-3 text-red-700 dark:text-red-400">
-              <IconAlertCircle size={16} className="shrink-0 mt-0.5" aria-hidden="true" />
-              <p role="alert" className="m-0 shrink-0 break-words text-xs leading-relaxed font-sans">{error}</p>
-            </div>
-          )}
+          {error && <p role="alert" className="mx-6 mt-3 mb-0 shrink-0 break-words text-xs text-red-600 dark:text-red-400">{error}</p>}
 
           {discard && (
-            <section role="alert" className="mx-5 mt-4 flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-sm text-amber-900 dark:text-amber-200">
-              <IconAlertTriangle size={18} className="shrink-0 mt-0.5 text-amber-500" aria-hidden="true" />
-              <div className="grid gap-2.5 flex-1 min-w-0">
-                <p className="m-0 text-xs font-medium leading-relaxed">
-                  {discard === "close" ? "配置尚未保存，放弃修改并返回插件管理？" : "重新加载将丢弃尚未保存的修改，是否继续？"}
-                </p>
-                <div className="flex items-center gap-2">
-                  <Button size="xs" variant="destructive" disabled={saving} onClick={() => { if (pending.current) return; if (discard === "close") onClose(); else void load(); }}>放弃修改</Button>
-                  <Button size="xs" variant="outline" disabled={saving} onClick={() => setDiscard(null)}>继续编辑</Button>
-                </div>
+            <section role="alert" className="mx-6 mt-3 grid shrink-0 gap-2 rounded-lg border border-amber-300 p-3 text-xs">
+              <p className="m-0">{discard === "close" ? "配置尚未保存，放弃修改？" : "重新加载将丢弃尚未保存的修改，是否继续？"}</p>
+              <div className="flex gap-2">
+                <Button size="xs" variant="destructive" disabled={saving} onClick={() => { if (pending.current) return; if (discard === "close") onClose(); else void load(); }}>放弃修改</Button>
+                <Button size="xs" variant="outline" disabled={saving} onClick={() => setDiscard(null)}>继续编辑</Button>
               </div>
             </section>
           )}
 
-          <div className="flex-1 min-h-0 space-y-4 overflow-y-auto px-5 py-4" aria-busy={loading || saving}>
-            <div className="rounded-xl border border-border/60 bg-muted/20 p-3 text-xs">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0 text-muted-foreground">
-                  <IconInfoCircle size={15} className="shrink-0 text-primary" aria-hidden="true" />
-                  <span className="font-medium text-foreground text-[12px]">JSON 配置规则</span>
-                  <span className="hidden sm:inline text-[11px] text-muted-foreground">· 字符串加引号，数字与布尔不加引号</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setRulesOpen(v => !v)}
-                  className="flex items-center gap-1 text-[11px] text-primary hover:underline cursor-pointer select-none"
-                >
-                  <span>{rulesOpen ? "收起规则" : "查看说明"}</span>
-                  {rulesOpen ? <IconChevronUp size={13} /> : <IconChevronDown size={13} />}
-                </button>
-              </div>
-              {rulesOpen && (
-                <div className="mt-2.5 pt-2.5 border-t border-border/40 space-y-1.5 text-[11px] text-muted-foreground leading-relaxed">
-                  <p className="m-0">1. <span className="text-foreground font-medium">基本类型</span>：字符串带双引号（换行请写为 \n），数字和 true / false 不加引号。</p>
-                  <p className="m-0">2. <span className="text-foreground font-medium">数组增删</span>：数值、文本等简单数组可直接增删元素；含对象的数组逐项修改字段值。</p>
-                  <p className="m-0">3. <span className="text-foreground font-medium">只读与生效</span>：字段名和说明只读；保存后重新启用插件生效。</p>
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-xl border border-border/60 bg-muted/20 p-3">
-              <div className="flex items-center justify-between gap-2 mb-1.5">
-                <div className="flex items-center gap-1.5">
-                  <IconFileCode size={15} className="text-muted-foreground" aria-hidden="true" />
-                  <span className="text-xs font-semibold text-foreground">config.json</span>
-                  {edits.size > 0 && <span className="inline-flex items-center rounded-full bg-amber-500/15 px-1.5 py-0.2 text-[10px] font-medium text-amber-600 dark:text-amber-400">已修改</span>}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void copyPath()}
-                  className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground cursor-pointer select-none transition-colors"
-                  title="复制完整路径"
-                >
-                  {copied ? <IconCheck size={13} className="text-green-600 dark:text-green-400" /> : <IconCopy size={13} />}
-                  <span>{copied ? "已复制" : "复制路径"}</span>
-                </button>
-              </div>
-              <p className="m-0 select-text break-all font-mono text-[11px] text-muted-foreground bg-background/60 rounded-md px-2 py-1 border border-border/40">
+          <DrawerBody aria-busy={loading || saving} className="mt-2 space-y-3">
+            <div className="flex items-baseline gap-2 text-xs">
+              <span className="font-medium text-foreground shrink-0">config.json</span>
+              <p className="m-0 select-text truncate font-mono text-[11px] text-muted-foreground" title={file?.path ?? plugin.configPath}>
                 {file?.path ?? plugin.configPath}
               </p>
             </div>
 
             {loading ? (
-              <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
-                <p role="status" className="m-0 text-sm text-muted-foreground">正在读取配置文件…</p>
-              </div>
+              <p role="status" className="m-0 text-sm text-muted-foreground">正在读取配置文件…</p>
             ) : document && (
               <div
                 aria-label="JSON 配置编辑器"
-                className="overflow-x-auto rounded-xl border border-border/80 bg-background/60 p-3.5 font-mono text-sm shadow-xs"
+                className="overflow-x-auto rounded-md border border-input bg-background p-3 font-mono text-sm"
               >
-                <div className="leading-7 text-muted-foreground">{"{"}</div>
+                <div className="leading-7">{"{"}</div>
                 <div className="min-w-0 pl-4 sm:pl-6">
                   {document.entries.map((entry, index) => renderEntry(entry, index === document.entries.length - 1))}
                 </div>
-                <div className="leading-7 text-muted-foreground">{"}"}</div>
+                <div className="leading-7">{"}"}</div>
               </div>
             )}
-          </div>
+          </DrawerBody>
 
-          <DrawerFooter className="px-5 py-3.5 bg-background/95 backdrop-blur-sm border-t border-border/60">
-            <Button size="sm" variant="outline" disabled={saving} onClick={() => request("close")}>
-              返回插件管理
+          <DrawerFooter className="gap-2">
+            <Button size="sm" variant="outline" disabled={saving || loading} onClick={() => request("reload")}>
+              {file ? "重新加载" : "重试读取"}
             </Button>
-            <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" disabled={saving || loading} onClick={() => request("reload")}>
-                {file ? "重新加载" : "重试读取"}
-              </Button>
-              <Button
-                size="sm"
-                disabled={saving || loading || !document || !edits.size || invalid(document.entries)}
-                onClick={() => void save()}
-              >
-                {saving ? "保存中…" : "保存配置"}
-              </Button>
-            </div>
+            <Button
+              size="sm"
+              disabled={saving || loading || !document || !edits.size || invalid(document.entries)}
+              onClick={() => void save()}
+            >
+              {saving ? "保存中…" : "保存配置"}
+            </Button>
           </DrawerFooter>
         </div>
       </DrawerContent>
