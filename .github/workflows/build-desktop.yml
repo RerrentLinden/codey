@@ -62,18 +62,26 @@ jobs:
       - name: JavaScript tests
         run: pnpm run test:js
 
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
       - name: Rust tests
         run: cargo test --workspace --locked
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Rust format
         run: cargo fmt --all -- --check
 
       - name: Rust clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Build unsigned macOS app
         env:
           CODEY_SKIP_CODESIGN: "1"
+          CODEY_SKIP_OVERLAY_BUILD: "1"
           CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
         run: pnpm run build
 
@@ -199,17 +207,25 @@ jobs:
       - name: JavaScript tests
         run: pnpm run test:js
 
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
       - name: Rust format
         run: cargo fmt --all -- --check
 
       - name: Rust tests
         run: cargo test --workspace --locked
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Rust clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Build Windows executable
         env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
           CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
         run: pnpm run build
 

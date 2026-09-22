@@ -65,6 +65,19 @@ test("tag-triggered desktop releases independently enforce Rust quality gates", 
   assertRustQualityGates(windowsJob);
 });
 
+test("desktop release jobs reuse the prebuilt frontend overlay", () => {
+  for (const job of [
+    workflow.slice(workflow.indexOf("\n  macos:"), workflow.indexOf("\n  windows:")),
+    workflow.slice(workflow.indexOf("\n  windows:"), workflow.indexOf("\n  publish:")),
+  ]) {
+    assert.match(job, /- name: Build embedded frontend assets\s+run: pnpm run vite:build/);
+    assert.match(job, /cargo test --workspace --locked\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
+    assert.match(job, /cargo clippy --workspace --all-targets --locked -- -D warnings\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
+    assert.match(job, /CODEY_SKIP_OVERLAY_BUILD: "1"/);
+  }
+  assert.match(macBuildScript, /CODEY_SKIP_OVERLAY_BUILD/);
+});
+
 test("local releases run the same locked Rust checks", () => {
   const releaseScript = fs.readFileSync(new URL("../scripts/release.mjs", import.meta.url), "utf8");
   assert.match(releaseScript, /\["fmt", "--all", "--", "--check"\]/);

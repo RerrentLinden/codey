@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -6,14 +6,22 @@ import { spawnSync } from "node:child_process";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { version } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
-const overlay = spawnSync(
-  process.execPath,
-  [join(root, "scripts", "build-overlay.mjs")],
-  { cwd: root, stdio: "inherit" },
-);
+if (process.env.CODEY_SKIP_OVERLAY_BUILD === "1") {
+  if (!existsSync(join(root, "dist-overlay", "codey-overlay.js"))) {
+    throw new Error(
+      "CODEY_SKIP_OVERLAY_BUILD=1 但 dist-overlay/codey-overlay.js 不存在，请先运行 pnpm run vite:build",
+    );
+  }
+} else {
+  const overlay = spawnSync(
+    process.execPath,
+    [join(root, "scripts", "build-overlay.mjs")],
+    { cwd: root, stdio: "inherit" },
+  );
 
-if (overlay.error) throw overlay.error;
-if (overlay.status !== 0) process.exit(overlay.status ?? 1);
+  if (overlay.error) throw overlay.error;
+  if (overlay.status !== 0) process.exit(overlay.status ?? 1);
+}
 
 const cargo = spawnSync(
   "cargo",
