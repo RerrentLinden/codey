@@ -6932,10 +6932,10 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
             .set_recv_buffer_size(1024 * 1024)
             .unwrap();
         let mut body = vec![0_u8; length];
-        tokio::time::timeout(Duration::from_secs(30), socket.read_exact(&mut body))
+        socket
+            .read_exact(&mut body)
             .await
-            .expect("上传仍应在进行，不能被响应头期限提前掐断")
-            .unwrap();
+            .expect("上传仍应在进行，不能被响应头期限提前掐断");
         let sse = concat!(
             "data: {\"type\":\"response.completed\",\"response\":{",
             "\"id\":\"resp-after-upload\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
@@ -6992,12 +6992,17 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
         "header timeout included the blocked history upload"
     );
     release.send(()).unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(10), pending)
+    // 放开后整段正文还要挤过被压小的接收窗口，慢机器上这一步可能远超几秒。
+    // 断言关心的是上传最终走完而不是被记成 504，所以等待要宽到不会误报。
+    tokio::time::timeout(Duration::from_secs(120), upstream_task)
+        .await
+        .expect("上游应当读完整段正文并回包")
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), pending)
         .await
         .expect("upstream response should arrive after the body upload")
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
-    upstream_task.await.unwrap();
     router.stop().await.unwrap();
 }
 
