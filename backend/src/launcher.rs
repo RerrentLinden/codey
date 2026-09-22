@@ -1529,7 +1529,12 @@ fn resolve_startup_profile(config: &CodeyConfig) -> Result<ProviderProfile> {
         if current_profile.official_account && !config.official_route_usable(&current_profile) {
             anyhow::bail!("当前线路需要官方账号登录，但本次 Codex 启动未检测到可用的官方登录态");
         }
-        current_profile.validate().map_err(anyhow::Error::msg)?;
+        // The empty default placeholder is the first-run / no-route state. It
+        // is allowed by profile validation so the console can open; requiring
+        // an API URL here would exit before the user can add a route.
+        if !config.needs_initial_route_import() {
+            current_profile.validate().map_err(anyhow::Error::msg)?;
+        }
     }
     Ok(current_profile)
 }

@@ -1688,9 +1688,9 @@ impl CodeyConfig {
     }
 
     pub fn has_third_party_route(&self) -> bool {
-        self.profiles
-            .iter()
-            .any(|profile| profile.enabled && !profile.official_account)
+        self.profiles.iter().any(|profile| {
+            profile.enabled && !profile.official_account && !profile.is_unconfigured_default()
+        })
     }
 
     pub(crate) fn uses_builtin_official_model_catalog(&self) -> bool {
@@ -3587,6 +3587,15 @@ mod tests {
         let config = config.normalize();
         assert!(config.runtime_model_targets().is_empty());
         assert!(!config.has_third_party_route());
+    }
+
+    #[test]
+    fn empty_default_route_is_not_a_third_party_route() {
+        let config = CodeyConfig::default();
+        assert!(config.profiles[0].is_unconfigured_default());
+        assert!(config.needs_initial_route_import());
+        assert!(!config.has_third_party_route());
+        assert!(validate_provider_profiles(&config.profiles).is_ok());
     }
 
     #[test]

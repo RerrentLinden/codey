@@ -234,6 +234,15 @@ async fn disabled_official_route_does_not_install_an_empty_model_catalog() {
     }
 }
 
+#[test]
+fn empty_default_route_can_start_without_an_api_url() {
+    let config = CodeyConfig::default();
+    let startup = resolve_startup_profile(&config).unwrap();
+    assert!(startup.is_unconfigured_default());
+    assert!(startup.enabled);
+    assert!(startup.validate().is_err());
+}
+
 #[tokio::test]
 async fn startup_fallback_removes_search_from_a_stale_chat_route_catalog() {
     let home = tempfile::tempdir().unwrap();
