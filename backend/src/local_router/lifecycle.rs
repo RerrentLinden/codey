@@ -8,12 +8,6 @@ use http_body::{Body as HttpBody, Frame};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// hyper 1.11 HTTP/1 的默认写缓冲上限（`DEFAULT_MAX_BUFFER_SIZE`）。
-/// 缓冲还放得下时，连接会先把正文取完并丢掉，再去刷套接字；响应头期限因此
-/// 会把仍堵在用户态缓冲里的历史上传算进去。最后一块必须至少这么大，连接
-/// 才会先写完它，再结束正文。
-const HYPER_H1_WRITE_BUFFER_BYTES: usize = 8192 + 4096 * 100;
-
 pub(super) fn apply_codey_plugin_header_patches(
     headers: &mut HeaderMap,
     patches: Vec<crate::codey_plugins::HeaderPatch>,
@@ -132,24 +126,6 @@ struct SignaledRequestBody {
     uploaded: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-impl SignaledRequestBody {
-    /// 下一块的结束位置。剩余部分比写缓冲更小时并入当前块，避免最后一块
-    /// 还能留在缓冲里，连接却已经认为正文结束。
-    fn next_chunk_end(&self) -> usize {
-        let remaining = self.bytes.len() - self.cursor;
-        if remaining <= HYPER_H1_WRITE_BUFFER_BYTES {
-            return self.bytes.len();
-        }
-        let end = self.cursor + HYPER_H1_WRITE_BUFFER_BYTES;
-        let tail = self.bytes.len() - end;
-        if tail < HYPER_H1_WRITE_BUFFER_BYTES {
-            self.bytes.len()
-        } else {
-            end
-        }
-    }
-}
-
 impl HttpBody for SignaledRequestBody {
     type Data = Bytes;
     type Error = std::io::Error;
@@ -160,16 +136,15 @@ impl HttpBody for SignaledRequestBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let body = self.get_mut();
         if body.cursor >= body.bytes.len() {
-            // 大请求的最后一块已经占满写缓冲，连接取到结束帧或丢掉正文之前
-            // 必须先把这块刷进套接字。这里才开始计算响应头期限。
+            // 请求体帧已经被连接取完。对于大请求，正文作为单个帧提交，连接
+            // 会在再次轮询到结束帧前先刷满写缓冲；这里才开始计算响应头期限。
             if let Some(uploaded) = body.uploaded.take() {
                 let _ = uploaded.send(());
             }
             return Poll::Ready(None);
         }
-        let end = body.next_chunk_end();
-        let chunk = body.bytes.slice(body.cursor..end);
-        body.cursor = end;
+        let chunk = body.bytes.slice(body.cursor..);
+        body.cursor = body.bytes.len();
         Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
 
@@ -493,7 +468,7 @@ mod tests {
                     seen += frame.into_data().unwrap().len();
                     assert!(
                         uploaded.try_recv().is_err(),
-                        "upload signal must wait until every chunk is taken"
+                        "upload signal must wait until the body frame is taken"
                     );
                 }
                 Poll::Ready(Some(Err(error))) => panic!("{error}"),
@@ -507,27 +482,14 @@ mod tests {
         let (_empty, mut empty_uploaded) = signaled_request_body(Bytes::new());
         empty_uploaded.try_recv().unwrap();
 
-        // 大于写缓冲的正文要拆成至少一块满缓冲的帧，最后一块也不得小于缓冲，
-        // 否则连接会在尾部尚未写出时结束正文。
-        let large = vec![9_u8; HYPER_H1_WRITE_BUFFER_BYTES * 2 + 10];
+        let large = vec![9_u8; 1_024 * 1_024];
         let (mut body, mut uploaded) = signaled_request_body(Bytes::from(large));
         let waker = futures_util::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut context) else {
-            panic!("expected the first full-buffer chunk");
+            panic!("expected the complete request body frame");
         };
-        assert_eq!(
-            frame.into_data().unwrap().len(),
-            HYPER_H1_WRITE_BUFFER_BYTES
-        );
-        assert!(uploaded.try_recv().is_err());
-        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut context) else {
-            panic!("expected the trailing chunk to stay above the write buffer");
-        };
-        assert_eq!(
-            frame.into_data().unwrap().len(),
-            HYPER_H1_WRITE_BUFFER_BYTES + 10
-        );
+        assert_eq!(frame.into_data().unwrap().len(), 1_024 * 1_024);
         assert!(uploaded.try_recv().is_err());
         assert!(matches!(
             Pin::new(&mut body).poll_frame(&mut context),

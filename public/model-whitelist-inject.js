@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "57";
+  const patchVersion = "58";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -91,6 +91,7 @@
   let groupedMenuTimer = 0;
   let groupedMenuObserver = null;
   const groupedMenuTextObservers = new Map();
+  let modelDisplayTextTimer = 0;
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
@@ -1116,6 +1117,41 @@
     return false;
   };
 
+  const replaceNativeModelDisplayText = () => {
+    modelDisplayTextTimer = 0;
+    if (disposed || !catalog.loaded || typeof document.createTreeWalker !== "function") return;
+    const entries = catalog.models
+      .map((modelName) => ({
+        modelName,
+        displayName: cleanText(modelPresentation(modelName).displayName),
+      }))
+      .filter(({ modelName, displayName }) => displayName && displayName !== cleanText(modelName))
+      .sort((left, right) => cleanText(right.modelName).length - cleanText(left.modelName).length);
+    if (!entries.length || !document.body) return;
+    const walker = document.createTreeWalker(document.body, 4);
+    const textNodes = [];
+    let node = walker.nextNode();
+    while (node) {
+      const parent = node.parentElement;
+      if (parent && !parent.closest?.("script,style,textarea,input")) textNodes.push(node);
+      node = walker.nextNode();
+    }
+    for (const textNode of textNodes) {
+      const text = textNode.nodeValue || "";
+      const trimmed = cleanText(text);
+      if (!trimmed) continue;
+      const entry = entries.find(({ modelName }) => cleanText(modelName) === trimmed);
+      if (!entry) continue;
+      const start = text.indexOf(trimmed);
+      textNode.nodeValue = `${text.slice(0, start)}${entry.displayName}${text.slice(start + trimmed.length)}`;
+    }
+  };
+
+  const scheduleNativeModelDisplayText = () => {
+    if (disposed || modelDisplayTextTimer || !catalog.loaded) return;
+    modelDisplayTextTimer = window.setTimeout(replaceNativeModelDisplayText, 0);
+  };
+
   const createRouteHeading = (routeName) => {
     if (typeof document.createElement !== "function") return null;
     const heading = document.createElement("div");
@@ -1369,6 +1405,7 @@
       }
     }
     if (discoveredMenus.length) syncGroupedMenuTextObservers(discoveredMenus);
+    scheduleNativeModelDisplayText();
     for (const container of [...groupedMenuTextObservers.keys()]) {
       if (container.isConnected === false) stopGroupedMenuTextObserver(container);
     }
@@ -1707,6 +1744,7 @@
       reactContainers: firstPass.reactContainers + secondPass.reactContainers,
     });
     scheduleGroupedModelMenuEnhancement();
+    scheduleNativeModelDisplayText();
     return true;
   };
 
