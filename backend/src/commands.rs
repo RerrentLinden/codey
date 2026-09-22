@@ -911,7 +911,15 @@ fn apply_unavailable_official_probe(
     };
     let diagnostics = official_auth_route_diagnostics(&next, "unauthenticated", fallback);
     if has_official_route || keeps_account_routes {
-        if !next.has_third_party_route() && !keeps_account_routes && !has_stored_accounts {
+        // A non-empty launch profile list can be the disposable route derived
+        // from the current Codex login. When that login is unavailable, clear
+        // the route and return to the initial-import placeholder instead of
+        // asking the user to configure an account that was never stored.
+        if official_profiles.is_empty()
+            && !next.has_third_party_route()
+            && !keeps_account_routes
+            && !has_stored_accounts
+        {
             let error = format!(
                 "Codey 中没有设为默认的官方账号，也没有已保存的 API Key 线路；请先添加官方账号并设为默认，或添加第三方 API 线路。认证诊断：{reason}"
             );
