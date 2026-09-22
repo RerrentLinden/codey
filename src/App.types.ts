@@ -181,6 +181,8 @@ export type OfficialAccount = {
   routeName?: string;
   routeShortName?: string;
   upstreamProxy?: string;
+  /** 自定义 OpenAI 网关。留空时使用官方默认地址。 */
+  baseUrl?: string;
   invalid?: boolean;
   invalidReason?: string;
   isDefault: boolean;

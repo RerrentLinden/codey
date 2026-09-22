@@ -61,6 +61,7 @@ pub struct OfficialRouteModelSave {
     pub enabled: Option<bool>,
     pub show_account_usage: Option<bool>,
     pub upstream_proxy: Option<String>,
+    pub base_url: Option<String>,
     pub account_id: Option<String>,
     pub route_name: Option<String>,
     pub route_short_name: Option<String>,
@@ -76,10 +77,17 @@ pub async fn save_official_route_models(
         enabled: requested_enabled,
         show_account_usage: requested_show_account_usage,
         upstream_proxy: requested_upstream_proxy,
+        base_url: requested_base_url,
         account_id,
         route_name,
         route_short_name,
     } = input;
+    let normalized_base_url = match requested_base_url.as_deref() {
+        Some(base_url) => {
+            Some(crate::codex_provider::normalize_official_gateway_base_url(base_url)?)
+        }
+        None => None,
+    };
     let mut timings = ModelOperationTimings::new("save_official_route_models");
     validate_requested_model_list_bounds("官方模型", &requested_models)?;
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -106,6 +114,10 @@ pub async fn save_official_route_models(
         let upstream_proxy = upstream_proxy.trim().to_string();
         config.profiles[profile_index].upstream_proxy = upstream_proxy.clone();
         mirrored_proxy = Some(upstream_proxy);
+    }
+    // 参数缺席表示保持现状；空字符串表示恢复官方默认网关。
+    if let Some(base_url) = normalized_base_url.as_ref() {
+        config.profiles[profile_index].base_url = base_url.clone().unwrap_or_default();
     }
     if let Some(show_usage) = requested_show_account_usage {
         config.show_account_usage_in_header = show_usage;
@@ -181,6 +193,7 @@ pub async fn save_official_route_models(
             route_name.unwrap_or_default(),
             route_short_name.unwrap_or_default(),
             requested_upstream_proxy.clone().unwrap_or_default(),
+            requested_base_url.clone().unwrap_or_default(),
         )
         .await
         {
@@ -258,6 +271,7 @@ async fn persist_official_account_proxy(
             record.route_name.clone(),
             record.route_short_name.clone(),
             upstream_proxy,
+            record.base_url.clone(),
         )?;
         Ok(())
     })

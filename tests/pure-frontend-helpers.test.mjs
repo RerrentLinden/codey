@@ -23,6 +23,14 @@ test("outbound API URL validation rejects non-http schemes, credentials and blan
   assert.match(validateOutboundApiUrl("", "服务地址"), /服务地址/);
 });
 
+test("optional gateway addresses stay empty until a real HTTP URL is entered", () => {
+  const { validateOptionalOutboundApiUrl } = urlValidation;
+  assert.equal(validateOptionalOutboundApiUrl("  "), "");
+  assert.equal(validateOptionalOutboundApiUrl("https://gateway.example/v1"), "");
+  assert.match(validateOptionalOutboundApiUrl("not a url", "官方账号线路的网关地址"), /网关地址/);
+  assert.match(validateOptionalOutboundApiUrl("https://user:pw@gateway.example/v1"), /用户名或密码/);
+});
+
 test("formatBytes picks a unit and one decimal below ten", () => {
   const { formatBytes } = formatters;
   assert.equal(formatBytes(0), "0 B");

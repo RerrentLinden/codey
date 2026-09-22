@@ -93,6 +93,7 @@ type ModelSectionProps = {
       accountId: string;
       routeName: string;
       routeShortName: string;
+      baseUrl: string;
     },
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
@@ -145,7 +146,7 @@ type RouteDraftErrors = {
   upstreamProxy: string;
 };
 
-// 官方线路的编辑入口只改线路名、短名称和代理，模型列举交给同步入口。
+// 官方线路的编辑入口只改线路名、短名称、网关和代理，模型列举交给同步入口。
 type OfficialRouteDialogScope = "settings" | "models";
 
 export { MAX_ROUTE_NAME_CHARACTERS };
@@ -267,7 +268,7 @@ function ModelSectionComponent({
     setRouteApiKeyVisible(false);
   }, [routeConfigReadOnly]);
 
-  // 官方线路的线路名、短名称和代理保存在所属账号记录里，保存入口在线路卡片上。
+  // 官方线路的线路名、短名称、网关和代理保存在所属账号记录里，保存入口在线路卡片上。
   const refreshOfficialAccounts = useCallback(async () => {
     try {
       const result = await listOfficialAccounts();
@@ -496,6 +497,7 @@ function ModelSectionComponent({
         ? {
             routeName: routeAccount?.routeName ?? "",
             routeShortName: routeAccount?.routeShortName ?? "",
+            baseUrl: routeAccount?.baseUrl ?? "",
             upstreamProxy: profile.upstreamProxy ?? "",
           }
         : null,
@@ -600,6 +602,7 @@ function ModelSectionComponent({
                     accountId,
                     routeName: officialRouteDraft.routeName.trim(),
                     routeShortName: officialRouteDraft.routeShortName.trim(),
+                    baseUrl: officialRouteDraft.baseUrl.trim(),
                   }
                 : undefined,
             )
@@ -1150,8 +1153,8 @@ function ModelSectionComponent({
                       ? `当前官方账号：${draftOfficialAccountLabel}。未勾选的模型不会在模型目录和选择器中显示。`
                       : "未勾选的模型不会在模型目录和选择器中显示。"
                     : draftOfficialAccount
-                      ? `当前官方账号：${draftOfficialAccountLabel}。此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。`
-                      : "此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。"
+                      ? `当前官方账号：${draftOfficialAccountLabel}。此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。`
+                      : "此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
             </DialogHeader>
@@ -1238,6 +1241,38 @@ function ModelSectionComponent({
                         ) : null}
                       </label>
                     </div>
+
+                    <label className="route-field">
+                      <span>网关地址（可选）</span>
+                      <Input
+                        id="official-route-base-url-input"
+                        aria-label="网关地址（可选）"
+                        aria-invalid={Boolean(officialRouteDraftErrors?.baseUrl)}
+                        aria-describedby={
+                          officialRouteDraftErrors?.baseUrl
+                            ? "official-route-base-url-error"
+                            : undefined
+                        }
+                        value={officialRouteDraft?.baseUrl ?? ""}
+                        disabled={isBusy || !draftOfficialAccount}
+                        placeholder="留空使用官方默认网关"
+                        onChange={(event) =>
+                          updateOfficialRouteDraft({ baseUrl: event.target.value })}
+                      />
+                      {officialRouteDraftErrors?.baseUrl ? (
+                        <small
+                          id="official-route-base-url-error"
+                          className="text-[var(--codey-red,#d70015)]"
+                          role="alert"
+                        >
+                          {officialRouteDraftErrors.baseUrl}
+                        </small>
+                      ) : (
+                        <small className="route-field-hint">
+                          默认 https://chatgpt.com/backend-api/codex
+                        </small>
+                      )}
+                    </label>
 
                     <label className="route-field">
                       <span className="route-option-title-group">

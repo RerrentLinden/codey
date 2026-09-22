@@ -113,6 +113,8 @@ test("official route settings are edited on the route card instead of the accoun
 
   assert.match(modelSection, /id="official-route-name-input"/);
   assert.match(modelSection, /id="official-route-short-name-input"/);
+  assert.match(modelSection, /id="official-route-base-url-input"/);
+  assert.match(modelSection, /留空使用官方默认网关/);
   assert.match(modelSection, /maxLength=\{MAX_ROUTE_NAME_CHARACTERS\}/);
   assert.match(modelSection, /maxLength=\{MAX_ROUTE_SHORT_NAME_CHARACTERS\}/);
   assert.match(modelSection, /validateOfficialRouteSettings\(/);
@@ -121,7 +123,7 @@ test("official route settings are edited on the route card instead of the accoun
   const editButton = modelSection.indexOf("aria-label={`编辑线路 ${profile.name}`}");
   const deleteGuard = modelSection.indexOf("{!isOfficial && (");
   assert.ok(editButton > 0 && deleteGuard > editButton);
-  // 编辑只改线路名、短名称和代理，模型列举交给同步入口。
+  // 编辑只改线路名、短名称、网关和代理，模型列举交给同步入口。
   assert.match(modelSection, /openRouteDialog\(profile, isOfficial \? "settings" : null\)/);
   assert.match(modelSection, /openRouteDialog\(profile, "models"\)/);
   assert.match(modelSection, /\{officialDialogScope !== "models" && \(/);
@@ -133,6 +135,7 @@ test("official route settings are edited on the route card instead of the accoun
   assert.match(app, /accountId: routeSettings.accountId/);
   assert.match(app, /routeName: routeSettings.routeName/);
   assert.match(app, /routeShortName: routeSettings.routeShortName/);
+  assert.match(app, /baseUrl: routeSettings.baseUrl/);
 });
 
 test("official accounts derive numbered default route names and short names", async () => {

@@ -78,6 +78,10 @@ pub struct OfficialAccountRecord {
     pub route_short_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
+    /// Custom OpenAI gateway for this account. `None` keeps the official
+    /// Codex endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// 官方明确拒绝该账号凭据时写入的原因与检测时间。网络故障、超时和
     /// 服务端 5xx 不会写入，刷新成功后清空。老记录没有这两个字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +112,8 @@ pub struct OfficialAccountSummary {
     pub route_short_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// 卡片据此把失效账号标红，并隐藏切换到该账号的入口。
     pub invalid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,6 +200,7 @@ impl OfficialAccountRecord {
             route_name: None,
             route_short_name: None,
             upstream_proxy: None,
+            base_url: None,
             invalid_reason: None,
             invalid_since: None,
             auth,
@@ -235,6 +242,7 @@ impl OfficialAccountRecord {
             route_name: self.route_name.clone(),
             route_short_name: self.route_short_name.clone(),
             upstream_proxy: self.upstream_proxy.clone(),
+            base_url: self.base_url.clone(),
             invalid: self.invalid(),
             invalid_reason: self.invalid_reason.clone(),
             is_default: default_id == Some(self.id.as_str()),
@@ -590,6 +598,7 @@ impl OfficialAccountStore {
             record.route_name = saved.route_name;
             record.route_short_name = saved.route_short_name;
             record.upstream_proxy = saved.upstream_proxy;
+            record.base_url = saved.base_url;
         }
         self.write(&record)
     }
@@ -625,6 +634,7 @@ impl OfficialAccountStore {
         route_name: Option<String>,
         route_short_name: Option<String>,
         upstream_proxy: Option<String>,
+        base_url: Option<String>,
     ) -> Result<()> {
         let _guard = self.lock_writes()?;
         let mut record = self
@@ -633,6 +643,7 @@ impl OfficialAccountStore {
         record.route_name = route_setting(route_name);
         record.route_short_name = route_setting(route_short_name);
         record.upstream_proxy = route_setting(upstream_proxy);
+        record.base_url = route_setting(base_url);
         self.write(&record)
     }
 
@@ -1417,6 +1428,7 @@ mod tests {
                 Some("new route".into()),
                 None,
                 Some("http://127.0.0.1:1234".into()),
+                Some("https://gateway.example/backend-api/codex".into()),
             )
             .unwrap();
         let committed = store
@@ -1427,6 +1439,10 @@ mod tests {
         assert_eq!(
             committed.upstream_proxy.as_deref(),
             Some("http://127.0.0.1:1234")
+        );
+        assert_eq!(
+            committed.base_url.as_deref(),
+            Some("https://gateway.example/backend-api/codex")
         );
         assert_eq!(committed.auth, refreshed.auth);
         store.remove(&original.id).unwrap();
@@ -1677,12 +1693,17 @@ mod tests {
                 Some("主".into()),
                 // A blank value means "no override", not an empty proxy.
                 Some("   ".into()),
+                Some("  https://gateway.example/v1/  ".into()),
             )
             .unwrap();
         let saved = store.get("acct_1").unwrap().unwrap();
         assert_eq!(saved.route_name.as_deref(), Some("主力官方号"));
         assert_eq!(saved.route_short_name.as_deref(), Some("主"));
         assert_eq!(saved.upstream_proxy, None);
+        assert_eq!(
+            saved.base_url.as_deref(),
+            Some("https://gateway.example/v1/")
+        );
 
         // Re-logging in rebuilds the record from `auth.json`, which carries
         // credentials only; the saved route must stay.
@@ -1700,16 +1721,21 @@ mod tests {
             .unwrap();
         assert_eq!(summary.route_name.as_deref(), Some("主力官方号"));
         assert_eq!(summary.route_short_name.as_deref(), Some("主"));
+        assert_eq!(
+            summary.base_url.as_deref(),
+            Some("https://gateway.example/v1/")
+        );
 
         store
-            .update_route_settings("acct_1", None, None, None)
+            .update_route_settings("acct_1", None, None, None, None)
             .unwrap();
         let cleared = store.get("acct_1").unwrap().unwrap();
         assert_eq!(cleared.route_name, None);
         assert_eq!(cleared.route_short_name, None);
+        assert_eq!(cleared.base_url, None);
 
         let error = store
-            .update_route_settings("acct_missing", None, None, None)
+            .update_route_settings("acct_missing", None, None, None, None)
             .unwrap_err();
         assert!(error.to_string().contains("acct_missing"));
     }
@@ -1764,7 +1790,13 @@ mod tests {
         // 重复执行不会改写已经生成的名称，手动设置的名称也不会被覆盖。
         store.ensure_generated_route_settings().unwrap();
         store
-            .update_route_settings("acct_2", Some("主力官方号".into()), Some("主".into()), None)
+            .update_route_settings(
+                "acct_2",
+                Some("主力官方号".into()),
+                Some("主".into()),
+                None,
+                None,
+            )
             .unwrap();
         store.ensure_generated_route_settings().unwrap();
         let custom = store.get("acct_2").unwrap().unwrap();
@@ -1789,7 +1821,7 @@ mod tests {
 
         // 只缺一半设置时，补上的名称沿用另一半的编号。
         store
-            .update_route_settings("acct_3", Some("官方账号7".into()), None, None)
+            .update_route_settings("acct_3", Some("官方账号7".into()), None, None, None)
             .unwrap();
         store.ensure_generated_route_settings().unwrap();
         let paired = store.get("acct_3").unwrap().unwrap();

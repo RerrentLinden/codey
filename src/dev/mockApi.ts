@@ -277,7 +277,7 @@ if (import.meta.env.DEV) {
           enabled: true,
           name: account.routeName ?? previewOfficialRouteName(index),
           shortName: account.routeShortName ?? previewOfficialRouteShortName(index),
-          baseUrl: "",
+          baseUrl: account.baseUrl ?? "",
           apiKey: "",
           upstreamProtocol: "official",
           authMode: "officialAccount",
@@ -829,6 +829,7 @@ if (import.meta.env.DEV) {
         account.routeName = routeOverride(args.routeName);
         account.routeShortName = routeOverride(args.routeShortName);
         account.upstreamProxy = routeOverride(args.upstreamProxy);
+        account.baseUrl = routeOverride(args.baseUrl);
         // 清空设置后后端会立刻补回生成的默认名称，预览保持一致。
         previewDeriveOfficialProfiles();
         return {
@@ -1366,6 +1367,7 @@ if (import.meta.env.DEV) {
           account.routeName = routeOverride(args.routeName);
           account.routeShortName = routeOverride(args.routeShortName);
           account.upstreamProxy = routeOverride(args.upstreamProxy);
+          if ("baseUrl" in args) account.baseUrl = routeOverride(args.baseUrl);
           previewDeriveOfficialProfiles();
         }
         return {

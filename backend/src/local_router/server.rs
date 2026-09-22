@@ -408,10 +408,11 @@ pub(crate) fn outbound_proxy_applies_to_route(profile: &ProviderProfile) -> bool
         return true;
     }
     let base_url = if profile.official_account {
-        CHATGPT_CODEX_BASE_URL
+        crate::codex_provider::official_route_base_url(profile)
     } else {
-        profile.base_url.as_str()
+        profile.base_url.clone()
     };
+    let base_url = base_url.as_str();
     outbound_proxy_applies_to_url_with_matcher(base_url, &SystemProxyMatcher::from_system())
 }
 
@@ -641,7 +642,7 @@ impl RouterSnapshot {
                 continue;
             }
             let base_url = if profile.official_account {
-                CHATGPT_CODEX_BASE_URL.to_string()
+                crate::codex_provider::official_route_base_url(profile)
             } else {
                 profile.normalized_base_url()
             };

@@ -2685,6 +2685,43 @@ fn official_account_models_enter_the_router_only_when_login_is_available() {
 }
 
 #[test]
+fn official_account_route_uses_a_saved_gateway_instead_of_the_default() {
+    let mut official = ProviderProfile::new("官方账号1");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    official.source_provider_id = Some("openai".into());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.base_url = "https://gateway.example/backend-api/codex/".into();
+    official.normalize();
+    let mut config = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    config
+        .selected_models_by_provider
+        .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+
+    let resolved = RouterSnapshot::from_config(&config)
+        .target_for_model(&model_alias("openai", "gpt-5.6-sol"))
+        .unwrap();
+
+    assert_eq!(
+        resolved.route.upstream_url.as_ref().unwrap(),
+        "https://gateway.example/backend-api/codex/responses"
+    );
+    assert_eq!(
+        resolved.route.upstream_compact_url.as_ref().unwrap(),
+        "https://gateway.example/backend-api/codex/responses/compact"
+    );
+    assert_eq!(
+        resolved.route.upstream_websocket_url.as_ref().unwrap(),
+        "wss://gateway.example/backend-api/codex/responses"
+    );
+}
+
+#[test]
 fn stored_official_account_routes_serve_requests_without_the_default_login() {
     let mut first = ProviderProfile::new("主力账号");
     first.id = crate::config::official_profile_id("acct-one");

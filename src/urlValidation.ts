@@ -16,6 +16,13 @@ export function validateOutboundProxyUrl(value: string, label = "上游代理") 
   }
 }
 
+/** Optional gateway address. Blank keeps the caller's default endpoint. */
+export function validateOptionalOutboundApiUrl(value: string, label = "网关地址") {
+  const normalized = value.trim();
+  if (!normalized) return "";
+  return validateOutboundApiUrl(normalized, label);
+}
+
 /** Validates custom API endpoints before they are saved. */
 export function validateOutboundApiUrl(value: string, label = "API URL") {
   const normalized = value.trim();

@@ -1198,8 +1198,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                     optional_argument::<String>(&args, "accountId"),
                     optional_argument::<String>(&args, "routeName"),
                     optional_argument::<String>(&args, "routeShortName"),
+                    optional_argument::<String>(&args, "baseUrl"),
                 ) {
-                    (Ok(account_id), Ok(route_name), Ok(route_short_name)) => {
+                    (
+                        Ok(account_id),
+                        Ok(route_name),
+                        Ok(route_short_name),
+                        Ok(base_url),
+                    ) => {
                         save_official_route_models(
                             state,
                             models::OfficialRouteModelSave {
@@ -1208,6 +1214,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                                 enabled,
                                 show_account_usage: show_usage,
                                 upstream_proxy,
+                                base_url,
                                 account_id,
                                 route_name,
                                 route_short_name,
@@ -1215,7 +1222,10 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                         )
                         .await
                     }
-                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+                    (Err(error), _, _, _)
+                    | (_, Err(error), _, _)
+                    | (_, _, Err(error), _)
+                    | (_, _, _, Err(error)) => Err(error),
                 }
             }
             (Err(error), _, _, _, _, _, _)
@@ -1311,21 +1321,30 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             optional_argument::<String>(&args, "routeName"),
             optional_argument::<String>(&args, "routeShortName"),
             optional_argument::<String>(&args, "upstreamProxy"),
+            optional_argument::<String>(&args, "baseUrl"),
         ) {
-            (Ok(account_id), Ok(route_name), Ok(route_short_name), Ok(upstream_proxy)) => {
+            (
+                Ok(account_id),
+                Ok(route_name),
+                Ok(route_short_name),
+                Ok(upstream_proxy),
+                Ok(base_url),
+            ) => {
                 save_official_account_route_settings(
                     state,
                     account_id,
                     route_name.unwrap_or_default(),
                     route_short_name.unwrap_or_default(),
                     upstream_proxy.unwrap_or_default(),
+                    base_url.unwrap_or_default(),
                 )
                 .await
             }
-            (Err(error), _, _, _)
-            | (_, Err(error), _, _)
-            | (_, _, Err(error), _)
-            | (_, _, _, Err(error)) => Err(error),
+            (Err(error), _, _, _, _)
+            | (_, Err(error), _, _, _)
+            | (_, _, Err(error), _, _)
+            | (_, _, _, Err(error), _)
+            | (_, _, _, _, Err(error)) => Err(error),
         },
         "start_wechat_claw_login" => start_wechat_claw_login(state).await,
         "poll_wechat_claw_login" => match string_argument(&args, "loginId") {

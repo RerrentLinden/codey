@@ -157,8 +157,8 @@ fn launch_official_profiles(
     Ok((profiles, true))
 }
 
-/// The official-account editor stores its route name, short name and proxy per
-/// account; every stored account owns one derived official route.
+/// The official-account editor stores its route name, short name, proxy and
+/// gateway per account; every stored account owns one derived official route.
 fn apply_account_route_overrides(
     profile: &mut ProviderProfile,
     record: &crate::official_accounts::OfficialAccountRecord,
@@ -173,6 +173,10 @@ fn apply_account_route_overrides(
         .unwrap_or_else(|| crate::config::default_official_route_short_name(index));
     if let Some(proxy) = trimmed(record.upstream_proxy.as_deref()) {
         profile.upstream_proxy = proxy.to_string();
+    }
+    // 留空表示继续使用官方网关；自定义地址写到派生线路上，路由快照据此转发。
+    if let Some(base_url) = trimmed(record.base_url.as_deref()) {
+        profile.base_url = base_url.trim_end_matches('/').to_string();
     }
 }
 
@@ -794,6 +798,29 @@ fn insert_model_request_header(headers: &mut BTreeMap<String, String>, name: &st
     headers.insert(name.to_string(), value.to_string());
 }
 
+/// Empty and the official Codex endpoint both mean "use the default gateway".
+pub(crate) fn normalize_official_gateway_base_url(
+    value: &str,
+) -> std::result::Result<Option<String>, String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() || is_official_base_url(value) {
+        return Ok(None);
+    }
+    crate::config::validate_outbound_api_url(value, "官方账号线路的网关地址")?;
+    Ok(Some(value.to_string()))
+}
+
+/// Upstream base URL for one official route. A saved gateway replaces the
+/// official endpoint; anything else stays on the default Codex gateway.
+pub(crate) fn official_route_base_url(profile: &ProviderProfile) -> String {
+    let custom = profile.normalized_base_url();
+    if custom.is_empty() || is_official_base_url(&custom) {
+        crate::codex_config::CHATGPT_CODEX_BASE_URL.to_string()
+    } else {
+        custom
+    }
+}
+
 pub(crate) fn is_official_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
@@ -882,6 +909,7 @@ experimental_bearer_token = "sk-relay"
             route_name: None,
             route_short_name: None,
             upstream_proxy: None,
+            base_url: None,
             invalid_reason: None,
             invalid_since: None,
             auth: serde_json::json!({
@@ -962,6 +990,7 @@ experimental_bearer_token = "sk-relay"
                 Some("主力官方号".into()),
                 Some("主".into()),
                 Some("http://127.0.0.1:7890".into()),
+                Some("https://gateway.example/backend-api/codex/".into()),
             )
             .unwrap();
         let OfficialAccountProfileStatus::Available(profile) =
@@ -972,9 +1001,14 @@ experimental_bearer_token = "sk-relay"
         assert_eq!(profile.name, "主力官方号");
         assert_eq!(profile.short_name, "主");
         assert_eq!(profile.upstream_proxy, "http://127.0.0.1:7890");
+        assert_eq!(profile.base_url, "https://gateway.example/backend-api/codex");
+        assert_eq!(
+            official_route_base_url(&profile),
+            "https://gateway.example/backend-api/codex"
+        );
 
         store
-            .update_route_settings(&account_id, None, None, None)
+            .update_route_settings(&account_id, None, None, None, None)
             .unwrap();
         let OfficialAccountProfileStatus::Available(profile) =
             launch_status(home.path(), &store).unwrap()
@@ -984,6 +1018,33 @@ experimental_bearer_token = "sk-relay"
         assert_eq!(profile.name, default_name);
         assert_eq!(profile.short_name, "官1");
         assert!(profile.upstream_proxy.is_empty());
+        assert!(profile.base_url.is_empty());
+        assert_eq!(
+            official_route_base_url(&profile),
+            crate::codex_config::CHATGPT_CODEX_BASE_URL
+        );
+    }
+
+    #[test]
+    fn official_gateway_blank_and_default_url_clear_the_override() {
+        assert_eq!(normalize_official_gateway_base_url("  ").unwrap(), None);
+        assert_eq!(
+            normalize_official_gateway_base_url(
+                "https://chatgpt.com/backend-api/codex/"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_official_gateway_base_url("https://gateway.example/v1/")
+                .unwrap()
+                .as_deref(),
+            Some("https://gateway.example/v1")
+        );
+        assert!(normalize_official_gateway_base_url("not a url").is_err());
+        assert!(
+            normalize_official_gateway_base_url("https://user:pass@gateway.example/v1").is_err()
+        );
     }
 
     #[test]

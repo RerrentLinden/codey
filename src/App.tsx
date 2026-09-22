@@ -789,6 +789,7 @@ export function App({
       accountId: string;
       routeName: string;
       routeShortName: string;
+      baseUrl: string;
     },
   ) {
     if (!config) return false;
@@ -814,12 +815,13 @@ export function App({
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
-        // 线路名、短名称和代理写入同一账号记录，避免再打一次派生/热更新。
+        // 线路名、短名称、网关和代理写入同一账号记录，避免再打一次派生/热更新。
         ...(routeSettings
           ? {
               accountId: routeSettings.accountId,
               routeName: routeSettings.routeName,
               routeShortName: routeSettings.routeShortName,
+              baseUrl: routeSettings.baseUrl,
             }
           : {}),
       });

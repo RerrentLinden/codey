@@ -413,15 +413,16 @@ pub(super) async fn drop_derived_official_routes(state: &Arc<AppState>) -> Resul
     Ok(())
 }
 
-/// Saves the route name, short name and upstream proxy of one official
-/// account and re-derives every official route, so the edited account shows
-/// its new name without becoming the default.
+/// Saves the route name, short name, gateway and upstream proxy of one
+/// official account and re-derives every official route, so the edited
+/// account shows its new name without becoming the default.
 pub(super) async fn save_official_account_route_settings(
     state: &Arc<AppState>,
     account_id: String,
     route_name: String,
     route_short_name: String,
     upstream_proxy: String,
+    base_url: String,
 ) -> Result<Value, String> {
     let account_id = write_official_account_route_settings(
         state,
@@ -429,6 +430,7 @@ pub(super) async fn save_official_account_route_settings(
         route_name,
         route_short_name,
         upstream_proxy,
+        base_url,
     )
     .await?;
     let payload = refresh_official_route_after_account_change(state).await?;
@@ -446,6 +448,7 @@ pub(crate) async fn write_official_account_route_settings(
     route_name: String,
     route_short_name: String,
     upstream_proxy: String,
+    base_url: String,
 ) -> Result<String, String> {
     let account_id = account_id.trim().to_string();
     if account_id.is_empty() {
@@ -464,6 +467,8 @@ pub(crate) async fn write_official_account_route_settings(
     if !upstream_proxy.is_empty() {
         validate_outbound_proxy_url(&upstream_proxy, "官方账号线路的上游代理")?;
     }
+    // 留空或官方默认地址都表示不覆盖网关。
+    let base_url = crate::codex_provider::normalize_official_gateway_base_url(&base_url)?;
     // Official and third-party routes share one short-name namespace because the
     // short name prefixes every route-scoped model name.
     if !route_short_name.is_empty()
@@ -501,7 +506,13 @@ pub(crate) async fn write_official_account_route_settings(
             let label = other.email.as_deref().unwrap_or(other.id.as_str());
             anyhow::bail!("短名称「{short_name}」已被官方账号 {label} 使用");
         }
-        store.update_route_settings(&saved_id, saved_name, saved_short_name, saved_proxy)?;
+        store.update_route_settings(
+            &saved_id,
+            saved_name,
+            saved_short_name,
+            saved_proxy,
+            base_url,
+        )?;
         Ok(())
     })
     .await
