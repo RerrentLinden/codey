@@ -1041,6 +1041,183 @@ fn windows_cli_runtime_sources(target: &std::path::Path) -> Result<Vec<WindowsCl
     Ok(sources)
 }
 
+/// Windows `MoveFileEx` reports access denied when the destination directory
+/// already exists, and sharing or lock violations while a scanner still has a
+/// newly copied executable open. Those are the failures that leave a verified
+/// staging directory unpublished.
+#[cfg(any(windows, test))]
+fn windows_runtime_publish_retryable(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(any(windows, test))]
+fn remove_windows_runtime_destination(destination: &std::path::Path) -> Result<()> {
+    // `exists` / `is_dir` collapse a permission error into "missing", which
+    // then turns into a bare access-denied rename. Surface the real status.
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() => {
+            std::fs::remove_dir_all(destination).with_context(|| {
+                format!(
+                    "清理不完整的 Codex 用户运行目录失败：{}",
+                    destination.display()
+                )
+            })
+        }
+        Ok(_) => std::fs::remove_file(destination).with_context(|| {
+            format!(
+                "清理无效的 Codex 用户运行路径失败：{}",
+                destination.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("检查 Codex 用户运行目录失败：{}", destination.display())),
+    }
+}
+
+/// Prefer the stable hash directory, then a previous fallback `{hash}-*` copy.
+/// In-flight `.staging-*` directories are excluded so a concurrent publish can
+/// still rename its own copy.
+#[cfg(any(windows, test))]
+fn find_ready_windows_runtime(
+    cache_root: &std::path::Path,
+    destination: &std::path::Path,
+    hash_name: &str,
+    sources: &[WindowsCliRuntimeSource],
+) -> Option<std::path::PathBuf> {
+    if staged_runtime_ready(destination, sources) {
+        return Some(destination.to_path_buf());
+    }
+    let entries = std::fs::read_dir(cache_root).ok()?;
+    let prefix = format!("{hash_name}-");
+    for entry in entries.flatten().take(1024) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if staged_runtime_ready(&path, sources) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(any(windows, test))]
+fn prune_abandoned_runtime_staging(
+    cache_root: &std::path::Path,
+    sources: &[WindowsCliRuntimeSource],
+) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten().take(1024) {
+        let file_name = entry.file_name();
+        if !file_name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".staging-"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if staged_runtime_ready(&path, sources) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= Duration::from_secs(60 * 60));
+        if stale {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn publish_windows_staged_runtime(
+    staging: &std::path::Path,
+    destination: &std::path::Path,
+    hash_name: &str,
+    sources: &[WindowsCliRuntimeSource],
+) -> Result<PathBuf> {
+    const ATTEMPTS: u32 = 4;
+    let mut last_error = None;
+    for attempt in 1..=ATTEMPTS {
+        if staged_runtime_ready(destination, sources) {
+            let _ = std::fs::remove_dir_all(staging);
+            return Ok(destination.join("codex.exe"));
+        }
+        if let Err(error) = remove_windows_runtime_destination(destination) {
+            last_error = Some(error);
+        }
+        match std::fs::rename(staging, destination) {
+            Ok(()) => return Ok(destination.join("codex.exe")),
+            Err(error) => {
+                if staged_runtime_ready(destination, sources) {
+                    let _ = std::fs::remove_dir_all(staging);
+                    return Ok(destination.join("codex.exe"));
+                }
+                let retryable = windows_runtime_publish_retryable(&error);
+                let publish_error = anyhow::Error::from(error).context(format!(
+                    "启用 Codex 用户运行目录失败：{}",
+                    destination.display()
+                ));
+                // Keep the cleanup failure in the chain. A locked or unreadable
+                // directory is why the rename was attempted against an occupant.
+                last_error = Some(match last_error.take() {
+                    Some(remove_error) => publish_error.context(format!("{remove_error:#}")),
+                    None => publish_error,
+                });
+                if retryable && attempt < ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    // The canonical directory can be locked by a running copy or an ACL that
+    // hides it from `metadata`. The staging tree is already verified, so launch
+    // from a sibling instead of dropping every runtime constraint.
+    if staged_runtime_ready(staging, sources) {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let fallback = destination.with_file_name(format!("{hash_name}-{}", &suffix[..8]));
+        let runtime_dir = if std::fs::rename(staging, &fallback).is_ok() {
+            fallback
+        } else {
+            staging.to_path_buf()
+        };
+        #[cfg(not(test))]
+        {
+            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                "launcher.windows_runtime_publish_fallback",
+                serde_json::json!({
+                    "destination": destination,
+                    "runtimeDir": runtime_dir,
+                    "detail": last_error
+                        .as_ref()
+                        .map(|error| format!("{error:#}"))
+                        .unwrap_or_default(),
+                }),
+            );
+        }
+        return Ok(runtime_dir.join("codex.exe"));
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "启用 Codex 用户运行目录失败：{}。请退出 Codex 后删除该目录并重新启动",
+            destination.display()
+        )
+    }))
+}
+
 /// A staged directory is reusable when its manifest still describes the current
 /// package files and every copy has the recorded size. Store packages are
 /// immutable per version, so size and modification time identify the sources
@@ -1091,11 +1268,13 @@ fn stage_windows_cli_runtime(
         cache_hasher.update([0]);
     }
     let cache_hash = format!("{:x}", cache_hasher.finalize());
+    let hash_name = &cache_hash[..16];
     // Codex 会清理自身 bin 中的旧哈希目录，Codey 的运行副本必须独立存放。
     let cache_root = local_app_data.join("Codey").join("codex-runtime");
-    let destination = cache_root.join(&cache_hash[..16]);
-    if staged_runtime_ready(&destination, &sources) {
-        return Ok(destination.join("codex.exe"));
+    let destination = cache_root.join(hash_name);
+    if let Some(ready) = find_ready_windows_runtime(&cache_root, &destination, hash_name, &sources)
+    {
+        return Ok(ready.join("codex.exe"));
     }
 
     // Slow path: a new Codex build or a damaged copy. Hash, copy, verify, then
@@ -1111,25 +1290,10 @@ fn stage_windows_cli_runtime(
     }
     std::fs::create_dir_all(&cache_root)
         .with_context(|| format!("创建 Codex 用户运行目录失败：{}", cache_root.display()))?;
-    if destination.is_dir() {
-        std::fs::remove_dir_all(&destination).with_context(|| {
-            format!(
-                "清理不完整的 Codex 用户运行目录失败：{}",
-                destination.display()
-            )
-        })?;
-    } else if destination.exists() {
-        std::fs::remove_file(&destination).with_context(|| {
-            format!(
-                "清理无效的 Codex 用户运行路径失败：{}",
-                destination.display()
-            )
-        })?;
-    }
+    prune_abandoned_runtime_staging(&cache_root, &sources);
 
     let staging = cache_root.join(format!(
-        ".staging-{}-{}",
-        &cache_hash[..16],
+        ".staging-{hash_name}-{}",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir(&staging)
@@ -1153,17 +1317,11 @@ fn stage_windows_cli_runtime(
             serde_json::to_vec(&manifest)?,
         )
         .with_context(|| format!("写入 Codex 运行目录清单失败：{}", staging.display()))?;
-        if let Err(error) = std::fs::rename(&staging, &destination) {
-            if staged_runtime_ready(&destination, &sources) {
-                return Ok(destination.join("codex.exe"));
-            }
-            return Err(error).with_context(|| {
-                format!("启用 Codex 用户运行目录失败：{}", destination.display())
-            });
-        }
-        Ok(destination.join("codex.exe"))
+        publish_windows_staged_runtime(&staging, &destination, hash_name, &sources)
     })();
-    let _ = std::fs::remove_dir_all(&staging);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
     result
 }
 
@@ -3375,5 +3533,68 @@ mod cli_wrapper_tests {
         let updated = stage_windows_cli_runtime(&target, &local_app_data).unwrap();
         assert_ne!(updated.parent(), staged.parent());
         assert_eq!(std::fs::read(&updated).unwrap(), b"payload:codex.exe v2");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windows_cli_runtime_falls_back_when_the_publish_directory_is_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let resources = temp.path().join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        for name in WINDOWS_CLI_RUNTIME_FILES {
+            std::fs::write(resources.join(name), format!("payload:{name}")).unwrap();
+        }
+        let local_app_data = temp.path().join("local-app-data");
+        let target = resources.join("codex.exe");
+        let staged = stage_windows_cli_runtime(&target, &local_app_data).unwrap();
+        let staged_dir = staged.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&staged_dir).unwrap();
+        std::fs::create_dir(&staged_dir).unwrap();
+        let locked = staged_dir.join("locked.txt");
+        std::fs::write(&locked, "locked").unwrap();
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(&locked)
+            .status()
+            .unwrap();
+        assert!(status.success(), "chflags uchg failed");
+
+        struct ClearImmutable(std::path::PathBuf);
+        impl Drop for ClearImmutable {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let _clear = ClearImmutable(locked);
+
+        let fallback = stage_windows_cli_runtime(&target, &local_app_data).unwrap();
+        assert_ne!(fallback.parent(), Some(staged_dir.as_path()));
+        let fallback_name = fallback
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let canonical_name = staged_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        assert!(
+            fallback_name.starts_with(&format!("{canonical_name}-")),
+            "{fallback_name}"
+        );
+        for name in WINDOWS_CLI_RUNTIME_FILES {
+            assert_eq!(
+                std::fs::read(fallback.parent().unwrap().join(name)).unwrap(),
+                format!("payload:{name}").as_bytes()
+            );
+        }
+        assert!(staged_dir.join("locked.txt").is_file());
+        assert_eq!(
+            stage_windows_cli_runtime(&target, &local_app_data).unwrap(),
+            fallback
+        );
     }
 }
