@@ -48,6 +48,9 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const setNotice = useCallback((text: string) => {
     if (text) toast.success(text);
   }, []);
+  const setWarning = useCallback((text: string) => {
+    if (text) toast.warning(text);
+  }, []);
   const [searchQuery, setSearchQuery] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [importError, setImportError] = useState("");
@@ -513,9 +516,11 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                         const opened = await invoke<{ status: "ok" | "already_open" }>(
                           "open_codey_plugin_logs", { pluginId: plugin.id },
                         );
-                        setNotice(opened.status === "already_open"
-                          ? `${plugin.name} 的日志终端已打开`
-                          : `已在本机终端打开 ${plugin.name} 的实时日志`);
+                        if (opened.status === "already_open") {
+                          setWarning(`${plugin.name} 当前已有日志窗口`);
+                        } else {
+                          setNotice(`已在本机终端打开 ${plugin.name} 的实时日志`);
+                        }
                       })}
                     >
                       <IconTerminal2 size={14} aria-hidden="true" />

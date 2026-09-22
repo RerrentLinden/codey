@@ -562,6 +562,19 @@ mod tests {
         };
         assert_eq!(launch(), OpenStatus::Opened);
         assert_eq!(launch(), OpenStatus::Opened);
+        let other_plugin = root.path().join("other-plugin");
+        assert_eq!(
+            open_with(&other_plugin, root.path(), |ticket| {
+                fs::write(ticket.join("ready"), b"")?;
+                Ok(Terminal {
+                    child: None,
+                    #[cfg(target_os = "macos")]
+                    window_id: None,
+                })
+            })
+            .unwrap(),
+            OpenStatus::Opened
+        );
         let key = format!(
             "{:x}",
             Sha256::digest(plugin.as_os_str().as_encoded_bytes())
