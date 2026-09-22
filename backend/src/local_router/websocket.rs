@@ -1,5 +1,11 @@
 use super::*;
 
+pub(crate) enum IdleDownstreamWait {
+    Evicted,
+    Message(Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>),
+    TimedOut,
+}
+
 pub(crate) enum IdleWebSocketEvent {
     Downstream(
         Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>,
@@ -7,6 +13,68 @@ pub(crate) enum IdleWebSocketEvent {
     Upstream(Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>),
     MaintainUpstream,
     ConfigurationChanged,
+    Evicted,
+}
+
+/// 空闲下游 WebSocket 的登记表。名额按注册顺序保留，超出上限时关闭最久的一条。
+#[derive(Default)]
+pub(crate) struct IdleDownstreamRegistry {
+    next_id: u64,
+    waiters: HashMap<u64, oneshot::Sender<()>>,
+}
+
+pub(crate) struct IdleGuard {
+    id: u64,
+    registry: Arc<Mutex<IdleDownstreamRegistry>>,
+}
+
+impl Drop for IdleGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .remove(&self.id);
+    }
+}
+
+impl IdleDownstreamRegistry {
+    pub(crate) fn register(registry: &Arc<Mutex<Self>>) -> (IdleGuard, oneshot::Receiver<()>) {
+        let (evict_tx, evict_rx) = oneshot::channel();
+        let mut slots = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = slots.next_id;
+        slots.next_id = slots.next_id.wrapping_add(1);
+        slots.waiters.insert(id, evict_tx);
+        while slots.waiters.len() > MAX_CONCURRENT_CONNECTIONS {
+            let Some(oldest) = slots
+                .waiters
+                .keys()
+                .copied()
+                .filter(|waiter| *waiter != id)
+                .min()
+            else {
+                break;
+            };
+            if let Some(evict) = slots.waiters.remove(&oldest) {
+                let _ = evict.send(());
+            }
+        }
+        drop(slots);
+        (
+            IdleGuard {
+                id,
+                registry: Arc::clone(registry),
+            },
+            evict_rx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.waiters.len()
+    }
 }
 
 impl WebSocketResponsesDownstream {
@@ -16,6 +84,7 @@ impl WebSocketResponsesDownstream {
             socket,
             Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
             Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+            Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
         )
     }
 
@@ -23,6 +92,7 @@ impl WebSocketResponsesDownstream {
         socket: WebSocketStream<TcpStream>,
         websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
         request_body_budget: Arc<Semaphore>,
+        idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
     ) -> Self {
         let config_changes = websocket_backoffs
             .lock()
@@ -41,6 +111,7 @@ impl WebSocketResponsesDownstream {
             pending_budget_blocked: false,
             request_body_budget,
             config_changes,
+            idle_registry,
         }
     }
 
@@ -55,6 +126,7 @@ impl WebSocketResponsesDownstream {
 
     pub(crate) async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
         let idle_deadline = tokio::time::Instant::now() + DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT;
+        let mut idle_slot = None;
         loop {
             if self.upstream.as_ref().is_some_and(|cached| {
                 !self
@@ -77,26 +149,12 @@ impl WebSocketResponsesDownstream {
                 }
                 return Ok(Some(message));
             }
+            if idle_slot.is_none() {
+                idle_slot = Some(IdleDownstreamRegistry::register(&self.idle_registry));
+            }
+            let evict = &mut idle_slot.as_mut().unwrap().1;
             let Some(upstream) = self.upstream.as_ref() else {
-                // A synthetic previous_response_id only exists in this socket's
-                // history. Closing it on idle would silently lose resumability.
-                if self.adapted_history.last.is_some() || self.native_history.has_history() {
-                    return self
-                        .socket
-                        .next()
-                        .await
-                        .transpose()
-                        .context("读取 Codey Responses WebSocket 消息失败");
-                }
-                return match tokio::time::timeout_at(idle_deadline, self.socket.next()).await {
-                    Ok(message) => message
-                        .transpose()
-                        .context("读取 Codey Responses WebSocket 消息失败"),
-                    Err(_) => {
-                        let _ = self.close(None).await;
-                        Ok(None)
-                    }
-                };
+                return self.wait_for_idle_downstream(evict, idle_deadline).await;
             };
             let maintenance_deadline = upstream.liveness.maintenance_deadline();
             let event = {
@@ -114,6 +172,7 @@ impl WebSocketResponsesDownstream {
                     // new request, so a stale socket is never used merely
                     // because the request and heartbeat deadline raced.
                     biased;
+                    _ = &mut *evict => IdleWebSocketEvent::Evicted,
                     _ = self.config_changes.changed() => IdleWebSocketEvent::ConfigurationChanged,
                     message = upstream_socket.next() => IdleWebSocketEvent::Upstream(message),
                     _ = &mut maintenance => IdleWebSocketEvent::MaintainUpstream,
@@ -122,6 +181,10 @@ impl WebSocketResponsesDownstream {
             };
 
             match event {
+                IdleWebSocketEvent::Evicted => {
+                    self.upstream.take();
+                    return Ok(None);
+                }
                 IdleWebSocketEvent::ConfigurationChanged => continue,
                 IdleWebSocketEvent::Downstream(message) => {
                     let message = message
@@ -210,6 +273,36 @@ impl WebSocketResponsesDownstream {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    async fn wait_for_idle_downstream(
+        &mut self,
+        evict: &mut oneshot::Receiver<()>,
+        idle_deadline: tokio::time::Instant,
+    ) -> Result<Option<WebSocketMessage>> {
+        // 合成 previous_response_id 只存在这条 socket 的历史里，空闲超时不能
+        // 关掉它，否则 Codex 复用连接时会丢掉续接。连接数超出上限时另有回收。
+        let stateful = self.adapted_history.last.is_some() || self.native_history.has_history();
+        let read = self.socket.next();
+        tokio::pin!(read);
+        let idle = tokio::time::sleep_until(idle_deadline);
+        tokio::pin!(idle);
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut *evict => IdleDownstreamWait::Evicted,
+            message = &mut read => IdleDownstreamWait::Message(message),
+            _ = &mut idle, if !stateful => IdleDownstreamWait::TimedOut,
+        };
+        match outcome {
+            IdleDownstreamWait::Evicted => Ok(None),
+            IdleDownstreamWait::Message(message) => message
+                .transpose()
+                .context("读取 Codey Responses WebSocket 消息失败"),
+            IdleDownstreamWait::TimedOut => {
+                let _ = self.close(None).await;
+                Ok(None)
             }
         }
     }

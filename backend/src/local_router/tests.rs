@@ -1746,6 +1746,109 @@ async fn idle_connection_receives_a_request_timeout_without_a_router_failure() {
 }
 
 #[tokio::test]
+async fn idle_downstream_websockets_do_not_consume_connection_permits() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let mut sockets = Vec::new();
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        sockets.push(connect_router_websocket(&endpoint).await);
+    }
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut last = String::new();
+    let mut available = false;
+    for _ in 0..50 {
+        let mut health = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        health
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        last.clear();
+        tokio::time::timeout(Duration::from_secs(2), health.read_to_string(&mut last))
+            .await
+            .expect("healthz should respond")
+            .unwrap();
+        if last.contains("200") && last.contains("ok") {
+            available = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        available,
+        "idle websockets should leave a connection slot for healthz, got {last}"
+    );
+    drop(sockets);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn connections_that_have_not_gone_idle_still_report_router_busy() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut silent = Vec::new();
+    let head = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 100\r\n\r\n",
+        endpoint.token
+    );
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        silent.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut last = String::new();
+    let mut busy = false;
+    for _ in 0..20 {
+        let mut health = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        if health
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .is_err()
+        {
+            busy = true;
+            break;
+        }
+        last.clear();
+        match tokio::time::timeout(Duration::from_secs(2), health.read_to_string(&mut last)).await {
+            Ok(Ok(_)) if last.contains("router_busy") => {
+                busy = true;
+                break;
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                // 拒绝名额也用尽时，这条连接会被直接丢掉。
+                busy = true;
+                break;
+            }
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => break,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        busy,
+        "in-flight connections should still saturate the router, got {last}"
+    );
+    drop(silent);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
@@ -6783,6 +6886,149 @@ async fn compaction_timeout_releases_session_and_model_switch_keeps_request_snap
         .await
         .unwrap();
     assert_ne!(retry.status().as_u16(), 409);
+    upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (headers_read, headers_read_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (socket, _) = upstream.accept().await.unwrap();
+        let std_socket = socket.into_std().unwrap();
+        std_socket.set_nonblocking(false).unwrap();
+        let socket = socket2::Socket::from(std_socket);
+        // 不读正文时，小接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传记成 504。
+        socket.set_recv_buffer_size(4 * 1024).unwrap();
+        let std_socket: std::net::TcpStream = socket.into();
+        std_socket.set_nonblocking(true).unwrap();
+        let mut socket = TcpStream::from_std(std_socket).unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = String::from_utf8(header).unwrap();
+        let length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        headers_read.send(length).unwrap();
+        release_rx.await.unwrap();
+        let mut body = vec![0_u8; length];
+        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut body))
+            .await
+            .expect("上传仍应在进行，不能被响应头期限提前掐断")
+            .unwrap();
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp-after-upload\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let padding = "x".repeat(1024 * 1024);
+    let mut pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": padding,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    let length = headers_read_rx.await.unwrap();
+    assert!(
+        length > 512 * 1024,
+        "forwarded body was only {length} bytes"
+    );
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(10)).await;
+    tokio::time::resume();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let early = tokio::time::timeout(Duration::from_millis(200), &mut pending).await;
+    assert!(
+        early.is_err(),
+        "header timeout included the blocked history upload"
+    );
+    release.send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("upstream response should arrive after the body upload")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn streaming_header_timeout_still_bounds_the_wait_after_upload() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (received, received_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        received.send(()).unwrap();
+        assert!(request.body.len() < 64 * 1024);
+        std::future::pending::<()>().await;
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": "short",
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    received_rx.await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let response = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("uploaded requests must still hit the header timeout")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 504);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("upstream_header_timeout"), "{body}");
     upstream_task.abort();
     router.stop().await.unwrap();
 }

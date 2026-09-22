@@ -401,6 +401,70 @@ async fn idle_reclamation_preserves_stateful_continuations() {
     assert!(waiting.await.unwrap().unwrap().is_some());
 }
 
+#[test]
+fn excess_idle_websockets_evict_the_oldest_registration() {
+    let registry = Arc::new(Mutex::new(IdleDownstreamRegistry::default()));
+    let mut held = Vec::new();
+    let mut oldest = None;
+    for index in 0..=MAX_CONCURRENT_CONNECTIONS {
+        let (guard, mut evict) = IdleDownstreamRegistry::register(&registry);
+        if index == 0 {
+            oldest = Some(evict);
+        } else {
+            assert!(evict.try_recv().is_err(), "newer idle sockets stay open");
+        }
+        held.push(guard);
+    }
+    assert!(
+        oldest.expect("oldest registration").try_recv().is_ok(),
+        "the oldest idle websocket should be closed"
+    );
+    assert_eq!(registry.lock().unwrap().len(), MAX_CONCURRENT_CONNECTIONS);
+    drop(held);
+}
+
+#[tokio::test]
+async fn stateful_idle_websocket_closes_when_a_newer_connection_needs_the_slot() {
+    let registry = Arc::new(Mutex::new(IdleDownstreamRegistry::default()));
+    let (socket, _client) = local_websocket_pair().await;
+    let mut downstream = WebSocketResponsesDownstream::with_shared_backoffs(
+        socket,
+        Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
+        Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+        Arc::clone(&registry),
+    );
+    downstream
+        .adapted_history
+        .prepare(&mut json!({"input":"hello"}))
+        .unwrap();
+    downstream
+        .adapted_history
+        .remember("resp_codey_saved", &[])
+        .unwrap();
+    let waiting = tokio::spawn(async move { downstream.next_message().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.lock().unwrap().len() >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle websocket should register");
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        held.push(IdleDownstreamRegistry::register(&registry));
+    }
+    let message = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("eviction should wake the idle websocket")
+        .unwrap()
+        .unwrap();
+    assert!(message.is_none());
+    drop(held);
+}
+
 #[tokio::test(start_paused = true)]
 async fn http_stream_heartbeat_does_not_extend_the_upstream_deadline() {
     let (mut writer, mut reader) = tcp_pair().await;
@@ -511,6 +575,7 @@ async fn disabling_route_releases_idle_cached_socket_without_another_request() {
         socket,
         Arc::clone(&shared),
         Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+        Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
     );
     downstream.upstream = Some(CachedUpstreamWebSocket {
         route_id: id.clone(),
