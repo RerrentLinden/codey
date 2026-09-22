@@ -6928,6 +6928,9 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
             .unwrap();
         headers_read.send(length).unwrap();
         release_rx.await.unwrap();
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(1024 * 1024)
+            .unwrap();
         let mut body = vec![0_u8; length];
         tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut body))
             .await
@@ -6950,7 +6953,9 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
     });
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
-    let padding = "x".repeat(1024 * 1024);
+    // 1 MiB 正文可能全部进入 Linux/Windows 的发送缓冲；仅缩小接收缓冲不足以
+    // 阻塞发送。使用更大的正文，让连接在上游恢复读取前仍有数据等待写出。
+    let padding = "x".repeat(16 * 1024 * 1024);
     let mut pending = tokio::spawn(async move {
         reqwest::Client::new()
             .post(format!("{}/responses", endpoint.base_url))
