@@ -1091,18 +1091,24 @@
 .official-account-plan-badge {
   display: inline-flex;
   align-items: center;
+  gap: 3.5px;
   flex-shrink: 0;
   box-sizing: border-box;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.02em;
-  padding: 0 7px;
+  padding: 0 7.5px;
   height: 20px;
   line-height: 18px;
   border-radius: 9999px;
   border: 1px solid transparent;
   user-select: none;
   white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.official-account-plan-badge .official-account-plan-icon {
+  flex-shrink: 0;
 }
 
 .official-account-plan-badge.is-plus {
@@ -1111,10 +1117,33 @@
   border-color: rgba(147, 51, 234, 0.25);
 }
 
+[data-theme="dark"] .official-account-plan-badge.is-plus {
+  background: rgba(168, 85, 247, 0.14);
+  color: #c084fc;
+  border-color: rgba(168, 85, 247, 0.35);
+}
+
 .official-account-plan-badge.is-pro {
-  background: rgba(15, 23, 42, 0.07);
-  color: var(--codey-text, #0f172a);
-  border-color: rgba(15, 23, 42, 0.2);
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.12) 0%, rgba(217, 119, 6, 0.06) 100%);
+  color: #b45309;
+  border-color: rgba(217, 119, 6, 0.28);
+  box-shadow: 0 1px 2px rgba(217, 119, 6, 0.06);
+}
+
+.official-account-plan-badge.is-pro:hover {
+  border-color: rgba(217, 119, 6, 0.42);
+}
+
+[data-theme="dark"] .official-account-plan-badge.is-pro {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.18) 0%, rgba(217, 119, 6, 0.10) 100%);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.38);
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.16), inset 0 1px 0 rgba(254, 240, 138, 0.16);
+}
+
+[data-theme="dark"] .official-account-plan-badge.is-pro:hover {
+  border-color: rgba(245, 158, 11, 0.55);
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.26), inset 0 1px 0 rgba(254, 240, 138, 0.25);
 }
 
 .official-account-plan-badge.is-team {
@@ -1123,10 +1152,22 @@
   border-color: rgba(2, 132, 199, 0.22);
 }
 
+[data-theme="dark"] .official-account-plan-badge.is-team {
+  background: rgba(59, 130, 246, 0.14);
+  color: #60a5fa;
+  border-color: rgba(59, 130, 246, 0.32);
+}
+
 .official-account-plan-badge.is-default {
   background: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.05);
   color: var(--mac-text-secondary);
   border-color: rgba(var(--codey-ink-rgb, 0, 0, 0), 0.1);
+}
+
+[data-theme="dark"] .official-account-plan-badge.is-default {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--mac-text-secondary);
+  border-color: rgba(255, 255, 255, 0.12);
 }
 
 .official-account-main {

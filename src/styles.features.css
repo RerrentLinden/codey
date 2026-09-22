@@ -1175,40 +1175,6 @@
   line-height: 1.3;
 }
 
-.prompt-optimization-instruction {
-  width: 100%;
-  height: 180px;
-  min-height: 140px;
-  box-sizing: border-box;
-  padding: 10px 12px;
-  border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.1);
-  border-radius: 9px;
-  outline: none;
-  background: var(--codey-surface-sunken, #f8f8fa);
-  color: var(--codey-text, #1d1d1f);
-  font-size: 12.5px;
-  line-height: 1.6;
-  font-family: inherit;
-  resize: vertical;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  transition: border-color 150ms ease, box-shadow 150ms ease, background-color 150ms ease;
-}
-
-.prompt-optimization-instruction:focus {
-  border-color: rgba(0, 122, 255, 0.6);
-  background: var(--codey-surface, #ffffff);
-  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.12);
-}
-
-[data-theme="dark"] .prompt-optimization-instruction {
-  border-color: rgba(255, 255, 255, 0.1);
-  background: var(--codey-surface-sunken, #1c1c1e);
-}
-
-[data-theme="dark"] .prompt-optimization-instruction:focus {
-  background: var(--codey-surface, #202024);
-}
 
 
 .settings-page .notification-title > span {

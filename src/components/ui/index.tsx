@@ -16,10 +16,13 @@ import {
   Select as HeroSelect,
   Spinner,
   Switch as HeroSwitch,
+  TextArea as HeroTextArea,
   Tooltip as HeroTooltip,
   cn,
   useFilter,
 } from "@heroui/react";
+export { Label } from "@heroui/react";
+export type LabelProps = React.ComponentProps<typeof Label>;
 import type { Key } from "@heroui/react";
 import { UNSAFE_PortalProvider } from "react-aria";
 
@@ -227,6 +230,31 @@ export function PasswordInput({ visibility, onVisibilityChange, rightSection, di
           {visible ? <IconEyeOff size={16} aria-hidden="true" /> : <IconEye size={16} aria-hidden="true" />}
         </HeroButton>
       </>}
+    />
+  );
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * TextArea（多行文本输入，基于 HeroUI TextArea）
+ * -----------------------------------------------------------------------------------------------*/
+type HeroTextAreaProps = React.ComponentProps<typeof HeroTextArea>;
+export interface TextAreaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {
+  error?: boolean;
+  fullWidth?: boolean;
+  ref?: React.Ref<HTMLTextAreaElement>;
+  variant?: HeroTextAreaProps["variant"];
+}
+export function TextArea({ className, error, disabled, fullWidth = true, value, defaultValue, ...props }: TextAreaProps) {
+  const invalid = Boolean(error) || props["aria-invalid"] === true || props["aria-invalid"] === "true";
+  return (
+    <HeroTextArea
+      fullWidth={fullWidth}
+      disabled={disabled}
+      aria-invalid={invalid || undefined}
+      value={value == null ? undefined : String(value)}
+      defaultValue={defaultValue == null ? undefined : String(defaultValue)}
+      {...props}
+      className={cn("min-w-0", className)}
     />
   );
 }

@@ -931,10 +931,11 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
             UpstreamWebSocketAuthIdentity::from_headers(headers),
             body,
         );
-        // Compaction skips the upstream WS attempt that normally stages history.
-        if is_compaction_request(body, ResponsesRequestKind::Create) {
-            self.native_history.prepare(key, body);
-        }
+        // The upstream WebSocket attempt normally stages continuation history.
+        // Compaction and an active lifecycle plugin both skip that attempt, so
+        // stage before every HTTP restore. A second call after a failed
+        // handshake only restages the same turn.
+        self.native_history.prepare(key, body);
         self.native_history.restore(key, body)
     }
 
@@ -1312,6 +1313,84 @@ pub(crate) async fn write_static_response(
     write_all_with_timeout(stream, header.as_bytes(), "写入请求日志页面响应头失败").await?;
     write_all_with_timeout(stream, body, "写入请求日志页面失败").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod http_fallback_history_tests {
+    use super::super::tests::{local_websocket_pair, router_config};
+    use super::super::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn http_fallback_stages_history_when_the_websocket_attempt_is_skipped() {
+        let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
+        let snapshot = RouterSnapshot::from_config(&config);
+        let route = snapshot.routes[&provider_id].as_ref();
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("session-id"),
+            HeaderValue::from_static("lifecycle-session"),
+        );
+        downstream.native_history = NativeResponsesHistory::with_cache(
+            Arc::new(Mutex::new(NativeHistoryCache::default())),
+            &[("session-id".into(), "lifecycle-session".into())],
+        );
+
+        let mut first = json!({"model": model, "stream": true, "input": "original task"});
+        assert!(
+            !downstream
+                .prepare_native_http_fallback(route, &headers, &mut first)
+                .unwrap()
+        );
+        downstream
+            .write_event(&json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-first",
+                    "status": "completed",
+                    "output": []
+                }
+            }))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(_) = peer.next().await.unwrap().unwrap() else {
+            panic!("expected the completed event");
+        };
+
+        downstream.clear_stream_id();
+        let mut second = json!({
+            "model": model,
+            "stream": true,
+            "previous_response_id": "resp-first",
+            "input": "follow up"
+        });
+        assert!(
+            downstream
+                .prepare_native_http_fallback(route, &headers, &mut second)
+                .unwrap()
+        );
+        assert!(second.get("previous_response_id").is_none());
+        assert_eq!(
+            second["input"],
+            json!([
+                {"role":"user","content":"original task"},
+                {"role":"user","content":"follow up"}
+            ])
+        );
+
+        let mut unknown = json!({
+            "model": model,
+            "previous_response_id": "resp-missing",
+            "input": "another"
+        });
+        let error = downstream
+            .prepare_native_http_fallback(route, &headers, &mut unknown)
+            .unwrap_err();
+        assert!(error.to_string().contains("会话历史已失效"), "{error}");
+        assert_eq!(unknown["previous_response_id"], "resp-missing");
+    }
 }
 
 #[cfg(test)]

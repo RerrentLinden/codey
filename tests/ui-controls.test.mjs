@@ -10,7 +10,7 @@ const root = new URL("../", import.meta.url);
 const compiled = ts.transpileModule(readFileSync(new URL("src/components/ui/index.tsx", root), "utf8"), {
   compilerOptions: { module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
 }).outputText.replace(/from "([^"./][^"]*)"/g, (_match, specifier) => `from "${import.meta.resolve(specifier)}"`);
-const { Badge, Button, Input, PasswordInput, NumberInput, Checkbox, Switch } = await import(
+const { Badge, Button, Input, PasswordInput, NumberInput, Checkbox, Switch, TextArea, Label } = await import(
   `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
 );
 const render = (component, props) => renderToStaticMarkup(React.createElement(component, props));
@@ -24,6 +24,10 @@ test("HeroUI controls preserve native input values, labels and disabled states",
   assert.match(render(NumberInput, { value: 4, "aria-label": "会话错误重试次数" }), /value="4"/);
   assert.match(render(NumberInput, { value: 4, "aria-label": "会话错误重试次数" }), /data-slot="number-field"/);
   assert.match(render(NumberInput, { value: 4, disabled: true, "aria-label": "会话错误重试次数" }), /data-disabled="true"/);
+  assert.match(render(TextArea, { value: "优化指令", readOnly: true, "aria-label": "优化指令", error: true }), /优化指令/);
+  assert.match(render(TextArea, { error: true }), /aria-invalid="true"/);
+  assert.match(render(TextArea, { disabled: true }), /data-disabled="true"/);
+  assert.match(render(Label, { children: "优化指令", htmlFor: "instruction-id" }), /for="instruction-id"/);
   assert.match(render(Checkbox, { checked: true, label: "启用" }), /checked=""/);
   assert.match(render(Checkbox, { checked: "indeterminate" }), /data-indeterminate="true"/);
   assert.match(render(Switch, { checked: true, loading: true }), /disabled=""/);

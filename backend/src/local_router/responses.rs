@@ -1761,6 +1761,8 @@ impl RouterServer {
             && stream_requested
             && bridge == ProtocolBridge::NativeResponses
         {
+            // Lifecycle plugins need response headers, so they skip this
+            // attempt. Continuation history is staged on the HTTP fallback.
             if !compacting && !lifecycle.is_active() {
                 let had_previous_response =
                     responses_previous_response_id(&upstream_body).is_some();
