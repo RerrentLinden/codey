@@ -6903,7 +6903,7 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
         std_socket.set_nonblocking(false).unwrap();
         let socket = socket2::Socket::from(std_socket);
         // 不读正文时，小接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传记成 504。
-        socket.set_recv_buffer_size(4 * 1024).unwrap();
+        socket.set_recv_buffer_size(1024).unwrap();
         let std_socket: std::net::TcpStream = socket.into();
         std_socket.set_nonblocking(true).unwrap();
         let mut socket = TcpStream::from_std(std_socket).unwrap();
@@ -6932,7 +6932,7 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
             .set_recv_buffer_size(1024 * 1024)
             .unwrap();
         let mut body = vec![0_u8; length];
-        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut body))
+        tokio::time::timeout(Duration::from_secs(30), socket.read_exact(&mut body))
             .await
             .expect("上传仍应在进行，不能被响应头期限提前掐断")
             .unwrap();
@@ -6973,6 +6973,12 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
     assert!(
         length > 512 * 1024,
         "forwarded body was only {length} bytes"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .is_err(),
+        "upload must still be in progress before the virtual header timeout"
     );
     tokio::time::pause();
     tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(10)).await;

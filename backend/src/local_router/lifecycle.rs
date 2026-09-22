@@ -176,6 +176,10 @@ impl HttpBody for SignaledRequestBody {
     fn size_hint(&self) -> http_body::SizeHint {
         http_body::SizeHint::with_exact(self.bytes.len().saturating_sub(self.cursor) as u64)
     }
+
+    fn is_end_stream(&self) -> bool {
+        self.cursor >= self.bytes.len()
+    }
 }
 
 fn signaled_request_body(bytes: Bytes) -> (reqwest::Body, tokio::sync::oneshot::Receiver<()>) {
