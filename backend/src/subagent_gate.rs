@@ -56,6 +56,7 @@ const UNAVAILABLE_STATUS_SINCE_FILE: &str = "unavailable-status-since.state";
 const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
 const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
 const STOP_ABSOLUTE_SINCE_FILE: &str = "stop-absolute-since.state";
+const CHILD_TOOL_IN_FLIGHT_PREFIX: &str = "child-tool-in-flight-";
 const STATUS_PROGRESS_FINGERPRINT_FILE: &str = "status-progress.state";
 const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
 const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
@@ -359,6 +360,7 @@ fn handle_hook_for_runtime_at(
                     now_ms,
                 )?;
                 remove_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
+                clear_child_tool_in_flight(state_root, runtime_id, &input.session_id, agent_id)?;
                 if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)? == 0 {
                     remove_session_state(state_root, runtime_id, &input.session_id)?;
                 }
@@ -964,9 +966,11 @@ fn pre_tool_use_output(
             tool_name,
             input.tool_input.as_ref(),
         ) {
+            refresh_stop_stall_clock_if_running(state_root, runtime_id, &input.session_id, now_ms)?;
             return Ok(json!({}));
         }
         if let Some(reason) = runtime_subagent_attestation_denial(input, state_root, runtime_id)? {
+            refresh_stop_stall_clock_if_running(state_root, runtime_id, &input.session_id, now_ms)?;
             return Ok(pre_tool_reason_denial(&reason));
         }
         if let Some(agent_id) = child_agent_id {
@@ -983,8 +987,15 @@ fn pre_tool_use_output(
                 },
                 now_ms,
             )? {
+                refresh_stop_stall_clock_if_running(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    now_ms,
+                )?;
                 return Ok(pre_tool_reason_denial(&reason));
             }
+            note_allowed_child_tool(state_root, runtime_id, &input.session_id, agent_id, now_ms)?;
             return Ok(json!({}));
         }
         return Ok(subagent_identity_missing_denial());
@@ -1160,6 +1171,12 @@ fn post_tool_use_output(
     now_ms: u64,
 ) -> Result<Value> {
     if input_has_subagent_context(input) {
+        if input.tool_name.is_some() {
+            refresh_stop_stall_clock_if_running(state_root, runtime_id, &input.session_id, now_ms)?;
+            if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
+                clear_child_tool_in_flight(state_root, runtime_id, &input.session_id, agent_id)?;
+            }
+        }
         return Ok(json!({}));
     }
     let Some(tool_name) = input.tool_name.as_deref() else {
@@ -1418,6 +1435,94 @@ fn stop_output(
     Ok(stop_continuation(active, protocol_issue.as_deref()))
 }
 
+// Child tool calls are progress even when the root status snapshot stays on the
+// same "running" value. Only an already-started stall clock moves; the absolute
+// cap is untouched. An allowed call also stays in flight until PostToolUse or
+// SubagentStop, so one long command is not fenced at the 10-minute mark.
+fn refresh_stop_stall_clock_if_running(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, STOP_BLOCKED_SINCE_FILE);
+    if read_observation_timestamp(&path)?.is_some() {
+        write_observation_timestamp(&session_dir, &path, now_ms)?;
+    }
+    Ok(())
+}
+
+fn note_allowed_child_tool(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    agent_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(
+        &session_dir,
+        runtime_id,
+        &child_tool_in_flight_file_name(agent_id),
+    );
+    write_observation_timestamp(&session_dir, &path, now_ms)?;
+    refresh_stop_stall_clock_if_running(state_root, runtime_id, session_id, now_ms)
+}
+
+fn clear_child_tool_in_flight(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    remove_session_auxiliary_file(
+        state_root,
+        runtime_id,
+        session_id,
+        &child_tool_in_flight_file_name(agent_id),
+    )
+}
+
+fn child_tool_in_flight_file_name(agent_id: &str) -> String {
+    format!(
+        "{CHILD_TOOL_IN_FLIGHT_PREFIX}{}.state",
+        hash_component(agent_id)
+    )
+}
+
+fn any_child_tool_in_flight(state_root: &Path, runtime_id: &str, session_id: &str) -> Result<bool> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let prefix = format!(
+        "{}{CHILD_TOOL_IN_FLIGHT_PREFIX}",
+        runtime_marker_prefix(runtime_id)
+    );
+    let entries = match fs::read_dir(&session_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "读取 Codex 子代理门禁会话状态失败：{}",
+                    session_dir.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "读取 Codex 子代理门禁会话状态失败：{}",
+                session_dir.display()
+            )
+        })?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // Every root entry point advances the same bounded recovery clock. Recovery
 // must not depend on Stop being installed or on a missing tool producing a hook.
 // Keep ledger tombstones here; only Stop finalizes the turn.
@@ -1485,6 +1590,17 @@ fn recover_root_active_state(
             now_ms,
             PENDING_INIT_GRACE_MILLIS,
         )?;
+    let stall_elapsed = observe_and_check_elapsed(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        STOP_BLOCKED_SINCE_FILE,
+        now_ms,
+        STOP_STALL_GRACE_MILLIS,
+    )?;
+    // 已放行、尚未结束的 child 工具说明子代理仍在工作。根代理状态快照
+    // 不变不能据此做 10 分钟回收；60 分钟绝对上限不看这个标记。
+    let child_tool_running = any_child_tool_in_flight(state_root, runtime_id, &input.session_id)?;
     if observation_elapsed_if_present(
         state_root,
         runtime_id,
@@ -1493,14 +1609,7 @@ fn recover_root_active_state(
         now_ms,
         UNAVAILABLE_STATUS_GRACE_MILLIS,
     )? || legacy_pending_init_elapsed
-        || observe_and_check_elapsed(
-            state_root,
-            runtime_id,
-            &input.session_id,
-            STOP_BLOCKED_SINCE_FILE,
-            now_ms,
-            STOP_STALL_GRACE_MILLIS,
-        )?
+        || (stall_elapsed && !child_tool_running)
     {
         crate::subagent_orchestrator::recover_active_reservations(
             state_root,

@@ -407,3 +407,264 @@ fn single_target_status_rejects_mismatched_or_mixed_response_identities() {
         );
     }
 }
+
+fn reader_tool(session: &str, event: &str) -> HookInput {
+    let mut child = input(event, session);
+    child.agent_id = Some("/root/reader".into());
+    child.agent_type = Some("codey_quick_scan".into());
+    child.tool_name = Some("mcp__codey_fastctx__inspect_local_file".into());
+    child
+}
+
+fn child_tool_in_flight_exists(root: &Path, session: &str) -> bool {
+    fs::read_dir(session_state_dir(root, session))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("child-tool-in-flight-")
+        })
+}
+
+#[test]
+fn child_tool_activity_postpones_stall_recovery_without_moving_the_absolute_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = "child-still-working";
+    start_recovery_child(root, session);
+    let session_dir = session_state_dir(root, session);
+    let stalled = session_auxiliary_path(&session_dir, "runtime-a", STOP_BLOCKED_SINCE_FILE);
+    let absolute = session_auxiliary_path(&session_dir, "runtime-a", STOP_ABSOLUTE_SINCE_FILE);
+
+    // 根代理还没受阻时，child 工具不能自己打开停滞计时。
+    let mut child = reader_tool(session, "PreToolUse");
+    attest_test_child(&child, root, "runtime-a");
+    assert_eq!(
+        handle_hook_for_runtime_at(&child, root, "runtime-a", 500).unwrap(),
+        json!({})
+    );
+    child.hook_event_name = "PostToolUse".into();
+    handle_hook_for_runtime_at(&child, root, "runtime-a", 600).unwrap();
+    assert!(!stalled.exists());
+    assert!(!child_tool_in_flight_exists(root, session));
+
+    assert_eq!(
+        handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
+
+    let activity_at = 1_000 + STOP_STALL_GRACE_MILLIS - 1;
+    child.hook_event_name = "PreToolUse".into();
+    assert_eq!(
+        handle_hook_for_runtime_at(&child, root, "runtime-a", activity_at).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        fs::read_to_string(&stalled).unwrap(),
+        format!("{activity_at}\n")
+    );
+    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            1_000 + STOP_STALL_GRACE_MILLIS
+        )
+        .unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        1
+    );
+
+    child.hook_event_name = "PostToolUse".into();
+    let finished_at = activity_at + 1_000;
+    handle_hook_for_runtime_at(&child, root, "runtime-a", finished_at).unwrap();
+    assert_eq!(
+        fs::read_to_string(&stalled).unwrap(),
+        format!("{finished_at}\n")
+    );
+    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
+    assert!(!child_tool_in_flight_exists(root, session));
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            finished_at + STOP_STALL_GRACE_MILLIS - 1
+        )
+        .unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            finished_at + STOP_STALL_GRACE_MILLIS
+        )
+        .unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn in_flight_child_tool_holds_past_the_stall_grace_until_the_absolute_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = "long-child-tool";
+    start_recovery_child(root, session);
+    handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
+
+    let child = reader_tool(session, "PreToolUse");
+    attest_test_child(&child, root, "runtime-a");
+    assert_eq!(
+        handle_hook_for_runtime_at(&child, root, "runtime-a", 2_000).unwrap(),
+        json!({})
+    );
+    assert!(child_tool_in_flight_exists(root, session));
+
+    let past_stall = 2_000 + STOP_STALL_GRACE_MILLIS;
+    assert_eq!(
+        handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", past_stall).unwrap()
+            ["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        1
+    );
+    let session_dir = session_state_dir(root, session);
+    let absolute = session_auxiliary_path(&session_dir, "runtime-a", STOP_ABSOLUTE_SINCE_FILE);
+    assert_eq!(fs::read_to_string(&absolute).unwrap(), "1000\n");
+
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            1_000 + STOP_ABSOLUTE_GRACE_MILLIS
+        )
+        .unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn denied_child_tool_postpones_stall_without_holding_an_in_flight_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = "denied-child-tool";
+    start_recovery_child(root, session);
+    handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
+
+    let mut child = input("PreToolUse", session);
+    child.agent_id = Some("/root/reader".into());
+    child.agent_type = Some("codey_quick_scan".into());
+    child.tool_name = Some("functions.exec_command".into());
+    child.tool_input = Some(json!({"cmd": "git status --short"}));
+    attest_test_child(&child, root, "runtime-a");
+    let denied_at = 1_000 + STOP_STALL_GRACE_MILLIS - 1;
+    assert_eq!(
+        handle_hook_for_runtime_at(&child, root, "runtime-a", denied_at).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+    assert!(!child_tool_in_flight_exists(root, session));
+    let stalled = session_auxiliary_path(
+        &session_state_dir(root, session),
+        "runtime-a",
+        STOP_BLOCKED_SINCE_FILE,
+    );
+    assert_eq!(
+        fs::read_to_string(&stalled).unwrap(),
+        format!("{denied_at}\n")
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            1_000 + STOP_STALL_GRACE_MILLIS
+        )
+        .unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            denied_at + STOP_STALL_GRACE_MILLIS
+        )
+        .unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn stopping_a_child_clears_its_in_flight_tool_so_stall_recovery_can_continue() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = "stop-clears-in-flight";
+    start_recovery_child(root, session);
+    start_recovery_child_named(root, session, "sibling");
+    handle_hook_for_runtime_at(&root_command(session), root, "runtime-a", 1_000).unwrap();
+
+    let child = reader_tool(session, "PreToolUse");
+    attest_test_child(&child, root, "runtime-a");
+    handle_hook_for_runtime_at(&child, root, "runtime-a", 2_000).unwrap();
+    assert!(child_tool_in_flight_exists(root, session));
+
+    let mut stopped = input("SubagentStop", session);
+    stopped.agent_id = Some("/root/reader".into());
+    stopped.agent_type = Some("codey_quick_scan".into());
+    handle_hook_for_runtime_at(&stopped, root, "runtime-a", 3_000).unwrap();
+    assert!(!child_tool_in_flight_exists(root, session));
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        1
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            2_000 + STOP_STALL_GRACE_MILLIS - 1
+        )
+        .unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(
+            &root_command(session),
+            root,
+            "runtime-a",
+            2_000 + STOP_STALL_GRACE_MILLIS
+        )
+        .unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, "runtime-a", session).unwrap(),
+        0
+    );
+}
