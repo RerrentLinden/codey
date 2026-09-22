@@ -1200,12 +1200,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                     optional_argument::<String>(&args, "routeShortName"),
                     optional_argument::<String>(&args, "baseUrl"),
                 ) {
-                    (
-                        Ok(account_id),
-                        Ok(route_name),
-                        Ok(route_short_name),
-                        Ok(base_url),
-                    ) => {
+                    (Ok(account_id), Ok(route_name), Ok(route_short_name), Ok(base_url)) => {
                         save_official_route_models(
                             state,
                             models::OfficialRouteModelSave {

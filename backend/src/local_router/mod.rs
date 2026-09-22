@@ -38,7 +38,6 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config};
 use uuid::Uuid;
 
-use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::{
     CodeyConfig, ProviderProfile, RouteRequestLogBackend, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
     UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS, UPSTREAM_PROTOCOL_OPENAI_RESPONSES,

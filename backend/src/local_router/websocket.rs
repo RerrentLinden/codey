@@ -1318,7 +1318,6 @@ pub(crate) async fn write_static_response(
 #[cfg(test)]
 mod http_fallback_history_tests {
     use super::super::tests::{local_websocket_pair, router_config};
-    use super::super::*;
     use super::*;
 
     #[tokio::test]

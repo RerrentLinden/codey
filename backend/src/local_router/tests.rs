@@ -1,4 +1,5 @@
 use super::*;
+use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::ProviderProfile;
 
 #[test]

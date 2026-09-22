@@ -1001,7 +1001,10 @@ experimental_bearer_token = "sk-relay"
         assert_eq!(profile.name, "主力官方号");
         assert_eq!(profile.short_name, "主");
         assert_eq!(profile.upstream_proxy, "http://127.0.0.1:7890");
-        assert_eq!(profile.base_url, "https://gateway.example/backend-api/codex");
+        assert_eq!(
+            profile.base_url,
+            "https://gateway.example/backend-api/codex"
+        );
         assert_eq!(
             official_route_base_url(&profile),
             "https://gateway.example/backend-api/codex"
@@ -1029,10 +1032,7 @@ experimental_bearer_token = "sk-relay"
     fn official_gateway_blank_and_default_url_clear_the_override() {
         assert_eq!(normalize_official_gateway_base_url("  ").unwrap(), None);
         assert_eq!(
-            normalize_official_gateway_base_url(
-                "https://chatgpt.com/backend-api/codex/"
-            )
-            .unwrap(),
+            normalize_official_gateway_base_url("https://chatgpt.com/backend-api/codex/").unwrap(),
             None
         );
         assert_eq!(

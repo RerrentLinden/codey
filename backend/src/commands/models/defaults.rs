@@ -83,9 +83,9 @@ pub async fn save_official_route_models(
         route_short_name,
     } = input;
     let normalized_base_url = match requested_base_url.as_deref() {
-        Some(base_url) => {
-            Some(crate::codex_provider::normalize_official_gateway_base_url(base_url)?)
-        }
+        Some(base_url) => Some(crate::codex_provider::normalize_official_gateway_base_url(
+            base_url,
+        )?),
         None => None,
     };
     let mut timings = ModelOperationTimings::new("save_official_route_models");
