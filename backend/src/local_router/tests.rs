@@ -6902,8 +6902,11 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
         let std_socket = socket.into_std().unwrap();
         std_socket.set_nonblocking(false).unwrap();
         let socket = socket2::Socket::from(std_socket);
-        // 不读正文时，小接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传记成 504。
-        socket.set_recv_buffer_size(1024).unwrap();
+        // 不读正文时，收紧的接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传
+        // 记成 504。窗口要保持在回环 MSS 的数倍以上（回环 MTU 在部分系统上有
+        // 64 KiB），并且全程不再改动：窗口一旦小于一个报文段，发送端会退进零窗口
+        // 探测，之后再调大缓冲也补不回这段正文的传输速度。
+        socket.set_recv_buffer_size(256 * 1024).unwrap();
         let std_socket: std::net::TcpStream = socket.into();
         std_socket.set_nonblocking(true).unwrap();
         let mut socket = TcpStream::from_std(std_socket).unwrap();
@@ -6928,9 +6931,6 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
             .unwrap();
         headers_read.send(length).unwrap();
         release_rx.await.unwrap();
-        socket2::SockRef::from(&socket)
-            .set_recv_buffer_size(1024 * 1024)
-            .unwrap();
         let mut body = vec![0_u8; length];
         socket
             .read_exact(&mut body)
@@ -6992,9 +6992,9 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
         "header timeout included the blocked history upload"
     );
     release.send(()).unwrap();
-    // 放开后整段正文还要挤过被压小的接收窗口，慢机器上这一步可能远超几秒。
-    // 断言关心的是上传最终走完而不是被记成 504，所以等待要宽到不会误报。
-    tokio::time::timeout(Duration::from_secs(120), upstream_task)
+    // 断言关心的是上传最终走完而不是被记成 504，等待要宽到不会把慢机器误报成
+    // 失败，同时短到能及时暴露真正卡死的上传。
+    tokio::time::timeout(Duration::from_secs(30), upstream_task)
         .await
         .expect("上游应当读完整段正文并回包")
         .unwrap();
