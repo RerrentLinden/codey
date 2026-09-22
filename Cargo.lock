@@ -383,6 +383,7 @@ dependencies = [
  "fastctx",
  "fs2",
  "futures-util",
+ "http-body",
  "hyper-util",
  "libc",
  "libloading",

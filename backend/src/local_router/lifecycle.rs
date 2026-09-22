@@ -4,6 +4,11 @@ use crate::codey_plugins::lifecycle::{
     LifecycleDecision, LifecycleError, LifecycleOutcome, LifecycleRequest, LifecycleResponse,
     LifecycleStage, has_plugins,
 };
+use http_body::{Body as HttpBody, Frame};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+const UPSTREAM_REQUEST_BODY_CHUNK_BYTES: usize = 16 * 1024;
 
 pub(super) fn apply_codey_plugin_header_patches(
     headers: &mut HeaderMap,
@@ -117,6 +122,90 @@ fn official_account_email(route: &RouteTarget) -> Option<&str> {
     route.official_auth.as_ref()?.email.as_deref()
 }
 
+struct SignaledRequestBody {
+    bytes: Bytes,
+    cursor: usize,
+    uploaded: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl HttpBody for SignaledRequestBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        if body.cursor >= body.bytes.len() {
+            // 连接把最后一个数据块取走之后才会再轮询到结束。此时前面的块已经
+            // 写出，响应头期限从这里开始，不再把历史重放的上传时间算进去。
+            if let Some(uploaded) = body.uploaded.take() {
+                let _ = uploaded.send(());
+            }
+            return Poll::Ready(None);
+        }
+        let end = body
+            .bytes
+            .len()
+            .min(body.cursor + UPSTREAM_REQUEST_BODY_CHUNK_BYTES);
+        let chunk = body.bytes.slice(body.cursor..end);
+        body.cursor = end;
+        Poll::Ready(Some(Ok(Frame::data(chunk))))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.bytes.len().saturating_sub(self.cursor) as u64)
+    }
+}
+
+fn signaled_request_body(bytes: Bytes) -> (reqwest::Body, tokio::sync::oneshot::Receiver<()>) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    if bytes.is_empty() {
+        let _ = sender.send(());
+        return (reqwest::Body::from(bytes), receiver);
+    }
+    (
+        reqwest::Body::wrap(SignaledRequestBody {
+            bytes,
+            cursor: 0,
+            uploaded: Some(sender),
+        }),
+        receiver,
+    )
+}
+
+/// 等待上游响应头。大请求体（切模型后的整段历史）先上传，上传完成后再应用
+/// `header_timeout`；上传本身只受响应总期限约束，避免还在传正文时被记成 504。
+pub(super) async fn send_for_response_headers(
+    builder: reqwest::RequestBuilder,
+    body: Bytes,
+    header_timeout: Duration,
+) -> std::result::Result<
+    std::result::Result<reqwest::Response, reqwest::Error>,
+    tokio::time::error::Elapsed,
+> {
+    let (body, mut uploaded) = signaled_request_body(body);
+    let send = builder.body(body).send();
+    tokio::pin!(send);
+    let upload_limit = tokio::time::sleep(UPSTREAM_RESPONSE_TIMEOUT);
+    tokio::pin!(upload_limit);
+    let uploaded_first = tokio::select! {
+        biased;
+        result = &mut send => return Ok(result),
+        _ = &mut uploaded => true,
+        _ = &mut upload_limit => false,
+    };
+    if !uploaded_first {
+        return Err(
+            tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .expect_err("zero timeout"),
+        );
+    }
+    tokio::time::timeout(header_timeout, send).await
+}
+
 /// 生命周期只允许在尚未向下游写出响应时重发。与 reasoning 回退共享两次发送预算。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
@@ -163,13 +252,10 @@ pub(super) async fn send_lifecycle_http<D: ResponsesDownstream + ?Sized>(
         }
         let result = await_upstream(
             downstream,
-            tokio::time::timeout(
+            send_for_response_headers(
+                client.post(url).headers(headers.clone()),
+                body.clone(),
                 timeout,
-                client
-                    .post(url)
-                    .headers(headers.clone())
-                    .body(body.clone())
-                    .send(),
             ),
         )
         .await?;
@@ -369,5 +455,37 @@ mod tests {
         assert_eq!(json!(official_account_email(&route)), Value::Null);
         route.official_auth = None;
         assert_eq!(json!(official_account_email(&route)), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn upload_signal_arrives_only_after_the_body_is_consumed() {
+        let payload = vec![7_u8; 40_000];
+        let (mut body, mut uploaded) = signaled_request_body(Bytes::from(payload.clone()));
+        assert_eq!(
+            HttpBody::size_hint(&body).exact(),
+            Some(payload.len() as u64)
+        );
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut seen = 0_usize;
+        loop {
+            match Pin::new(&mut body).poll_frame(&mut context) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    seen += frame.into_data().unwrap().len();
+                    assert!(
+                        uploaded.try_recv().is_err(),
+                        "upload signal must wait until every chunk is taken"
+                    );
+                }
+                Poll::Ready(Some(Err(error))) => panic!("{error}"),
+                Poll::Ready(None) => break,
+                Poll::Pending => panic!("in-memory body should be ready"),
+            }
+        }
+        assert_eq!(seen, payload.len());
+        uploaded.try_recv().unwrap();
+
+        let (_empty, mut empty_uploaded) = signaled_request_body(Bytes::new());
+        empty_uploaded.try_recv().unwrap();
     }
 }
