@@ -468,13 +468,25 @@ async fn dispatch_one(
     let mut token: Option<String> = None;
     loop {
         let call_deadline = deadline.unwrap_or(overall_deadline).min(overall_deadline);
-        let value = plugin
+        let value = match plugin
             .call(
                 method,
                 entry.context.as_ref().unwrap().clone(),
                 Some(call_deadline),
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            // 续发排队和回调共用等待期限。期限正好在这次调用里耗尽时，对外的
+            // 原因仍是等待超时，而不是实例忙或回调慢；停用是另一种状态，保留。
+            Err(error)
+                if error.code != "plugin_disabled"
+                    && deadline.is_some_and(|end| Instant::now() >= end) =>
+            {
+                return Err(failure("plugin_wait_timeout"));
+            }
+            Err(error) => return Err(error),
+        };
         let action = parse_action(value, stage, &plugin.request_headers)?;
         match action {
             ParsedAction::Wait(next_token, delay) => {
@@ -734,13 +746,20 @@ mod tests {
 
     #[tokio::test]
     async fn token_changes_and_fixed_wait_deadlines_are_rejected() {
-        for change_token in [true, false] {
+        // 续发换令牌要被拒；等待期限耗尽时，无论是轮询排队还是回调自己用光
+        // 期限，对外都只报等待超时。
+        for case in ["change_token", "poll_until_deadline", "slow_resume"] {
             let mut plugin = TestPlugin::new("a", move |method, _| {
-                Ok(if method == "request.resume" && change_token {
-                    json!({"action":"wait","token":"other","pollAfterMs":50})
-                } else {
-                    json!({"action":"wait","token":"same","pollAfterMs":50})
-                })
+                if method == "request.resume" {
+                    match case {
+                        "change_token" => {
+                            return Ok(json!({"action":"wait","token":"other","pollAfterMs":50}));
+                        }
+                        "slow_resume" => std::thread::sleep(Duration::from_millis(200)),
+                        _ => {}
+                    }
+                }
+                Ok(json!({"action":"wait","token":"same","pollAfterMs":50}))
             });
             Arc::get_mut(&mut plugin.plugin).unwrap().max_wait = Duration::from_millis(120);
             with_test_plugins(vec![plugin], async {
@@ -751,7 +770,7 @@ mod tests {
                     .unwrap_err();
                 assert_eq!(
                     error.code,
-                    if change_token {
+                    if case == "change_token" {
                         "plugin_invalid_token"
                     } else {
                         "plugin_wait_timeout"
