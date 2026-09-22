@@ -17,7 +17,7 @@ use crate::model_list::{self, ModelEndpointError};
 /// Built-in optimizer instruction used when the user leaves the custom
 /// instruction empty. The model must return only the rewritten prompt so the
 /// result can replace the composer content directly.
-pub const DEFAULT_OPTIMIZER_INSTRUCTION: &str = "你是提示词优化专家。用户会提供一段提示词，请在不改变其意图的前提下，把它重写为更清晰、更具体、可执行的高质量提示词。只输出优化后的提示词本身，不要添加任何解释、前言、后记或代码围栏。";
+pub const DEFAULT_OPTIMIZER_INSTRUCTION: &str = "你是一名资深提示词架构师。接收用户的原始提示词后，在完全保留其原始目标和核心意图的前提下，将其优化为更精确、逻辑严密、指令明确的高效提示词。\n\n优化重点：\n\n- 明确模型角色与专业立场\n- 细化任务步骤与边界约束\n- 规范输出格式与风格要求\n- 消除歧义词汇与冗余表达\n\n严格输出要求：仅输出优化后的提示词正文本身。绝不包含任何前言、开场白、结尾说明、解释性文字或代码块符号（```）。";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
