@@ -107,18 +107,15 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
-        let request = match tokio::time::timeout(
-            REQUEST_READ_TIMEOUT,
-            read_http_request_body_with_budget(
-                &mut stream,
-                pending,
-                Some(&self.request_body_budget),
-            ),
+        let admission = match acquire_request_body_budget_within(
+            &self.request_body_budget,
+            pending.content_length,
+            REQUEST_BODY_BUDGET_WAIT,
         )
         .await
         {
-            Ok(Ok(request)) => request,
-            Ok(Err(error))
+            Ok(permit) => permit,
+            Err(error)
                 if error
                     .downcast_ref::<RequestBodyBudgetUnavailable>()
                     .is_some() =>
@@ -132,6 +129,29 @@ impl RouterServer {
                 )
                 .await?;
                 return Ok(());
+            }
+            Err(error) if error.is::<RequestBodyTooLarge>() => {
+                write_error_response(
+                    &mut stream,
+                    413,
+                    "request_too_large",
+                    error.to_string(),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let request = match tokio::time::timeout(
+            REQUEST_READ_TIMEOUT,
+            read_http_request_body_with_budget(&mut stream, pending, None),
+        )
+        .await
+        {
+            Ok(Ok(mut request)) => {
+                request._body_budget_permit = admission;
+                request
             }
             Ok(Err(error)) => {
                 write_error_response(
@@ -645,6 +665,7 @@ impl RouterServer {
             upstream_client.post(&upstream_url).headers(headers),
             request_body,
             response_header_timeout,
+            || {},
         )
         .await
         {
@@ -934,26 +955,31 @@ impl RouterServer {
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
-                    let body_budget_permit =
-                        match acquire_request_body_budget(&self.request_body_budget, text.len()) {
-                            Ok(permit) => permit,
-                            Err(error)
-                                if error
-                                    .downcast_ref::<RequestBodyBudgetUnavailable>()
-                                    .is_some() =>
-                            {
-                                downstream
-                                    .write_error(
-                                        503,
-                                        "router_memory_busy",
-                                        "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
-                                        None,
-                                    )
-                                    .await?;
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
+                    let body_budget_permit = match acquire_request_body_budget_within(
+                        &self.request_body_budget,
+                        text.len(),
+                        REQUEST_BODY_BUDGET_WAIT,
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(error)
+                            if error
+                                .downcast_ref::<RequestBodyBudgetUnavailable>()
+                                .is_some() =>
+                        {
+                            downstream
+                                .write_error(
+                                    503,
+                                    "router_memory_busy",
+                                    "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
+                                    None,
+                                )
+                                .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut body = match serde_json::from_str::<Value>(text.as_str()) {
                         Ok(Value::Object(body)) => Value::Object(body),
                         Ok(_) => {
@@ -1938,8 +1964,18 @@ impl RouterServer {
             drop(encoded_body.take());
             serde_json::to_vec(&upstream_body).context("序列化转换后的上游请求失败")?.into()
         };
-        // 重发需要完整请求体，只有可能重发时才继续持有它。
-        let mut retryable_body = reasoning_text_retry_allowed.then_some(upstream_body);
+        // 重发只保留紧凑的编码副本。解析出的 JSON 树在发出前丢掉，
+        // 预算从 4 倍工作集收回到这一份正文。
+        let retryable_encoded = reasoning_text_retry_allowed.then(|| encoded.clone());
+        drop(upstream_body);
+        drop(std::mem::take(&mut request.body));
+        let mut admission = request._body_budget_permit.take();
+        retain_compact_request_budget(&mut admission, encoded.len());
+        let retained_after_upload = if retryable_encoded.is_some() || lifecycle.is_active() {
+            encoded.len()
+        } else {
+            0
+        };
         let response_header_timeout = if compacting {
             // 流式压缩在生成期间持续返回事件，非流式压缩要到生成结束后才返回
             // 响应头，两者的等待期限不同，都只约束响应头。
@@ -1963,7 +1999,9 @@ impl RouterServer {
         let mut attempt = 0;
         let response_result = send_lifecycle_http(
             downstream, &mut lifecycle, &upstream_client, upstream_url,
-            &mut headers, encoded, &mut attempt, response_header_timeout,
+            &mut headers, encoded, &mut || {
+                retain_compact_request_budget(&mut admission, retained_after_upload);
+            }, &mut attempt, response_header_timeout,
         ).await?;
         let Some(response) = Self::finish_upstream_http_send(
             downstream,
@@ -2012,11 +2050,24 @@ impl RouterServer {
                 }
                 Ok(Err(error)) | Err(error) => return Err(error),
             };
-            if requires_reasoning_text_fallback(&body)
-                && let Some(retryable_body) = retryable_body.as_mut()
-                && fill_missing_reasoning_text(retryable_body)
-            {
-                let encoded = serde_json::to_vec(retryable_body)
+            let retryable_body = match retryable_encoded.as_deref() {
+                Some(encoded)
+                    if requires_reasoning_text_fallback(&body)
+                        && grow_request_body_budget(
+                            &mut admission,
+                            &self.request_body_budget,
+                            encoded.len(),
+                        )
+                        .is_ok() =>
+                {
+                    let mut retryable_body = serde_json::from_slice::<Value>(encoded)
+                        .context("解析 reasoning 回退请求失败")?;
+                    fill_missing_reasoning_text(&mut retryable_body).then_some(retryable_body)
+                }
+                _ => None,
+            };
+            if let Some(retryable_body) = retryable_body {
+                let encoded = serde_json::to_vec(&retryable_body)
                     .context("序列化补齐 reasoning 明文的 Responses 请求失败")?;
                 if let Some(probe) = downstream.request_log_probe() {
                     probe.mark_fallback("reasoning_text_placeholder_retry");
@@ -2026,14 +2077,21 @@ impl RouterServer {
                         UpstreamTransport::Http
                     });
                     probe.record_upstream_body(RequestBodySummary::from_responses_body(
-                        retryable_body,
+                        &retryable_body,
                         Some(encoded.len() as u64),
                     ));
                 }
+                let retry_retained = if lifecycle.is_active() {
+                    encoded.len()
+                } else {
+                    0
+                };
                 attempt += 1;
                 let retry_result = send_lifecycle_http(
                     downstream, &mut lifecycle, &upstream_client, upstream_url,
-                    &mut headers, encoded.into(), &mut attempt, response_header_timeout,
+                    &mut headers, encoded.into(), &mut || {
+                        retain_compact_request_budget(&mut admission, retry_retained);
+                    }, &mut attempt, response_header_timeout,
                 ).await?;
                 let Some(retried) = Self::finish_upstream_http_send(
                     downstream,
@@ -2061,14 +2119,10 @@ impl RouterServer {
                 preloaded_error_body = Some(body);
             }
         }
-        // 所有可能的重发结束后再释放请求内存预算，避免等待插件时失去记账。
-        drop(retryable_body);
-        if tool_bridge.upstream_to_response.is_empty()
-            && tool_bridge.response_to_upstream.is_empty()
-        {
-            drop(std::mem::take(&mut request.body));
-            drop(request._body_budget_permit.take());
-        }
+        // 重发已经结束。工具名映射不保留请求正文，响应内存在另一份预算里。
+        drop(retryable_encoded);
+        drop(admission);
+        drop(std::mem::take(&mut request.body));
         if let Some(probe) = downstream.request_log_probe() {
             probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
         }

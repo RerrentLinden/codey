@@ -347,7 +347,7 @@ pub(crate) fn request_body_budget_permit_count(wire_bytes: usize) -> Result<usiz
     Ok(estimated_memory.div_ceil(REQUEST_BODY_BUDGET_UNIT_BYTES))
 }
 
-fn grow_request_body_budget(
+pub(crate) fn grow_request_body_budget(
     permit: &mut Option<OwnedSemaphorePermit>,
     body_budget: &Arc<Semaphore>,
     bytes: usize,
@@ -407,13 +407,78 @@ pub(crate) fn acquire_request_body_budget(
     body_budget: &Arc<Semaphore>,
     wire_bytes: usize,
 ) -> Result<Option<OwnedSemaphorePermit>> {
-    let permits = request_body_budget_permit_count(wire_bytes)?;
-    if permits == 0 {
+    let permits = request_body_budget_permits(wire_bytes)?;
+    let Some(permits) = permits else {
         return Ok(None);
-    }
-    let permits = u32::try_from(permits).context("请求体缓冲预算超出内部上限")?;
+    };
     Arc::clone(body_budget)
         .try_acquire_many_owned(permits)
         .map(Some)
         .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))
+}
+
+const REQUEST_BODY_BUDGET_POLL: Duration = Duration::from_millis(50);
+
+/// 轮询空闲名额，不进入信号量的公平队列。
+/// 一个需要更多名额的请求在等待时，后来的小请求只要当时放得下就可以先通过。
+pub(crate) async fn acquire_request_body_budget_within(
+    body_budget: &Arc<Semaphore>,
+    wire_bytes: usize,
+    wait: Duration,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let Some(permits) = request_body_budget_permits(wire_bytes)? else {
+        return Ok(None);
+    };
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match Arc::clone(body_budget).try_acquire_many_owned(permits) {
+            Ok(permit) => return Ok(Some(permit)),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(anyhow::Error::new(RequestBodyBudgetUnavailable));
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(anyhow::Error::new(RequestBodyBudgetUnavailable));
+                }
+                tokio::time::sleep_until(std::cmp::min(deadline, now + REQUEST_BODY_BUDGET_POLL))
+                    .await;
+            }
+        }
+    }
+}
+
+fn request_body_budget_permits(wire_bytes: usize) -> Result<Option<u32>> {
+    let permits = request_body_budget_permit_count(wire_bytes)?;
+    if permits == 0 {
+        return Ok(None);
+    }
+    u32::try_from(permits)
+        .context("请求体缓冲预算超出内部上限")
+        .map(Some)
+}
+
+/// 解析和转换结束后，预算只保留仍在内存中的那一份正文，不再按 4 倍工作集占用。
+pub(crate) fn retain_compact_request_budget(
+    permit: &mut Option<OwnedSemaphorePermit>,
+    retained_bytes: usize,
+) {
+    let Some(mut held) = permit.take() else {
+        return;
+    };
+    let desired = retained_bytes.div_ceil(REQUEST_BODY_BUDGET_UNIT_BYTES);
+    if desired == 0 {
+        return;
+    }
+    let desired = desired.min(held.num_permits());
+    if desired == held.num_permits() {
+        *permit = Some(held);
+        return;
+    }
+    let Some(retained) = held.split(desired) else {
+        *permit = Some(held);
+        return;
+    };
+    drop(held);
+    *permit = Some(retained);
 }

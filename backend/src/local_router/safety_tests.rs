@@ -154,6 +154,91 @@ async fn request_body_limit_reports_declared_size() {
     }
 }
 
+#[tokio::test]
+async fn body_budget_wait_proceeds_when_the_holder_releases() {
+    let budget = Arc::new(Semaphore::new(4));
+    let held = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES)
+        .unwrap()
+        .unwrap();
+    let waiting = Arc::clone(&budget);
+    let waiter = tokio::spawn(async move {
+        acquire_request_body_budget_within(
+            &waiting,
+            REQUEST_BODY_BUDGET_UNIT_BYTES,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap()
+    });
+    tokio::task::yield_now().await;
+    assert!(budget.available_permits() < 4);
+    drop(held);
+    assert!(waiter.await.unwrap().is_some());
+    assert_eq!(budget.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn body_budget_wait_reports_busy_when_the_holder_keeps_it() {
+    let budget = Arc::new(Semaphore::new(4));
+    let _held = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES)
+        .unwrap()
+        .unwrap();
+    let error = acquire_request_body_budget_within(
+        &budget,
+        REQUEST_BODY_BUDGET_UNIT_BYTES,
+        Duration::from_millis(30),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<RequestBodyBudgetUnavailable>()
+            .is_some()
+    );
+    assert_eq!(budget.available_permits(), 0);
+}
+
+#[tokio::test]
+async fn body_budget_wait_lets_a_smaller_request_pass() {
+    let budget = Arc::new(Semaphore::new(5));
+    let held = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.num_permits(), 4);
+    assert_eq!(budget.available_permits(), 1);
+    let waiting = Arc::clone(&budget);
+    let large = tokio::spawn(async move {
+        acquire_request_body_budget_within(
+            &waiting,
+            REQUEST_BODY_BUDGET_UNIT_BYTES,
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let small = acquire_request_body_budget_within(&budget, 1, Duration::from_millis(50))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(small.num_permits(), 1);
+    assert_eq!(budget.available_permits(), 0);
+    drop(held);
+    assert!(large.await.unwrap().unwrap().is_some());
+}
+
+#[test]
+fn compact_retention_frees_the_parse_working_set() {
+    let budget = Arc::new(Semaphore::new(8));
+    let mut permit = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES).unwrap();
+    assert_eq!(permit.as_ref().unwrap().num_permits(), 4);
+    retain_compact_request_budget(&mut permit, REQUEST_BODY_BUDGET_UNIT_BYTES);
+    assert_eq!(permit.as_ref().unwrap().num_permits(), 1);
+    assert_eq!(budget.available_permits(), 7);
+    retain_compact_request_budget(&mut permit, 0);
+    assert!(permit.is_none());
+    assert_eq!(budget.available_permits(), 8);
+}
+
 #[test]
 fn zstd_request_budget_grows_and_releases_on_all_results() {
     // A tiny request succeeds with far less than the maximum request budget.

@@ -79,9 +79,14 @@ const REQUEST_BODY_BUDGET_UNIT_BYTES: usize = 64 * 1024;
 // serde_json trees and protocol conversion buffers live alongside the encoded
 // request. Reserve a conservative multiple of the wire size so the semaphore
 // represents the request's working set instead of only its first Vec<u8>.
+// Once those copies are gone, the reservation shrinks to the single buffer
+// still retained, and drops after that buffer is handed to the connection.
 const REQUEST_MEMORY_BUDGET_MULTIPLIER: usize = 4;
 const REQUEST_BODY_BUDGET_PERMITS: usize =
     REQUEST_BODY_BUDGET_BYTES / REQUEST_BODY_BUDGET_UNIT_BYTES;
+// 上传结束就会交回名额。后来的请求最多等两秒，并且只在当时有空闲名额时占用，
+// 不会排在一个更大的请求后面。等不到就返回 503，连接不会被长时间占住。
+const REQUEST_BODY_BUDGET_WAIT: Duration = Duration::from_secs(2);
 const MAX_ROUTE_BINDINGS: usize = 4096;
 const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);

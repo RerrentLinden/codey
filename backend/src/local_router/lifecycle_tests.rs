@@ -1,5 +1,7 @@
 use super::*;
-use crate::codey_plugins::lifecycle::{TestPlugin, with_test_plugins};
+use crate::codey_plugins::lifecycle::{
+    LifecycleRequest, TestPlugin, has_plugins, with_test_plugins,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Default)]
@@ -237,6 +239,51 @@ async fn lifecycle_waits_before_delivery_and_retries_exact_bytes_with_patched_he
     assert_eq!(event.0, "request.completed");
     assert_eq!(event.1["status"], 200);
     assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn plugin_retry_keeps_the_body_when_plugins_are_disabled_during_upload() {
+    let (url, upstream) = fake_upstream(vec![200, 200]).await;
+    let (plugin, events) = recording_plugin(|method, params| {
+        if method == "request.afterHeaders" && params["attempt"] == 0 {
+            json!({"action":"retry"})
+        } else {
+            json!({"action":"continue"})
+        }
+    });
+    let mut lifecycle = with_test_plugins(vec![plugin], async {
+        LifecycleRequest::new(json!({"requestId": "retry-after-disable"}), None)
+    })
+    .await;
+    assert!(lifecycle.is_active());
+    let body = Bytes::from_static(br#"{"input":"same"}"#);
+    with_test_plugins(Vec::new(), async {
+        assert!(!has_plugins());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut headers = HeaderMap::new();
+        let mut downstream = CapturedDownstream::default();
+        let mut attempt = 0;
+        send_lifecycle_http(
+            &mut downstream,
+            &mut lifecycle,
+            &client,
+            &format!("{url}/responses"),
+            &mut headers,
+            body,
+            &mut || {},
+            &mut attempt,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    })
+    .await;
+    drop(events);
+    let requests = upstream.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
 }
 
 #[tokio::test]
