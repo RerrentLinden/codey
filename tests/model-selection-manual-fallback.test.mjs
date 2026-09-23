@@ -15,6 +15,7 @@ test("bulk model selection includes every filtered page and preserves unrelated 
   const react = {
     useCallback: (callback) => callback,
     useMemo: (factory) => factory(),
+    useRef: (initial) => ({ current: initial }),
     useState(initial) {
       const index = cursor++;
       if (!(index in state)) state[index] = initial;
