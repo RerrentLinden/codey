@@ -173,7 +173,9 @@ pub(crate) async fn fetch_official_route_models(
         .map(str::to_string)
         .unwrap_or_else(|| crate::codex_provider::official_route_base_url(profile));
     let base_url = configured_base_url.trim().trim_end_matches('/');
-    let endpoint = format!("{base_url}/models?client_version=0.154.0");
+    let codex_app_path = state.config.read().await.codex_app_path.clone();
+    let client_version = installed_codex_client_version(&codex_app_path);
+    let endpoint = official_models_endpoint(base_url, client_version.as_deref());
     let client = if profile.upstream_proxy.trim().is_empty() {
         state.http_client.clone()
     } else {
@@ -236,6 +238,36 @@ pub(crate) async fn fetch_official_route_models(
         return Err("官方模型列表为空".to_string());
     }
     Ok(models)
+}
+
+const FALLBACK_OFFICIAL_MODELS_CLIENT_VERSION: &str = "0.154.0";
+
+/// The official models endpoint omits slugs the reported client is too old to
+/// use. The installed Codex version is what that build itself would send.
+pub(crate) fn official_models_endpoint(base_url: &str, client_version: Option<&str>) -> String {
+    let version = client_version
+        .map(str::trim)
+        .filter(|version| is_dotted_numeric_version(version))
+        .unwrap_or(FALLBACK_OFFICIAL_MODELS_CLIENT_VERSION);
+    format!("{base_url}/models?client_version={version}")
+}
+
+fn installed_codex_client_version(codex_app_path: &str) -> Option<String> {
+    let configured = codex_app_path.trim();
+    let app_dir = if configured.is_empty() {
+        codey_runtime_core::app_paths::resolve_codex_app_dir(None)
+    } else {
+        codey_runtime_core::app_paths::resolve_codex_app_dir(Some(std::path::Path::new(configured)))
+    }?;
+    codey_runtime_core::app_paths::codex_app_version(&app_dir)
+}
+
+fn is_dotted_numeric_version(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 pub async fn fetch_route_models(
@@ -424,4 +456,31 @@ pub(crate) fn config_with_provider_model_sync(
         subagent_policy::reconcile_for_current_provider(&mut next, codex_home, false);
     }
     next
+}
+
+#[cfg(test)]
+mod tests {
+    use super::official_models_endpoint;
+
+    #[test]
+    fn official_models_endpoint_uses_the_installed_client_version() {
+        assert_eq!(
+            official_models_endpoint(
+                "https://chatgpt.com/backend-api/codex",
+                Some("26.908.70816")
+            ),
+            "https://chatgpt.com/backend-api/codex/models?client_version=26.908.70816"
+        );
+        assert_eq!(
+            official_models_endpoint(
+                "https://chatgpt.com/backend-api/codex",
+                Some("not-a-version")
+            ),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0"
+        );
+        assert_eq!(
+            official_models_endpoint("https://chatgpt.com/backend-api/codex", None),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0"
+        );
+    }
 }
