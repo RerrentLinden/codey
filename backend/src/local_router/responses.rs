@@ -1836,7 +1836,9 @@ impl RouterServer {
         {
             // Lifecycle plugins need response headers, so they skip this
             // attempt. Continuation history is staged on the HTTP fallback.
-            if !compacting && !lifecycle.is_active() {
+            // xAI 回包要改工具名和整数参数，不能走原样透传的上游 WebSocket。
+            // 历史仍由下面的 HTTP 回退展开。
+            if !compacting && !lifecycle.is_active() && !upstream_is_xai(upstream_url) {
                 let had_previous_response =
                     responses_previous_response_id(&upstream_body).is_some();
                 let websocket_attempt = downstream
@@ -1919,6 +1921,35 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
+            && !resolved.route.official_account
+            && upstream_is_xai(upstream_url)
+        {
+            match prepare_xai_native_request(&mut upstream_body) {
+                Ok(prepared) => {
+                    if prepared.request_changed {
+                        body_mutated = true;
+                        encoded_body = None;
+                    }
+                    Some(prepared.response)
+                }
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            400,
+                            "unsupported_responses_payload",
+                            format!(
+                                "线路「{}」发往 xAI 前无法整理请求：{error:#}",
+                                route_display_name(&resolved.route)
+                            ),
+                            Some(&resolved.route),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
         let upstream_stream_requested = upstream_body
             .get("stream")
             .and_then(Value::as_bool)
@@ -2225,7 +2256,15 @@ impl RouterServer {
                 )
                 .await
             }
-            _ => downstream.proxy_response(response).await,
+            _ => {
+                if let Some(fix) = xai_response_fix {
+                    XAI_RESPONSE_FIX
+                        .scope(fix, downstream.proxy_response(response))
+                        .await
+                } else {
+                    downstream.proxy_response(response).await
+                }
+            }
         };
         if let Err(error) = &result
             && downstream_websocket

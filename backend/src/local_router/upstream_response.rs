@@ -373,6 +373,16 @@ pub(crate) async fn write_proxy_response(
     if let Some(probe) = probe {
         probe.mark_response_started(status);
     }
+    let xai_fix = current_xai_response_fix();
+    let mut sse_rewriter = xai_fix
+        .as_ref()
+        .filter(|_| upstream_is_sse)
+        .map(XaiSseRewriter::new);
+    let mut buffered_json = xai_fix
+        .as_ref()
+        .filter(|_| !upstream_is_sse)
+        .map(|_| Vec::new());
+    let mut finished = false;
     loop {
         let next = read_prepared_upstream_chunk(&mut prepared, "读取上游响应失败", probe);
         let chunk = if upstream_is_sse {
@@ -386,19 +396,67 @@ pub(crate) async fn write_proxy_response(
         if chunk.is_empty() {
             continue;
         }
-        let finished = match terminal.as_mut() {
-            Some(terminal) => terminal.observe(&chunk)?,
+        if let Some(buffered) = buffered_json.as_mut() {
+            if buffered.len().saturating_add(chunk.len()) > MAX_UPSTREAM_RESPONSE_BYTES {
+                anyhow::bail!("上游响应超过上限");
+            }
+            buffered.extend_from_slice(&chunk);
+            continue;
+        }
+        let rewritten;
+        let output: &[u8] = if let Some(rewriter) = sse_rewriter.as_mut() {
+            rewritten = rewriter.push(&chunk)?;
+            if rewritten.is_empty() {
+                continue;
+            }
+            &rewritten
+        } else {
+            &chunk
+        };
+        finished = match terminal.as_mut() {
+            Some(terminal) => terminal.observe(output)?,
             None => false,
         };
-        write_chunked_frame(stream, &chunk, "写入上游响应块失败").await?;
+        write_chunked_frame(stream, output, "写入上游响应块失败").await?;
         if let Some(tap) = log_tap.as_mut() {
-            tap.observe(&chunk);
+            if sse_rewriter.is_some() {
+                tap.observe(&Bytes::copy_from_slice(output));
+            } else {
+                tap.observe(&chunk);
+            }
         }
         if !upstream_is_sse && let Some(probe) = probe {
             probe.mark_first_downstream_content();
         }
         if finished {
             break;
+        }
+    }
+    if !finished && let Some(rewriter) = sse_rewriter.as_mut() {
+        let tail = rewriter.finish();
+        if !tail.is_empty() {
+            if let Some(terminal) = terminal.as_mut() {
+                terminal.observe(&tail)?;
+            }
+            write_chunked_frame(stream, &tail, "写入上游响应块失败").await?;
+            if let Some(tap) = log_tap.as_mut() {
+                tap.observe(&Bytes::copy_from_slice(&tail));
+            }
+        }
+    }
+    if let Some(buffered) = buffered_json {
+        let output = xai_fix
+            .as_ref()
+            .expect("xAI JSON rewrite is only armed with a response fix")
+            .rewrite_json_bytes(&buffered);
+        if !output.is_empty() {
+            write_chunked_frame(stream, &output, "写入上游响应块失败").await?;
+            if let Some(tap) = log_tap.as_mut() {
+                tap.observe(&Bytes::copy_from_slice(&output));
+            }
+            if let Some(probe) = probe {
+                probe.mark_first_downstream_content();
+            }
         }
     }
     if let Some(terminal) = terminal.as_mut() {

@@ -182,6 +182,7 @@ mod upstream_response;
 mod websocket;
 mod websocket_context;
 mod websocket_tls;
+mod xai;
 
 pub(crate) use adapt::*;
 pub(crate) use anthropic_request::*;
@@ -206,6 +207,7 @@ pub(crate) use upstream::*;
 pub(crate) use upstream_response::*;
 pub(crate) use websocket::*;
 pub(crate) use websocket_context::*;
+pub(crate) use xai::*;
 
 #[cfg(test)]
 #[path = "../local_router_bench.rs"]
