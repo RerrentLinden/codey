@@ -59,12 +59,27 @@ pub(crate) fn upstream_is_xai(upstream_url: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+/// 官方 xAI 地址，以及任何线路上的 Grok 模型。第三方中转不会用 `x.ai` 做域名，
+/// 但上游模型名仍然是 `grok-…`。
+pub(crate) fn native_upstream_needs_xai_compat(upstream_url: &str, upstream_model: &str) -> bool {
+    upstream_is_xai(upstream_url) || model_is_grok(upstream_model)
+}
+
+pub(crate) fn model_is_grok(model: &str) -> bool {
+    let bare = model.trim().rsplit('/').next().unwrap_or("").trim();
+    let bytes = bare.as_bytes();
+    bytes.eq_ignore_ascii_case(b"grok")
+        || bytes.get(..5).is_some_and(|prefix| {
+            prefix[..4].eq_ignore_ascii_case(b"grok") && matches!(prefix[4], b'-' | b'.' | b'_')
+        })
+}
+
 pub(crate) fn current_xai_response_fix() -> Option<XaiResponseFix> {
     XAI_RESPONSE_FIX.try_with(|fix| fix.clone()).ok()
 }
 
-/// 只处理发往 xAI 的原生 Responses。先提升 `additional_tools`，再展平
-/// namespace，最后删掉 xAI 不接受的字段和工具。无法展开或无法表达的
+/// 整理发往 Grok 原生 Responses 的请求。先提升 `additional_tools`，再展平
+/// namespace，最后删掉 Grok 不接受的字段和工具。无法展开或无法表达的
 /// 加密任务直接拒绝。
 pub(crate) fn prepare_xai_native_request(body: &mut Value) -> Result<XaiNativePrepared> {
     let mut changed = promote_additional_tools(body);
@@ -951,6 +966,22 @@ mod tests {
         assert!(!upstream_is_xai("https://api.openai.com/v1/responses"));
         assert!(!upstream_is_xai("https://x.ai.example.com/v1"));
         assert!(!upstream_is_xai("not a url"));
+        assert!(native_upstream_needs_xai_compat(
+            "https://relay.example.com/v1/responses",
+            "x-ai/grok-4"
+        ));
+        assert!(native_upstream_needs_xai_compat(
+            "https://api.x.ai/v1/responses",
+            "custom-model"
+        ));
+        assert!(model_is_grok("grok-4.5-fast"));
+        assert!(model_is_grok("org/grok_code"));
+        assert!(!model_is_grok("gpt-5"));
+        assert!(!model_is_grok("grokking-bot"));
+        assert!(!native_upstream_needs_xai_compat(
+            "https://relay.example.com/v1/responses",
+            "gpt-5"
+        ));
     }
 
     #[test]

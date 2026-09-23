@@ -1863,9 +1863,12 @@ impl RouterServer {
         {
             // Lifecycle plugins need response headers, so they skip this
             // attempt. Continuation history is staged on the HTTP fallback.
-            // xAI 回包要改工具名和整数参数，不能走原样透传的上游 WebSocket。
+            // Grok 回包要改工具名和整数参数，不能走原样透传的上游 WebSocket。
             // 历史仍由下面的 HTTP 回退展开。
-            if !compacting && !lifecycle.is_active() && !upstream_is_xai(upstream_url) {
+            if !compacting
+                && !lifecycle.is_active()
+                && !native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
+            {
                 let had_previous_response =
                     responses_previous_response_id(&upstream_body).is_some();
                 let websocket_attempt = downstream
@@ -1947,7 +1950,7 @@ impl RouterServer {
         }
         let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
             && !resolved.route.official_account
-            && upstream_is_xai(upstream_url)
+            && native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
         {
             match prepare_xai_native_request(&mut upstream_body) {
                 Ok(prepared) => {
@@ -1963,7 +1966,7 @@ impl RouterServer {
                             400,
                             "unsupported_responses_payload",
                             format!(
-                                "线路「{}」发往 xAI 前无法整理请求：{error:#}",
+                                "线路「{}」发往 Grok 前无法整理请求：{error:#}",
                                 route_display_name(&resolved.route)
                             ),
                             Some(&resolved.route),
