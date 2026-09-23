@@ -1118,6 +1118,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "poll_official_account_login"
         | "cancel_official_account_login"
         | "import_current_codex_login"
+        | "import_official_account_credential"
         | "set_default_official_account"
         | "remove_official_account"
         | "save_official_account_route_settings" => {

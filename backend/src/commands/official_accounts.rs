@@ -74,6 +74,10 @@ pub(super) async fn invoke(
             Err(error) => Err(error),
         },
         "import_current_codex_login" => import_current_codex_login(state).await,
+        "import_official_account_credential" => match string_argument(args, "credential") {
+            Ok(credential) => import_official_account_credential(state, credential).await,
+            Err(error) => Err(error),
+        },
         "set_default_official_account" => match string_argument(args, "accountId") {
             Ok(account_id) => set_default_official_account(state, account_id).await,
             Err(error) => Err(error),
@@ -241,6 +245,20 @@ pub(super) async fn import_current_codex_login(state: &Arc<AppState>) -> Result<
         .map_err(|error| format!("读取 Codex 登录信息任务异常退出：{error}"))?
         .map_err(|error| format!("{error:#}"))?
         .ok_or_else(|| "当前 Codex 没有 ChatGPT 官方账号登录，无法导入".to_string())?;
+    let payload = add_account(state, record).await?;
+    Ok(merge(payload, json!({ "status": "ok" })))
+}
+
+pub(super) async fn import_official_account_credential(
+    state: &Arc<AppState>,
+    credential: String,
+) -> Result<Value, String> {
+    let record = crate::official_accounts::official_account_from_manual_input(
+        &state.http_client,
+        &credential,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
     let payload = add_account(state, record).await?;
     Ok(merge(payload, json!({ "status": "ok" })))
 }

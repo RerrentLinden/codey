@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { IconBrandOpenai, IconCheck, IconLogin2 as IconLogin, IconPlus, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
+import { IconBrandOpenai, IconCheck, IconClipboard, IconLogin2 as IconLogin, IconPlus, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
 
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
-import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Tooltip } from "./components/ui";
+import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, TextArea, Tooltip } from "./components/ui";
 import { maskEmail } from "./sensitiveText";
 import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
 import type { AccountUsageSnapshot } from "./quotaEstimate";
@@ -190,6 +190,9 @@ export function OfficialAccountsPanel({
   const [login, setLogin] = useState<LoginStart | null>(null);
   const [loginError, setLoginError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualInput, setManualInput] = useState("");
+  const [manualError, setManualError] = useState("");
   const loginRef = useRef<LoginStart | null>(null);
   loginRef.current = login;
 
@@ -362,6 +365,43 @@ export function OfficialAccountsPanel({
     }
   }
 
+  function openManual() {
+    setManualError("");
+    setManualInput("");
+    setManualOpen(true);
+  }
+
+  function closeManual() {
+    if (pending === "manual") return;
+    setManualOpen(false);
+    setManualInput("");
+    setManualError("");
+  }
+
+  async function submitManual() {
+    const credential = manualInput.trim();
+    if (!credential) {
+      setManualError("请粘贴 Refresh Token 或 OAuth JSON");
+      return;
+    }
+    setPending("manual");
+    setManualError("");
+    try {
+      const result = await invoke<OfficialAccountsResult>("import_official_account_credential", { credential });
+      applyResult(result);
+      setManualOpen(false);
+      setManualInput("");
+      onNotice({
+        tone: result.warning ? "info" : "success",
+        text: result.warning ? `账号已添加；${result.warning}` : "官方账号已添加",
+      });
+    } catch (error) {
+      setManualError(errorText(error));
+    } finally {
+      setPending(null);
+    }
+  }
+
   async function importCurrent() {
     setPending("import");
     try {
@@ -465,6 +505,12 @@ export function OfficialAccountsPanel({
             <Button variant="link" color="primary" size="xs" disabled={disabled} loading={pending === "import"} onClick={() => void importCurrent()}>
               <IconLogin size={13} aria-hidden="true" />
               <span>导入当前登录</span>
+            </Button>
+          </Tooltip>
+          <Tooltip content="粘贴 Refresh Token 或 OAuth JSON">
+            <Button variant="link" color="primary" size="xs" disabled={disabled} onClick={openManual}>
+              <IconClipboard size={13} aria-hidden="true" />
+              <span>手动输入</span>
             </Button>
           </Tooltip>
           <Button variant="brand-outline" size="xs" disabled={disabled} loading={pending === "login"} onClick={() => void startLogin()}>
@@ -589,6 +635,45 @@ export function OfficialAccountsPanel({
             ) : (
               <Button variant="secondary" size="sm" onClick={() => void closeLogin()}>取消</Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={manualOpen} onOpenChange={(open) => { if (!open) closeManual(); }}>
+        <DialogContent
+          className="sm:w-[520px]"
+          container={popupContainer}
+          onEscapeKeyDown={(event) => { if (pending === "manual") event.preventDefault(); }}
+          onPointerDownOutside={(event) => { if (pending === "manual") event.preventDefault(); }}
+        >
+          <DialogHeader>
+            <DialogTitle>手动添加官方账号</DialogTitle>
+            <DialogDescription>
+              粘贴 Refresh Token，或包含 access_token 与 refresh_token 的 OAuth JSON。只含 Refresh Token 时会向官方换取登录；已含 access token 的 JSON 直接保存，不会轮换来源令牌。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="official-login-body">
+            <TextArea
+              aria-label="Refresh Token 或 OAuth JSON"
+              autoFocus
+              autoComplete="off"
+              className="min-h-[148px] resize-y font-mono text-xs leading-relaxed"
+              disabled={pending === "manual"}
+              placeholder="Refresh Token 或 OAuth JSON"
+              spellCheck={false}
+              value={manualInput}
+              onChange={(event) => {
+                setManualInput(event.target.value);
+                if (manualError) setManualError("");
+              }}
+            />
+            {manualError ? <small className="official-accounts-error">{manualError}</small> : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" disabled={pending === "manual"} onClick={closeManual}>取消</Button>
+            <Button size="sm" disabled={disabled || manualInput.trim() === ""} loading={pending === "manual"} onClick={() => void submitManual()}>
+              添加
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

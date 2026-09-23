@@ -800,6 +800,15 @@ if (import.meta.env.DEV) {
       if (command === "import_current_codex_login") {
         return { status: "failed", message: "当前 Codex 没有 ChatGPT 官方账号登录，无法导入" };
       }
+      if (command === "import_official_account_credential") {
+        const credential = typeof args.credential === "string" ? args.credential.trim() : "";
+        if (!credential) return { status: "failed", message: "请粘贴 Refresh Token 或 OAuth JSON" };
+        if (credential.includes("invalid")) return { status: "failed", message: "Refresh Token 已被拒绝，请确认令牌仍然有效" };
+        const id = `acct_preview_${previewOfficialAccounts.length + 1}`;
+        previewOfficialAccounts.push({ id, email: `user${previewOfficialAccounts.length + 1}@example.com`, planType: "plus", accountId: id, addedAt: Math.floor(Date.now() / 1000), isDefault: previewOfficialAccounts.length === 0 });
+        previewDeriveOfficialProfiles();
+        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true, config: previewConfig, modelState: previewModelState, restartRequired: false };
+      }
       if (command === "set_default_official_account") {
         const target = previewOfficialAccounts.find((account) => account.id === args.accountId);
         if (target?.invalid) {

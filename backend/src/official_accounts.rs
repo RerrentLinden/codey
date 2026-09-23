@@ -1,10 +1,16 @@
 //! Multiple ChatGPT (Codex official) accounts managed by Codey.
 //!
 //! Accounts are added through the same OAuth PKCE flow Codex and CLIProxyAPI
-//! use and stored as complete `auth.json` documents under Codey's own config
-//! directory. Exactly one account can be the default; making an account the
-//! default copies its credentials into the Codex home so Codex itself (and the
-//! local router, which reads the same file) run as that account.
+//! use, by importing the current Codex login, or by pasting a refresh token
+//! or OAuth JSON. A refresh token is exchanged for a full credential document.
+//! JSON that already contains an access token is stored without exchanging it.
+//! A still-valid access token with no refresh time is marked as just imported,
+//! so the following usage query does not rotate the source refresh token.
+//! Credentials are stored as complete `auth.json`
+//! documents under Codey's own config directory. Exactly one account can be
+//! the default; making an account the default copies its credentials into the
+//! Codex home so Codex itself (and the local router, which reads the same
+//! file) run as that account.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -53,6 +59,9 @@ const TOKEN_REFRESH_MARGIN_SECONDS: u64 = 5 * 60;
 /// account proxies keep their TLS pools warm; a rare flood of new addresses
 /// just drops the older pools.
 const MAX_OFFICIAL_PROXY_CLIENTS: usize = 8;
+/// 手动粘贴的 Refresh Token 或 OAuth JSON 上限。正常登录文档远小于此值。
+const MAX_MANUAL_CREDENTIAL_BYTES: usize = 64 * 1024;
+const MIN_REFRESH_TOKEN_CHARS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -170,14 +179,7 @@ impl OfficialAccountRecord {
         let id = account_id
             .clone()
             .map(|account_id| sanitize_id(&account_id))
-            .or_else(|| {
-                email.as_deref().map(|email| {
-                    format!(
-                        "email-{}",
-                        &crate::fs_util::sha256_hex(email.to_ascii_lowercase().as_bytes())[..24]
-                    )
-                })
-            })
+            .or_else(|| email.as_deref().map(email_account_id))
             .unwrap_or_else(|| format!("account-{}", uuid::Uuid::new_v4()));
         let mut auth = auth;
         if let Some(object) = auth.as_object_mut() {
@@ -316,6 +318,19 @@ fn read_account_record(path: &Path, operation: &str) -> Result<Option<OfficialAc
             Ok(None)
         }
     }
+}
+
+fn email_account_id(email: &str) -> String {
+    format!(
+        "email-{}",
+        &crate::fs_util::sha256_hex(email.to_ascii_lowercase().as_bytes())[..24]
+    )
+}
+
+/// `from_auth` 在既没有账号 ID 也没有邮箱时生成的占位 ID。
+fn is_generated_account_id(id: &str) -> bool {
+    id.strip_prefix("account-")
+        .is_some_and(|rest| uuid::Uuid::parse_str(rest).is_ok())
 }
 
 fn sanitize_id(value: &str) -> String {
@@ -970,12 +985,7 @@ pub async fn refresh_if_stale_cached(
     let response = owned_client
         .post(OAUTH_TOKEN_URL)
         .timeout(Duration::from_secs(20))
-        .json(&json!({
-            "client_id": OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "scope": "openid profile email",
-        }))
+        .json(&refresh_token_grant(&refresh_token))
         .send()
         .await
         .context("刷新官方账号令牌请求失败")?;
@@ -1064,6 +1074,325 @@ fn apply_token_response(record: &mut OfficialAccountRecord, payload: &Value) -> 
     }
     object.insert("last_refresh".to_string(), json!(rfc3339_now()));
     Ok(())
+}
+
+fn refresh_token_grant(refresh_token: &str) -> Value {
+    json!({
+        "client_id": OAUTH_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": "openid profile email",
+    })
+}
+
+/// 手动添加官方账号。
+///
+/// 只含 Refresh Token 时向官方换取完整登录信息。已经带 access token 的
+/// OAuth JSON 原样保存，避免换票时轮换来源 Refresh Token。
+pub async fn official_account_from_manual_input(
+    client: &reqwest::Client,
+    input: &str,
+) -> Result<OfficialAccountRecord> {
+    match parse_manual_official_credential(input)? {
+        ManualOfficialCredential::Record(record) => Ok(record),
+        ManualOfficialCredential::RefreshToken(token) => {
+            exchange_refresh_token(client, &token).await
+        }
+    }
+}
+
+enum ManualOfficialCredential {
+    Record(OfficialAccountRecord),
+    RefreshToken(String),
+}
+
+fn parse_manual_official_credential(input: &str) -> Result<ManualOfficialCredential> {
+    if input.len() > MAX_MANUAL_CREDENTIAL_BYTES {
+        bail!("输入过长，请只粘贴 Refresh Token 或一份 OAuth JSON");
+    }
+    let trimmed = prepare_manual_input(input);
+    if trimmed.is_empty() {
+        bail!("请粘贴 Refresh Token 或 OAuth JSON");
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let value: Value =
+            serde_json::from_str(trimmed).map_err(|_| anyhow!("OAuth JSON 格式无效"))?;
+        return credential_from_oauth_json(&value);
+    }
+    if trimmed.starts_with('"') {
+        return match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::String(token)) => credential_from_refresh_token(&token),
+            _ => bail!("OAuth JSON 格式无效"),
+        };
+    }
+    credential_from_refresh_token(trimmed)
+}
+
+fn prepare_manual_input(input: &str) -> &str {
+    let trimmed = input.trim().trim_start_matches('\u{feff}');
+    let Some(fenced) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let fenced = fenced.trim_start();
+    let fenced = fenced
+        .strip_prefix("json")
+        .or_else(|| fenced.strip_prefix("JSON"))
+        .unwrap_or(fenced)
+        .trim();
+    fenced.strip_suffix("```").unwrap_or(fenced).trim()
+}
+
+fn credential_from_refresh_token(raw: &str) -> Result<ManualOfficialCredential> {
+    let token = normalize_bare_token(raw);
+    if token.is_empty() {
+        bail!("请粘贴 Refresh Token 或 OAuth JSON");
+    }
+    if token.chars().count() < MIN_REFRESH_TOKEN_CHARS {
+        bail!("Refresh Token 无效");
+    }
+    if token.starts_with("sk-") {
+        bail!("这是 API Key，官方账号需要 Refresh Token 或 OAuth JSON");
+    }
+    if looks_like_jwt(&token) {
+        bail!("这是 Access Token，请粘贴 Refresh Token，或包含 refresh_token 的 OAuth JSON");
+    }
+    Ok(ManualOfficialCredential::RefreshToken(token))
+}
+
+fn normalize_bare_token(raw: &str) -> String {
+    let mut text = raw.trim();
+    if text.len() >= 6 && text[..6].eq_ignore_ascii_case("bearer") {
+        let rest = &text[6..];
+        if rest.chars().next().is_some_and(char::is_whitespace) {
+            text = rest.trim();
+        }
+    }
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let bytes = compact.as_bytes();
+    if compact.len() >= 2
+        && ((bytes[0] == b'"' && bytes[compact.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[compact.len() - 1] == b'\''))
+    {
+        return compact[1..compact.len() - 1].to_string();
+    }
+    compact
+}
+
+fn looks_like_jwt(token: &str) -> bool {
+    let mut parts = token.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(header), Some(payload), Some(signature), None)
+            if !header.is_empty() && !payload.is_empty() && !signature.is_empty()
+    )
+}
+
+fn credential_from_oauth_json(value: &Value) -> Result<ManualOfficialCredential> {
+    if !value.is_object() {
+        bail!("OAuth JSON 必须是对象");
+    }
+    let source = oauth_json_source(value)?;
+    let access_token = token_string(source, &["access_token", "accessToken"]);
+    let refresh_token = token_string(source, &["refresh_token", "refreshToken", "rt"]);
+    let id_token = token_string(source, &["id_token", "idToken"]);
+    let account_id = token_string(source, &["account_id", "accountId"])
+        .or_else(|| string_field(value, &["account_id", "accountId"]));
+    let email = string_field(source, &["email"]).or_else(|| string_field(value, &["email"]));
+    let plan = string_field(source, &["plan_type", "planType", "chatgpt_plan_type"])
+        .or_else(|| string_field(value, &["plan_type", "planType", "chatgpt_plan_type"]));
+    let Some(access_token) = access_token else {
+        let Some(refresh_token) = refresh_token else {
+            bail!("OAuth JSON 里没有 refresh_token 或 access_token");
+        };
+        return credential_from_refresh_token(&refresh_token);
+    };
+    if let Some(mode) = source.get("auth_mode").and_then(Value::as_str)
+        && mode != "chatgpt"
+    {
+        bail!("当前登录不是 ChatGPT 官方账号登录");
+    }
+    let auth = auth_document_from_oauth_json(
+        source,
+        &access_token,
+        refresh_token.as_deref(),
+        id_token.as_deref(),
+        account_id.as_deref(),
+    );
+    let mut record = OfficialAccountRecord::from_auth(auth, unix_timestamp())?;
+    apply_declared_identity(&mut record, email, plan);
+    // 仍在有效期内、又没有刷新时间的登录文档，按刚刚导入处理。
+    // 否则接下来的额度查询会立刻轮换 Refresh Token，使来源登录失效。
+    if record.last_refresh().is_none() && record.has_live_access_token() {
+        if let Some(object) = record.auth.as_object_mut() {
+            object.insert("last_refresh".to_string(), json!(rfc3339_now()));
+        }
+    }
+    Ok(ManualOfficialCredential::Record(record))
+}
+
+fn oauth_json_source(value: &Value) -> Result<&Value> {
+    if token_string(
+        value,
+        &[
+            "access_token",
+            "accessToken",
+            "refresh_token",
+            "refreshToken",
+            "rt",
+        ],
+    )
+    .is_some()
+    {
+        return Ok(value);
+    }
+    if let Some(auth) = value.get("auth")
+        && token_string(
+            auth,
+            &[
+                "access_token",
+                "accessToken",
+                "refresh_token",
+                "refreshToken",
+                "rt",
+            ],
+        )
+        .is_some()
+    {
+        return Ok(auth);
+    }
+    bail!("OAuth JSON 里没有 refresh_token 或 access_token")
+}
+
+fn token_string(document: &Value, keys: &[&str]) -> Option<String> {
+    document
+        .get("tokens")
+        .and_then(|tokens| string_field(tokens, keys))
+        .or_else(|| string_field(document, keys))
+}
+
+fn string_field(document: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        document
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn auth_document_from_oauth_json(
+    source: &Value,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    id_token: Option<&str>,
+    account_id: Option<&str>,
+) -> Value {
+    if source.get("tokens").and_then(Value::as_object).is_some() {
+        let mut auth = source.clone();
+        if let Some(tokens) = auth.get_mut("tokens").and_then(Value::as_object_mut) {
+            insert_token_if_blank(tokens, "access_token", Some(access_token));
+            insert_token_if_blank(tokens, "refresh_token", refresh_token);
+            insert_token_if_blank(tokens, "id_token", id_token);
+            insert_token_if_blank(tokens, "account_id", account_id);
+        }
+        return auth;
+    }
+    let mut tokens = serde_json::Map::new();
+    tokens.insert("access_token".to_string(), json!(access_token));
+    tokens.insert(
+        "refresh_token".to_string(),
+        json!(refresh_token.unwrap_or("")),
+    );
+    tokens.insert("id_token".to_string(), json!(id_token.unwrap_or("")));
+    if let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) {
+        tokens.insert("account_id".to_string(), json!(account_id));
+    }
+    let mut auth = serde_json::Map::new();
+    auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
+    auth.insert("auth_mode".to_string(), json!("chatgpt"));
+    auth.insert("tokens".to_string(), Value::Object(tokens));
+    if let Some(last_refresh) = source
+        .get("last_refresh")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        auth.insert("last_refresh".to_string(), json!(last_refresh));
+    }
+    Value::Object(auth)
+}
+
+fn insert_token_if_blank(
+    tokens: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let occupied = tokens
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|current| !current.trim().is_empty());
+    if !occupied {
+        tokens.insert(key.to_string(), json!(value));
+    }
+}
+
+fn apply_declared_identity(
+    record: &mut OfficialAccountRecord,
+    email: Option<String>,
+    plan: Option<String>,
+) {
+    if record.email.is_none() {
+        record.email = email.filter(|value| !value.is_empty());
+    }
+    if record.plan_type.is_none() {
+        record.plan_type = plan.filter(|value| !value.is_empty());
+    }
+    if record.account_id.is_none()
+        && is_generated_account_id(&record.id)
+        && let Some(email) = record.email.clone()
+    {
+        record.id = email_account_id(&email);
+    }
+}
+
+async fn exchange_refresh_token(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<OfficialAccountRecord> {
+    let response = client
+        .post(OAUTH_TOKEN_URL)
+        .timeout(Duration::from_secs(20))
+        .json(&refresh_token_grant(refresh_token))
+        .send()
+        .await
+        .context("用 Refresh Token 换取登录信息失败")?;
+    let status = response.status();
+    let body =
+        crate::http_response::read_bounded_body(response, 256 * 1024, "换取登录信息响应").await?;
+    if !status.is_success() {
+        if official_account_invalid_from_body(&body).is_some() {
+            bail!("Refresh Token 已被拒绝，请确认令牌仍然有效");
+        }
+        bail!("用 Refresh Token 换取登录信息失败：{status}");
+    }
+    let mut payload: Value = serde_json::from_slice(&body).context("登录信息响应格式无效")?;
+    let missing_refresh = payload
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .is_none();
+    if missing_refresh && let Some(object) = payload.as_object_mut() {
+        object.insert("refresh_token".to_string(), json!(refresh_token));
+    }
+    record_from_token_response(&payload).context("Refresh Token 换到的登录信息不完整")
 }
 
 // ---------------------------------------------------------------------------
@@ -2171,6 +2500,156 @@ mod tests {
         assert_eq!(record.auth["tokens"]["account_id"], json!("acct_c"));
         assert!(record.auth["last_refresh"].as_str().is_some());
         assert!(record.last_refresh_age(SystemTime::now()).unwrap() < Duration::from_secs(60));
+    }
+
+    fn manual_record(input: &str) -> OfficialAccountRecord {
+        match parse_manual_official_credential(input).unwrap() {
+            ManualOfficialCredential::Record(record) => record,
+            ManualOfficialCredential::RefreshToken(_) => panic!("应直接保存登录文档"),
+        }
+    }
+
+    fn manual_refresh(input: &str) -> String {
+        match parse_manual_official_credential(input).unwrap() {
+            ManualOfficialCredential::RefreshToken(token) => token,
+            ManualOfficialCredential::Record(_) => panic!("应保留 Refresh Token 以便换票"),
+        }
+    }
+
+    fn manual_error(input: &str) -> String {
+        match parse_manual_official_credential(input) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("应拒绝这份输入"),
+        }
+    }
+
+    #[test]
+    fn manual_input_keeps_oauth_json_and_exchanges_only_a_refresh_token() {
+        let mut auth = chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z");
+        auth["custom_flag"] = json!(true);
+        let stored = manual_record(&serde_json::to_string(&auth).unwrap());
+        assert_eq!(stored.id, "acct_1");
+        assert_eq!(stored.auth["custom_flag"], json!(true));
+        assert_eq!(
+            stored.auth["tokens"]["access_token"],
+            json!("access-acct_1")
+        );
+        assert_eq!(
+            stored.auth["tokens"]["refresh_token"],
+            json!("refresh-acct_1")
+        );
+        assert_eq!(stored.auth["last_refresh"], json!("2026-01-01T00:00:00Z"));
+
+        let token = "rt_abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(manual_refresh(token), token);
+        assert_eq!(manual_refresh(&format!("Bearer\n{token}  ")), token);
+        assert_eq!(manual_refresh(&format!("\"{token}\"")), token);
+        assert_eq!(
+            manual_refresh(&json!({ "tokens": { "refreshToken": token } }).to_string()),
+            token
+        );
+        assert_eq!(
+            refresh_token_grant(token)["grant_type"],
+            json!("refresh_token")
+        );
+        assert_eq!(
+            refresh_token_grant(token)["client_id"],
+            json!(OAUTH_CLIENT_ID)
+        );
+    }
+
+    #[test]
+    fn manual_oauth_json_accepts_flat_token_and_wrapped_account_files() {
+        let live_exp = unix_timestamp() + 7_200;
+        let access = unsigned_jwt(json!({
+            "exp": live_exp,
+            "email": "flat@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_flat",
+                "chatgpt_plan_type": "pro",
+            }
+        }));
+        let flat = manual_record(
+            &json!({
+                "access_token": access,
+                "refresh_token": "refresh-flat",
+                "id_token": access,
+                "account_id": "acct_flat",
+            })
+            .to_string(),
+        );
+        assert_eq!(flat.id, "acct_flat");
+        assert_eq!(flat.email.as_deref(), Some("flat@example.com"));
+        assert_eq!(flat.plan_type.as_deref(), Some("pro"));
+        assert_eq!(flat.auth["tokens"]["refresh_token"], json!("refresh-flat"));
+        assert!(flat.last_refresh().is_some());
+
+        let wrapped_access = unsigned_jwt(json!({ "exp": live_exp }));
+        let wrapped = format!(
+            "```json\n{}\n```",
+            json!({
+                "email": "wrap@example.com",
+                "accountId": "acct_wrap",
+                "planType": "team",
+                "auth": {
+                    "tokens": {
+                        "access_token": wrapped_access,
+                        "refresh_token": "refresh-wrap",
+                    }
+                }
+            })
+        );
+        let wrapped = manual_record(&wrapped);
+        assert_eq!(wrapped.id, "acct_wrap");
+        assert_eq!(wrapped.email.as_deref(), Some("wrap@example.com"));
+        assert_eq!(wrapped.plan_type.as_deref(), Some("team"));
+        assert_eq!(wrapped.auth["tokens"]["account_id"], json!("acct_wrap"));
+        assert_eq!(
+            wrapped.auth["tokens"]["refresh_token"],
+            json!("refresh-wrap")
+        );
+        assert!(wrapped.last_refresh().is_some());
+    }
+
+    #[test]
+    fn manual_input_rejects_secrets_that_are_not_refresh_tokens_without_echoing_them() {
+        let secret = "rt_super_secret_value_should_not_leak";
+        let broken = format!("{{\"refresh_token\":\"{secret}\"");
+        let message = manual_error(&broken);
+        assert!(message.contains("格式无效"));
+        assert!(!message.contains(secret));
+
+        let jwt = unsigned_jwt(json!({"sub": "user"}));
+        assert!(manual_error(&jwt).contains("Access Token"));
+        assert!(manual_error("sk-abcdefghijklmnopqrstuvwxyz").contains("API Key"));
+        assert!(manual_error("[]").contains("对象"));
+        assert!(manual_error("   ").contains("请粘贴"));
+        assert!(manual_error(&"x".repeat(MAX_MANUAL_CREDENTIAL_BYTES + 1)).contains("过长"));
+        let expired = unsigned_jwt(json!({
+            "exp": unix_timestamp().saturating_sub(30),
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_old" }
+        }));
+        let expired = manual_record(
+            &json!({
+                "access_token": expired,
+                "refresh_token": "refresh-old",
+            })
+            .to_string(),
+        );
+        assert!(expired.last_refresh().is_none());
+        assert!(
+            manual_error(
+                &json!({
+                    "auth_mode": "apikey",
+                    "tokens": {
+                        "access_token": "x",
+                        "refresh_token": "refresh-value-long-enough",
+                    }
+                })
+                .to_string(),
+            )
+            .contains("ChatGPT")
+        );
     }
 
     #[test]
