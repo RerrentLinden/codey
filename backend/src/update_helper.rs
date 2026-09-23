@@ -390,6 +390,16 @@ fn nsis_install_directory_argument(install_dir: &Path) -> OsString {
     argument
 }
 
+/// 安装包位于 `<配置目录>/updates/v<版本>/`。主进程在配置目录等待回执，
+/// 少退一层会把文件写进 `updates`，等待方永远看不到助手已启动。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn update_helper_report_path(update_path: &Path) -> Option<PathBuf> {
+    let version_dir = update_path.parent()?;
+    let updates_dir = version_dir.parent()?;
+    let config_dir = updates_dir.parent()?;
+    Some(config_dir.join(UPDATE_INSTALL_REPORT_FILE))
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn spawn_update_installer(
     update_path: &Path,
@@ -429,10 +439,8 @@ pub(crate) fn spawn_update_installer(
     // PowerShell execution policy after the main process has already exited.
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    // 结果报告的落点由主进程决定：它知道自己真正的配置目录，助手只负责写。
-    let report_path = update_dir
-        .parent()
-        .map(|config_dir| config_dir.join(UPDATE_INSTALL_REPORT_FILE));
+    // 回执必须和主进程等待的位置相同：配置目录，而不是 updates 这一层。
+    let report_path = update_helper_report_path(update_path);
     let mut command = std::process::Command::new(&helper_path);
     command
         .arg(UPDATE_HELPER_FLAG)
@@ -960,6 +968,20 @@ mod tests {
         assert_eq!(
             nsis_install_directory_argument(&parsed.install_dir),
             OsString::from(r"/D=C:\Users\Test User\Programs\Codey")
+        );
+    }
+
+    #[test]
+    fn update_helper_report_path_matches_the_file_the_main_process_waits_for() {
+        let mut update = PathBuf::from("config");
+        update.push("updates");
+        update.push("v1.2.3");
+        update.push("Codey-setup.exe");
+        let config = PathBuf::from("config").join("config.json");
+
+        assert_eq!(
+            update_helper_report_path(&update),
+            Some(update_install_report_path(&config))
         );
     }
 
