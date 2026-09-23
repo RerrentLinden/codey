@@ -272,6 +272,13 @@ mod tests {
                 visual: true,
             })
         );
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_DEFAULT),
+            Some(RolePolicy {
+                access: RoleAccess::Write,
+                visual: true,
+            })
+        );
         assert_eq!(role_policy("unknown"), None);
     }
 

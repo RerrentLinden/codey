@@ -129,12 +129,12 @@ pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
 
 pub(crate) const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
 
-description = "General-purpose exploration subagent using the configured default model and reasoning effort."
-sandbox_mode = "read-only"
+description = "General-purpose subagent using the configured default model and reasoning effort."
+sandbox_mode = "workspace-write"
 
 developer_instructions = """
-你是通用子代理，是主代理派出去的探子。你只做探索、检索、核验：不改动任何东西，不做方案取舍或者最终判断——那些是主代理的事。
-不要派生、调用或者请求新的子代理；任务若是需要进一步拆分，把拆分的建议返回给主代理。
+你是通用子代理。按本次任务调用需要的工具，包括读写、命令、视觉和未归类工具；实际文件与命令访问仍受 Codex 原生权限约束。
+不要派生、调用或者请求新的子代理；任务若是需要进一步拆分，把拆分的建议返回给主代理。不做方案取舍或者最终判断——那些是主代理的事。
 
 你交回给主代理的东西：
 - 你的产出直接喂给主代理、是它据以行动的数据，并非给人看的。密而不水，不寒暄、不复述过程、不下客套结论。
@@ -245,9 +245,9 @@ pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
 返回时区分本次实际修改、已清理内容和未完成要求，不能用其他尝试的结果代替本次证据。";
 
 pub(crate) const NO_WRITABLE_SUBAGENT_GUIDANCE: &str = "\
-本次运行没有启用 `codey_worker` 或 `codey_visual_worker`，因此没有可写子代理。所有创建、修改、\
+本次运行没有启用 `codey_worker`、`codey_visual_worker` 或 `default`，因此没有可写子代理。所有创建、修改、\
 删除、移动文件或其他会改变状态的工作都由主代理直接完成；只读子代理只能承担检索、分析和证据\
-收集。不得把写入任务改派给 `default` 或任何只读角色，也不得要求它们尝试 `replace`、\
+收集。不得把写入任务改派给只读角色，也不得要求它们尝试 `replace`、\
 `apply_patch` 或其他写入工具。";
 
 pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
@@ -637,7 +637,7 @@ mod tests {
             ("codey_visual_analysis", false),
             ("codey_worker", true),
             ("codey_visual_worker", true),
-            ("default", false),
+            ("default", true),
         ] {
             let source = subagent_source_config(role).unwrap();
             assert!(source.contains(&format!("name = \"{role}\"")));

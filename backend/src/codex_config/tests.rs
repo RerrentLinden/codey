@@ -964,6 +964,10 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
         .get_mut(crate::config::SUBAGENT_ROLE_VISUAL_WORKER)
         .unwrap()
         .enabled = false;
+    configured
+        .get_mut(crate::config::SUBAGENT_ROLE_DEFAULT)
+        .unwrap()
+        .enabled = false;
     let runtime_roles = runtime_subagent_roles(
         Some(&configured),
         DEFAULT_SUBAGENT_MODEL,
@@ -1049,6 +1053,14 @@ fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
         .unwrap();
     let worker = String::from_utf8(worker.contents.clone()).unwrap();
     assert!(!worker.contains(READ_ONLY_AGENT_WRITE_GUARD));
+
+    let default_agent = plans
+        .iter()
+        .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_DEFAULT)
+        .unwrap();
+    let default_agent = String::from_utf8(default_agent.contents.clone()).unwrap();
+    assert!(!default_agent.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(default_agent.contains("sandbox_mode = \"workspace-write\""));
 }
 
 #[test]

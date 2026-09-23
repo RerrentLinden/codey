@@ -168,7 +168,7 @@ impl RuleSet {
             ("codey_visual_analysis", RoleAccess::ReadOnly, true),
             ("codey_worker", RoleAccess::Write, false),
             ("codey_visual_worker", RoleAccess::Write, true),
-            ("default", RoleAccess::ReadOnly, false),
+            ("default", RoleAccess::Write, true),
         ];
         anyhow::ensure!(
             self.roles.len() == EXPECTED_ROLES.len(),
@@ -200,8 +200,13 @@ impl RuleSet {
                 tool_class: ToolClass::Unknown,
             });
             anyhow::ensure!(
-                unknown.effect == RuleEffect::Deny,
-                "子代理规则必须拒绝角色 {role} 的未知工具"
+                unknown.effect
+                    == if expected_access == RoleAccess::ReadOnly {
+                        RuleEffect::Deny
+                    } else {
+                        RuleEffect::Allow
+                    },
+                "子代理规则必须按 access 限制角色 {role} 的未归类工具"
             );
             if expected_access == RoleAccess::ReadOnly {
                 let write = self.evaluate(&RuleContext {
@@ -642,6 +647,57 @@ mod tests {
             tool_class: ToolClass::Unknown,
         });
         assert_eq!(decision.effect, RuleEffect::Deny);
+        assert_eq!(decision.rule_id, "deny-unknown-child-tool");
+
+        for (role, rule_id) in [
+            ("codey_worker", "allow-worker-capabilities"),
+            ("codey_visual_worker", "allow-worker-capabilities"),
+            ("default", "allow-default-capabilities"),
+        ] {
+            let decision = rules.evaluate(&RuleContext {
+                actor: RuleActor::Child,
+                role: Some(role),
+                tool_name: "mcp_idea_apply_patch",
+                tool_class: classify_tool("mcp_idea_apply_patch"),
+            });
+            assert_eq!(decision.effect, RuleEffect::Allow, "{role}");
+            assert_eq!(decision.rule_id, rule_id, "{role}");
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "apply_patch",
+                        tool_class: ToolClass::Write,
+                    })
+                    .effect,
+                RuleEffect::Allow,
+                "{role}"
+            );
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "agents.spawn_agent",
+                        tool_class: ToolClass::Spawn,
+                    })
+                    .effect,
+                RuleEffect::Deny,
+                "{role}"
+            );
+        }
+        assert_eq!(
+            rules
+                .evaluate(&RuleContext {
+                    actor: RuleActor::Child,
+                    role: None,
+                    tool_name: "mcp_idea_apply_patch",
+                    tool_class: ToolClass::Unknown,
+                })
+                .effect,
+            RuleEffect::Deny
+        );
 
         for (role, tool, class) in [
             (None, "functions.exec", ToolClass::Command),
@@ -745,12 +801,24 @@ mod tests {
                 embedded()
                     .evaluate(&RuleContext {
                         actor: RuleActor::Child,
-                        role: Some("codey_worker"),
+                        role: Some("codey_quick_scan"),
                         tool_name: tool,
                         tool_class: classify_tool(tool),
                     })
                     .effect,
                 RuleEffect::Deny,
+                "{tool}"
+            );
+            assert_eq!(
+                embedded()
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some("codey_worker"),
+                        tool_name: tool,
+                        tool_class: classify_tool(tool),
+                    })
+                    .effect,
+                RuleEffect::Allow,
                 "{tool}"
             );
         }

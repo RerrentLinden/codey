@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "revision": 7,
+  "revision": 9,
   "conflictResolution": "highest_priority_deny_wins",
   "fallback": "deny",
   "roles": {
@@ -9,7 +9,7 @@
     "codey_visual_analysis": { "access": "read_only", "visual": true },
     "codey_worker": { "access": "write", "visual": false },
     "codey_visual_worker": { "access": "write", "visual": true },
-    "default": { "access": "read_only", "visual": false }
+    "default": { "access": "write", "visual": true }
   },
   "rules": [
     {
@@ -33,7 +33,7 @@
       "priority": 900,
       "effect": "deny",
       "actors": ["child"],
-      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "default"],
+      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
       "toolClasses": ["write"],
       "explanation": "只读角色不得调用写入工具。"
     },
@@ -59,7 +59,7 @@
       "priority": 800,
       "effect": "allow",
       "actors": ["child"],
-      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "default"],
+      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
       "toolClasses": ["read", "command", "network", "collaboration"],
       "explanation": "只读角色可使用本地与网络只读检索、显式声明的命令和协作能力；文件写入仍由角色与原生沙箱限制。"
     },
@@ -69,8 +69,17 @@
       "effect": "allow",
       "actors": ["child"],
       "roles": ["codey_worker", "codey_visual_worker"],
-      "toolClasses": ["read", "write", "command", "network", "collaboration"],
-      "explanation": "写入角色可使用声明范围内的读写、网络读取与受沙箱约束的命令能力。"
+      "toolClasses": ["read", "write", "command", "network", "collaboration", "unknown"],
+      "explanation": "写入角色可使用声明范围内的读写、网络读取、受沙箱约束的命令，以及未归类工具。"
+    },
+    {
+      "id": "allow-default-capabilities",
+      "priority": 800,
+      "effect": "allow",
+      "actors": ["child"],
+      "roles": ["default"],
+      "toolClasses": ["read", "write", "command", "network", "collaboration", "visual", "unknown"],
+      "explanation": "默认角色可调用读写、命令、网络、视觉、协作和未归类工具。"
     },
     {
       "id": "allow-unbound-collaboration",
@@ -85,8 +94,9 @@
       "priority": 50,
       "effect": "deny",
       "actors": ["child"],
+      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis"],
       "toolClasses": ["unknown"],
-      "explanation": "未知工具不在最小权限能力集合内。"
+      "explanation": "只读角色不得调用未归类工具。"
     }
   ]
 }

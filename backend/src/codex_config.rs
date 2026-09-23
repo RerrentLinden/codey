@@ -703,8 +703,9 @@ fn runtime_root_instructions_for_roles(
     root_instructions: &str,
     roles: &BTreeMap<String, SubagentRoleConfig>,
 ) -> String {
-    let has_writable_role =
-        roles.contains_key(SUBAGENT_ROLE_WORKER) || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER);
+    let has_writable_role = roles.contains_key(SUBAGENT_ROLE_WORKER)
+        || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER)
+        || roles.contains_key(SUBAGENT_ROLE_DEFAULT);
     if has_writable_role {
         root_instructions.to_string()
     } else {
@@ -843,7 +844,10 @@ fn render_runtime_agent(
             "developer_instructions",
         )?;
     }
-    if !matches!(role, SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_VISUAL_WORKER) {
+    if !matches!(
+        role,
+        SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_VISUAL_WORKER | SUBAGENT_ROLE_DEFAULT
+    ) {
         append_table_constraint_text(
             document.as_table_mut(),
             "developer_instructions",
