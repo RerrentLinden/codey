@@ -269,7 +269,10 @@ export function App({
     officialOnly,
     setModelState,
     modelPickerVisible,
+    modelPickerLoading,
     setModelPickerVisible,
+    beginModelPickerLoad,
+    completeModelPickerLoad,
     customModelInput,
     modelInputError,
     modelSyncWarning,
@@ -284,7 +287,6 @@ export function App({
     resetDraftReasoningEffort,
     draftManualThirdPartyModelKeys,
     thirdPartyModelOptions,
-    openModelPicker,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,
@@ -539,36 +541,52 @@ export function App({
       if (shouldPersistNativeToggle) {
         await persist(config);
       }
-      const result = await invoke<{
-        config: Config;
-        providerStatus: ProviderStatus;
-        modelState: ModelState;
-        restartRequired?: boolean;
-      }>("sync_current_provider");
-      setPersistedConfig(result.config);
-      setProviderStatus(result.providerStatus);
-      setModelState(result.modelState);
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired ?? current.restartRequired,
-      }));
-      if (nativeMode) {
-        openModelPicker(
-          result.providerStatus.provider.official
-            ? result.modelState
-            : { ...result.modelState, officialModels: [] },
-          "",
-          result.providerStatus.provider.official ? null : result.providerStatus.provider.id,
-        );
+      const session = nativeMode
+        ? beginModelPickerLoad(provider?.official ? null : provider?.id ?? null, false)
+        : 0;
+      try {
+        const result = await invoke<{
+          config: Config;
+          providerStatus: ProviderStatus;
+          modelState: ModelState;
+          restartRequired?: boolean;
+        }>("sync_current_provider");
+        setPersistedConfig(result.config);
+        setProviderStatus(result.providerStatus);
+        setModelState(result.modelState);
+        setStatus((current) => ({
+          ...current,
+          restartRequired: result.restartRequired ?? current.restartRequired,
+        }));
+        if (nativeMode) {
+          completeModelPickerLoad(
+            session,
+            result.providerStatus.provider.official
+              ? result.modelState
+              : { ...result.modelState, officialModels: [] },
+            "",
+            result.providerStatus.provider.official ? null : result.providerStatus.provider.id,
+          );
+        }
+        setNotice({
+          tone: result.restartRequired ? "info" : "success",
+          text: nativeMode
+            ? `已同步当前线路「${result.providerStatus.provider.name}」，请勾选要启用的模型`
+            : result.restartRequired
+              ? "已重新读取 Codex 配置，重启后应用当前线路"
+              : "已重新读取 Codex 配置",
+        });
+      } catch (error) {
+        if (nativeMode) {
+          completeModelPickerLoad(
+            session,
+            provider?.official ? modelState : { ...modelState, officialModels: [] },
+            `自动同步失败：${errorText(error)}。请重试以读取当前账号可用模型。`,
+            provider?.official ? null : provider?.id ?? null,
+          );
+        }
+        throw error;
       }
-      setNotice({
-        tone: result.restartRequired ? "info" : "success",
-        text: nativeMode
-          ? `已同步当前线路「${result.providerStatus.provider.name}」，请勾选要启用的模型`
-          : result.restartRequired
-            ? "已重新读取 Codex 配置，重启后应用当前线路"
-            : "已重新读取 Codex 配置",
-      });
     });
   }
 
@@ -742,6 +760,10 @@ export function App({
       const savedConfig = config;
       const savedRoute = savedConfig.profiles.find((profile) => profile.id === route.id);
       if (!savedRoute) throw new Error("找不到要同步模型的线路");
+      const session = beginModelPickerLoad(
+        savedRoute.id,
+        savedRoute.supportsAutoReview === true,
+      );
       try {
         const result = await invoke<{
           config: Config;
@@ -756,7 +778,8 @@ export function App({
           expectedRevision: savedConfig.settingsRevision,
         });
         applyRouteResult(result);
-        openModelPicker(
+        completeModelPickerLoad(
+          session,
           savedRoute.authMode === "officialAccount"
             ? result.routeModelState
             : { ...result.routeModelState, officialModels: [] },
@@ -769,7 +792,8 @@ export function App({
         const warning = savedRoute.authMode === "officialAccount"
           ? `自动同步失败：${errorText(error)}。请重试以读取当前账号可用模型。`
           : `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
-        openModelPicker(
+        completeModelPickerLoad(
+          session,
           savedRoute.authMode === "officialAccount"
             ? modelState
             : thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
@@ -1587,6 +1611,7 @@ export function App({
         customModelInput={customModelInput}
         modelInputError={modelInputError}
         modelSyncWarning={modelSyncWarning}
+        loading={modelPickerLoading}
         autoReviewSupported={draftAutoReviewSupported}
         thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelEditorState}

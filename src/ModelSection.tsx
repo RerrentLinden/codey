@@ -422,10 +422,9 @@ function ModelSectionComponent({
               )
             : modelState.thirdPartyModels
             : official
-              ? uniqueModelIds([
-                  ...officialCatalog,
-                  ...configuredModels,
-                ])
+              ? uniqueModelIds(
+                  configuredModels.length > 0 ? configuredModels : officialCatalog,
+                )
             : uniqueModelIds([
                 ...configuredModels,
                 ...(config.declaredOfficialModelsByProvider[providerId] || []),
@@ -506,7 +505,11 @@ function ModelSectionComponent({
     if (official && officialScope === "models") {
       const providerId = routeProviderId(profile);
       const configuredModels = config.selectedModelsByProvider[providerId] || [];
-      setOfficialModelDraft(uniqueModelIds([...officialCatalog, ...configuredModels]));
+      const catalogKeys = new Set(officialCatalog.map(modelKey));
+      const enabledModels = configuredModels.filter((model) => catalogKeys.has(modelKey(model)));
+      setOfficialModelDraft(
+        uniqueModelIds(enabledModels.length > 0 ? enabledModels : officialCatalog),
+      );
     } else {
       setOfficialModelDraft([]);
     }

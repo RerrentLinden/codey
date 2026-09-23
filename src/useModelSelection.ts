@@ -1,6 +1,7 @@
 import {
   useCallback,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
   type SetStateAction,
@@ -77,6 +78,8 @@ export function useModelSelection({
     defaultModel: "",
   });
   const [modelPickerVisible, setModelPickerVisible] = useState(false);
+  const [modelPickerLoading, setModelPickerLoading] = useState(false);
+  const modelPickerSession = useRef(0);
   const [modelPickerRouteId, setModelPickerRouteId] = useState<string | null>(null);
   const [modelPickerState, setModelPickerState] = useState<ModelState | null>(null);
   const [draftModels, setDraftModels] = useState<string[]>([]);
@@ -244,6 +247,46 @@ export function useModelSelection({
     setDraftAutoReviewSupported(autoReviewSupported);
     setModelPickerVisible(true);
   }, [config, currentProvider]);
+
+  const emptyModelState = useCallback((): ModelState => ({
+    officialModels: [],
+    officialModelIds: [],
+    thirdPartyModels: [],
+    manualThirdPartyModels: [],
+    upstreamModels: [],
+    defaultModel: "",
+  }), []);
+
+  const beginModelPickerLoad = useCallback((
+    routeId: string | null = null,
+    autoReviewSupported = false,
+  ) => {
+    const session = modelPickerSession.current + 1;
+    modelPickerSession.current = session;
+    setModelPickerLoading(true);
+    openModelPicker(emptyModelState(), "", routeId, autoReviewSupported);
+    return session;
+  }, [emptyModelState, openModelPicker]);
+
+  const completeModelPickerLoad = useCallback((
+    session: number,
+    state: ModelState,
+    warning = "",
+    routeId: string | null = null,
+    autoReviewSupported = false,
+  ) => {
+    if (modelPickerSession.current !== session) return;
+    setModelPickerLoading(false);
+    openModelPicker(state, warning, routeId, autoReviewSupported);
+  }, [openModelPicker]);
+
+  const setModelPickerOpen = useCallback((open: boolean) => {
+    if (!open) {
+      modelPickerSession.current += 1;
+      setModelPickerLoading(false);
+    }
+    setModelPickerVisible(open);
+  }, []);
 
   const toggleDraftModel = useCallback((model: string | readonly string[], checked: boolean) => {
     const models = typeof model === "string" ? [model] : model;
@@ -491,7 +534,10 @@ export function useModelSelection({
     officialOnly,
     setModelState,
     modelPickerVisible,
-    setModelPickerVisible,
+    modelPickerLoading,
+    setModelPickerVisible: setModelPickerOpen,
+    beginModelPickerLoad,
+    completeModelPickerLoad,
     customModelInput,
     modelInputError,
     modelSyncWarning,

@@ -718,12 +718,20 @@ pub fn selection_state_with_manual_models(
                     default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
                 let model = official_model_from_value(model)?;
                 let model_key = model_id::key(&model.slug);
-                let supported = !filter_official_selection
-                    || requested_upstream_keys
+                // 同步结果只说明账号能调用哪些模型。用户勾选的子集才是启用
+                // 集合；有勾选时，未勾选的同步模型不能再进入运行时列表。
+                let known_to_account = requested_upstream_keys
+                    .as_ref()
+                    .is_none_or(|keys| keys.contains(&model_key));
+                let supported = if !filter_official_selection {
+                    true
+                } else if selected_official_keys.is_empty() {
+                    requested_upstream_keys
                         .as_ref()
                         .is_some_and(|keys| keys.contains(&model_key))
-                    || (requested_upstream_keys.is_none()
-                        && selected_official_keys.contains(&model_key));
+                } else {
+                    selected_official_keys.contains(&model_key) && known_to_account
+                };
                 Some(OfficialModelAvailability {
                     slug: model.slug,
                     display_name: model.display_name,
@@ -4643,6 +4651,38 @@ mod tests {
                 .iter()
                 .filter(|model| model.slug != "gpt-5.6-sol")
                 .all(|model| !model.supported)
+        );
+    }
+
+    #[test]
+    fn synced_official_account_keeps_unchecked_models_disabled() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let upstream = vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-luna".into(),
+            "gpt-5.5".into(),
+        ];
+        let selected = vec!["gpt-5.6-sol".into()];
+
+        let state = selection_state(
+            home.path(),
+            true,
+            Some(&upstream),
+            &selected,
+            Some("gpt-5.6-luna"),
+        )
+        .unwrap();
+
+        assert_eq!(state.default_model, "gpt-5.6-sol");
+        assert_eq!(
+            state
+                .official_models
+                .iter()
+                .filter(|model| model.supported)
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5.6-sol"]
         );
     }
 
