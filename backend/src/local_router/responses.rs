@@ -1892,10 +1892,12 @@ impl RouterServer {
         };
         // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
         // 回放历史时只保留加密字段。首次仍按原样发送，只有上游明确报出
-        // reasoning_text 缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
+        // reasoning 明文缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
         // 不参与该回退。
-        let reasoning_text_retry_allowed = bridge == ProtocolBridge::NativeResponses
-            && request_kind == ResponsesRequestKind::Create
+        let reasoning_text_retry_allowed = matches!(
+            bridge,
+            ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
+        ) && request_kind == ResponsesRequestKind::Create
             && !compacting
             && !resolved.route.official_account;
         // 重发需要同一份请求头和完整请求体，只有可能重发时才保留。

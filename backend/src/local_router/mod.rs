@@ -86,11 +86,14 @@ const MAX_ROUTE_BINDINGS: usize = 4096;
 const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-// 流式网关常把响应头留到首个 token。这个期限从请求体上传完成起算，不包含
-// 上传本身：同对话切换模型会重放整段历史，若从 send() 一开始计时，60 秒会在
-// 上游已经生成（网关侧首字约三十秒）之前用完。本地记成 504 后 Codex 收不到
-// 终态，界面就停在思考。正文到达后仍由空闲期限和总期限约束。
+// 流式网关常把响应头留到首个 token。60 秒只覆盖正文离开本机发送缓冲之后的
+// 首字等待。同对话切换模型会重放整段历史，HTTP/2 窗口和内核发送缓冲可以在
+// 网关收齐之前就把正文取走；若从取走起只等 60 秒，会在网关侧首字（高思考大约
+// 三十秒）之前用完。本地记成 504 后 Codex 收不到终态，界面就停在思考。
+// 仍在缓冲中的传输由 response_header_timeout 按正文大小加到这个期限上。
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+// 正文被协议栈取走后，按这个上行速率估算它还要多久才到达网关。
+const BUFFERED_UPLOAD_BYTES_PER_SEC: u64 = 64 * 1024;
 // A non-streaming upstream may not send response headers until generation is
 // complete, so its header wait is also the model's total generation budget.
 const UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(5 * 60);

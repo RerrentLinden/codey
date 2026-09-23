@@ -214,9 +214,14 @@ pub(crate) fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<St
 }
 
 /// 部分第三方 thinking 模式要求把上一轮的 reasoning 明文原样回传，请求缺少
-/// 明文字段时上游拒绝整条请求。识别该错误后由调用方补齐占位明文再重发一次。
+/// 明文字段时上游拒绝整条请求。DeepSeek 的说法是 `reasoning_content_missing`
+/// 或 “reasoning content”，另一些网关写 `reasoning_text`。识别后由调用方补齐
+/// 占位明文再重发一次。
 pub(crate) fn requires_reasoning_text_fallback(body: &[u8]) -> bool {
-    String::from_utf8_lossy(body).contains("reasoning_text")
+    let text = String::from_utf8_lossy(body);
+    text.contains("reasoning_text")
+        || text.contains("reasoning_content")
+        || text.contains("reasoning content")
 }
 
 /// 上游非 2xx 错误正文读取超时：与压缩路径一致返回结构化 504，而不是让

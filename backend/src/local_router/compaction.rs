@@ -95,20 +95,26 @@ pub(crate) const MISSING_REASONING_TEXT_PLACEHOLDER: &str = "(thinking unavailab
 
 /// 部分第三方 thinking 模式（DeepSeek 等）要求把上一轮的 reasoning 明文原样
 /// 回传，而 Codex 回放历史时会省略 reasoning 项的明文 content，只保留
-/// encrypted_content，上游因此拒绝整条请求。这里给缺少明文的 reasoning 项补一段
-/// 占位文本；已有明文的项保持原始字节不变。
+/// encrypted_content。切换线路时这些密文项会被去掉。这里给缺少明文的
+/// reasoning 项补占位文本；已经没有 reasoning 项的助手回合补回一项。
+/// Chat Completions 则给缺少 `reasoning_content` 的助手消息补上同一段占位。
+/// 已有明文的项保持原始字节不变。
 pub(crate) fn fill_missing_reasoning_text(body: &mut Value) -> bool {
-    match body.get_mut("input") {
-        Some(Value::Array(items)) => {
-            let mut changed = false;
-            for item in items {
-                changed |= fill_reasoning_item_text(item);
+    if let Some(input) = body.get_mut("input") {
+        return match input {
+            Value::Array(items) => {
+                let mut changed = false;
+                for item in items.iter_mut() {
+                    changed |= fill_reasoning_item_text(item);
+                }
+                changed |= insert_missing_reasoning_items(items);
+                changed
             }
-            changed
-        }
-        Some(item @ Value::Object(_)) => fill_reasoning_item_text(item),
-        _ => false,
+            item @ Value::Object(_) => fill_reasoning_item_text(item),
+            _ => false,
+        };
     }
+    fill_missing_chat_reasoning_content(body)
 }
 
 fn fill_reasoning_item_text(item: &mut Value) -> bool {
@@ -154,6 +160,104 @@ fn fill_reasoning_item_text(item: &mut Value) -> bool {
 
 fn reasoning_text_placeholder() -> Value {
     json!({"type":"reasoning_text","text":MISSING_REASONING_TEXT_PLACEHOLDER})
+}
+
+fn placeholder_reasoning_item() -> Value {
+    json!({
+        "type": "reasoning",
+        "summary": [],
+        "content": [reasoning_text_placeholder()],
+    })
+}
+
+/// 切模型后 reasoning 项已被删除。每个助手回合开头补一项占位，供思考模式回传。
+/// 同一回合里的工具调用和工具结果保持在一起，不在结果后面再插一条推理。
+fn insert_missing_reasoning_items(items: &mut Vec<Value>) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+    while index < items.len() {
+        if !is_assistant_side_item(&items[index]) {
+            index += 1;
+            continue;
+        }
+        let mut end = index;
+        while end < items.len() && !is_user_turn_boundary(&items[end]) {
+            end += 1;
+        }
+        if items[index..end].iter().any(reasoning_item_has_text) {
+            index = end;
+            continue;
+        }
+        items.insert(index, placeholder_reasoning_item());
+        changed = true;
+        index = end + 1;
+    }
+    changed
+}
+
+fn is_user_turn_boundary(item: &Value) -> bool {
+    matches!(
+        item.get("role").and_then(Value::as_str),
+        Some("user" | "system" | "developer")
+    )
+}
+
+fn is_assistant_side_item(item: &Value) -> bool {
+    let item_type = item.get("type").and_then(Value::as_str);
+    let role = item.get("role").and_then(Value::as_str);
+    match item_type {
+        Some(
+            "reasoning" | "function_call" | "custom_tool_call" | "tool_search_call"
+            | "web_search_call",
+        ) => true,
+        Some("message") => role == Some("assistant"),
+        Some(
+            "function_call_output"
+            | "custom_tool_call_output"
+            | "tool_search_output"
+            | "compaction",
+        ) => false,
+        _ => role == Some("assistant"),
+    }
+}
+
+fn reasoning_item_has_text(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return false;
+    }
+    match item.get("content") {
+        Some(Value::Array(parts)) => parts.iter().any(reasoning_part_has_text),
+        Some(part @ Value::Object(_)) => reasoning_part_has_text(part),
+        _ => false,
+    }
+}
+
+fn fill_missing_chat_reasoning_content(body: &mut Value) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+        {
+            continue;
+        }
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "reasoning_content".to_string(),
+            Value::String(MISSING_REASONING_TEXT_PLACEHOLDER.to_string()),
+        );
+        changed = true;
+    }
+    changed
 }
 
 fn reasoning_part_has_text(part: &Value) -> bool {
@@ -523,6 +627,70 @@ mod tests {
         let original = plain.clone();
         assert!(!fill_missing_reasoning_text(&mut plain));
         assert_eq!(plain, original);
+    }
+
+    #[test]
+    fn stripped_assistant_turn_gets_a_reasoning_placeholder() {
+        let mut body = json!({
+            "input":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看文件"}]},
+                {"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call-1","output":"done"},
+                {"type":"function_call","call_id":"call-2","name":"lookup","arguments":"{}"},
+                {"role":"user","content":[{"type":"input_text","text":"继续"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"第二轮"}]}
+            ]
+        });
+        assert!(fill_missing_reasoning_text(&mut body));
+        assert_eq!(body["input"][0]["type"], "reasoning");
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([{"type":"reasoning_text","text":MISSING_REASONING_TEXT_PLACEHOLDER}])
+        );
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][4]["type"], "function_call");
+        assert_eq!(body["input"][6]["type"], "reasoning");
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            2
+        );
+        assert!(!fill_missing_reasoning_text(&mut body));
+
+        let error = br#"{"error":{"message":"{\"code\":11155,\"msg\":\"the reasoning content from the previous turn must be passed back in thinking mode\",\"extError\":{\"code\":\"reasoning_content_missing\"}}","type":"invalid_request_error"}}"#;
+        assert!(requires_reasoning_text_fallback(error));
+        assert!(!requires_reasoning_text_fallback(
+            br#"{"error":{"message":"quota exceeded"}}"#
+        ));
+    }
+
+    #[test]
+    fn chat_assistant_messages_get_reasoning_content_placeholder() {
+        let mut body = json!({
+            "messages":[
+                {"role":"user","content":"继续"},
+                {"role":"assistant","content":"先看文件"},
+                {"role":"assistant","content":"已有推理","reasoning_content":"真实明文"},
+                {"role":"assistant","content":"空白","reasoning_content":"  "}
+            ]
+        });
+        assert!(fill_missing_reasoning_text(&mut body));
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            MISSING_REASONING_TEXT_PLACEHOLDER
+        );
+        assert_eq!(body["messages"][2]["reasoning_content"], "真实明文");
+        assert_eq!(
+            body["messages"][3]["reasoning_content"],
+            MISSING_REASONING_TEXT_PLACEHOLDER
+        );
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+        assert!(!fill_missing_reasoning_text(&mut body));
     }
 
     #[test]
