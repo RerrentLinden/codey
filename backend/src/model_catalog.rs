@@ -629,6 +629,9 @@ fn render_catalog_for_provider(
     }
     for model in &mut catalog_models {
         prepare_cached_context_window(model);
+        // Codex 只发送模型目录里声明过的思考强度。目录没有 ultra 时，界面仍能
+        // 选中它，请求会被静默改成该模型的默认档（luna 是 medium）。
+        ensure_forwarded_ultra_level(model);
     }
     // Third-party routes still fail closed when their template lacks runtime
     // fields. Official-only catalogs never drop incompatible slugs above, so
@@ -713,7 +716,9 @@ pub fn selection_state_with_manual_models(
         official_entries
             .iter()
             .filter_map(|model| {
-                let supported_reasoning_efforts = reasoning_efforts_from_value(model);
+                let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+                let supported_reasoning_efforts =
+                    with_forwarded_ultra(slug, reasoning_efforts_from_value(model));
                 let default_reasoning_effort =
                     default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
                 let model = official_model_from_value(model)?;
@@ -1759,7 +1764,43 @@ fn third_party_reasoning_efforts_from_value(model: &Value) -> Vec<String> {
             efforts.push(effort);
         }
     }
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+    with_forwarded_ultra(slug, efforts)
+}
+
+/// Luna 的上游目录停在 max，但桌面档位选择器仍提供 ultra。不补上这一档时，
+/// 客户端会把选中的 ultra 退回默认强度。
+fn forwards_ultra_despite_template(slug: &str) -> bool {
+    let slug = route_scoped_upstream_model_id(slug);
+    model_id::equal(slug, "gpt-6-luna") || model_id::equal(slug, "gpt-5.6-luna")
+}
+
+fn with_forwarded_ultra(slug: &str, mut efforts: Vec<String>) -> Vec<String> {
+    if forwards_ultra_despite_template(slug)
+        && efforts.iter().any(|effort| effort == "max")
+        && !efforts.iter().any(|effort| effort == "ultra")
+    {
+        efforts.push("ultra".to_string());
+    }
     efforts
+}
+
+fn ensure_forwarded_ultra_level(model: &mut Value) {
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+    let current = reasoning_efforts_from_value(model);
+    if with_forwarded_ultra(slug, current.clone())
+        .iter()
+        .any(|effort| effort == "ultra")
+        && !current.iter().any(|effort| effort == "ultra")
+        && let Some(levels) = model
+            .get_mut("supported_reasoning_levels")
+            .and_then(Value::as_array_mut)
+    {
+        levels.push(json!({
+            "effort": "ultra",
+            "description": reasoning_level_description("ultra"),
+        }));
+    }
 }
 
 fn third_party_template_supports_ultra(model: &Value) -> bool {
@@ -1769,6 +1810,8 @@ fn third_party_template_supports_ultra(model: &Value) -> bool {
         .is_some_and(|slug| {
             [
                 "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -4293,6 +4336,69 @@ mod tests {
         );
         assert!(astra.get("multi_agent_version").is_none());
         assert!(astra.get("multi_agent_reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn luna_forwards_ultra_even_when_the_template_stops_at_max() {
+        let luna = json!({
+            "slug": "gpt-6-luna",
+            "default_reasoning_level": "medium",
+            "base_instructions": "luna instructions",
+            "supported_reasoning_levels": [
+                {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                {"effort": "xhigh"}, {"effort": "max"}
+            ]
+        });
+        assert_eq!(
+            third_party_reasoning_efforts_from_value(&luna),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert!(!third_party_template_supports_coordination(&luna));
+
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&json!({
+                "codey_account_snapshot": true,
+                "models": [luna.clone()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let route = vec![
+            "codey-official-account-67fa10d5-0cf6-4653-ad8b-34664dde569e/gpt-6-luna".to_string(),
+        ];
+        refresh_for_provider(home.path(), false, Some(&route), &route).unwrap();
+        let catalog = read_catalog_value(&home.path().join(relative_path())).unwrap();
+        let written = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| {
+                model["slug"]
+                    .as_str()
+                    .is_some_and(|slug| slug.ends_with("/gpt-6-luna"))
+            })
+            .unwrap();
+        assert_eq!(
+            reasoning_efforts_from_value(written),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+
+        let state = selection_state(home.path(), true, None, &["gpt-6-luna".into()], None).unwrap();
+        let metadata = state
+            .official_models
+            .iter()
+            .find(|model| model.slug == "gpt-6-luna")
+            .unwrap();
+        assert!(
+            metadata
+                .supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort == "ultra")
+        );
+        assert_eq!(metadata.default_reasoning_effort, "medium");
     }
 
     #[test]
