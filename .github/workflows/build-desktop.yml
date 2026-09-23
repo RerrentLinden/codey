@@ -47,36 +47,18 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release
+          cache-on-failure: true
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: TypeScript check
-        run: pnpm run check
-
-      - name: JavaScript tests
-        run: pnpm run test:js
-
       - name: Build embedded frontend assets
         run: pnpm run vite:build
-
-      - name: Rust tests
-        run: cargo test --workspace --locked
-        env:
-          CODEY_SKIP_OVERLAY_BUILD: "1"
-
-      - name: Rust format
-        run: cargo fmt --all -- --check
-
-      - name: Rust clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        env:
-          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Build unsigned macOS app
         env:
@@ -126,12 +108,15 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
-  windows:
-    name: Windows x64
-    runs-on: windows-latest
-    env:
-      CARGO_PROFILE_RELEASE_LTO: thin
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  macos-check:
+    name: macOS ${{ matrix.arch }} checks
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
 
     steps:
       - name: Checkout Codey
@@ -158,46 +143,6 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Install NSIS
-        shell: pwsh
-        run: |
-          $maxAttempts = 3
-          $installExitCode = 1
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            choco install nsis --yes --no-progress
-            $installExitCode = $LASTEXITCODE
-            if ($installExitCode -eq 0) {
-              break
-            }
-
-            if ($attempt -lt $maxAttempts) {
-              $delaySeconds = 15 * $attempt
-              Write-Warning "Chocolatey failed to install NSIS (attempt $attempt/$maxAttempts, exit code $installExitCode). Retrying in $delaySeconds seconds."
-              Start-Sleep -Seconds $delaySeconds
-            }
-          }
-          if ($installExitCode -ne 0) {
-            throw "Chocolatey failed to install NSIS after $maxAttempts attempts (exit code $installExitCode)."
-          }
-
-          $makensis = @(
-            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-            "${env:ProgramFiles}\NSIS\makensis.exe",
-            "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
-            "${env:ProgramFiles}\NSIS\Bin\makensis.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $makensis) {
-            $command = Get-Command makensis -ErrorAction SilentlyContinue
-            if ($command) {
-              $makensis = $command.Source
-            }
-          }
-          if (-not $makensis) {
-            throw "makensis.exe was not found after installing NSIS"
-          }
-          Split-Path $makensis | Out-File -FilePath $env:GITHUB_PATH -Append
-          "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append
-
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
@@ -222,6 +167,86 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    # 测试和 clippy 在 ci.yml 的 Windows 任务里跑。这里只编 release 并打安装包。
+    env:
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      # rustc 自带 rust-lld。Windows 上它比 MSVC link.exe 快，尤其是 release 链接。
+      RUSTFLAGS: -D warnings -C linker=rust-lld.exe
+
+    steps:
+      - name: Checkout Codey
+        uses: actions/checkout@v4
+
+      - name: Keep Windows Defender off the Cargo directories
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $paths = @(
+            (Join-Path $env:GITHUB_WORKSPACE "target"),
+            (Join-Path $env:USERPROFILE ".cargo")
+          )
+          foreach ($path in $paths) {
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+            Add-MpPreference -ExclusionPath $path
+          }
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.5.2"
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+          cache-on-failure: true
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "3.11"
+          $expectedHash = "c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1"
+          $zip = Join-Path $env:RUNNER_TEMP "nsis-$version.zip"
+          $url = "https://github.com/tauri-apps/binary-releases/releases/download/nsis-$version/nsis-$version.zip"
+          curl.exe -fL --retry 3 --retry-all-errors -o $zip $url
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to download NSIS $version"
+          }
+          $actualHash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "NSIS archive hash mismatch. Expected $expectedHash, got $actualHash."
+          }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $nsisHome = Join-Path $env:RUNNER_TEMP "nsis-$version"
+          $makensis = Join-Path $nsisHome "Bin" "makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            throw "makensis.exe was not found at $makensis"
+          }
+          "NSISDIR=$nsisHome" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
 
       - name: Build Windows executable
         env:
@@ -299,6 +324,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - macos
+      - macos-check
       - windows
     runs-on: macos-14
     env:

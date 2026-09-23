@@ -25,7 +25,15 @@ if (process.env.CODEY_SKIP_OVERLAY_BUILD === "1") {
 
 const cargo = spawnSync(
   "cargo",
-  ["build", "--release", "--manifest-path", join(root, "Cargo.toml")],
+  [
+    "build",
+    "--release",
+    "-p",
+    "codey",
+    "--bins",
+    "--manifest-path",
+    join(root, "Cargo.toml"),
+  ],
   {
     cwd: root,
     stdio: "inherit",
