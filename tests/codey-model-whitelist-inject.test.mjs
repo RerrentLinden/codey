@@ -3062,6 +3062,69 @@ test("model picker menu groups models under route headings without changing mode
   runtime.patch.dispose();
 });
 
+test("historical route aliases keep the route short name after that model leaves the catalog", async () => {
+  const provider = "codey-official-account-d3265a21-a59f-40c8-a05a-5b4e03231c22";
+  const encodedProvider = "my%20route";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: [`${provider}/gpt-6-luna`, `${encodedProvider}/gpt-5.6-sol`],
+    default_model: `${provider}/gpt-6-luna`,
+    model_metadata: [
+      {
+        model: `${provider}/gpt-6-luna`,
+        display_name: "[官1] gpt-6-luna",
+        route_name: "官方账号1",
+        route_prefix: "官1",
+        provider_id: "openai",
+        route_provider_id: provider,
+        source_model: "gpt-6-luna",
+        upstream_model: "gpt-6-luna",
+        model_display_name: "gpt-6-luna",
+      },
+      {
+        model: `${encodedProvider}/gpt-5.6-sol`,
+        display_name: "[测] gpt-5.6-sol",
+        route_name: "我的线路",
+        route_prefix: "测",
+        provider_id: "openai",
+        route_provider_id: "my route",
+        source_model: "gpt-5.6-sol",
+        upstream_model: "gpt-5.6-sol",
+        model_display_name: "gpt-5.6-sol",
+      },
+    ],
+    legacy_model_aliases: {
+      "retired-route/gpt-5.5": "gpt-5.5",
+    },
+  }, [statsigClient()]);
+
+  assert.equal(
+    runtime.patch.presentModel(`${provider}/gpt-6-luna`).displayName,
+    "[官1] gpt-6-luna",
+  );
+  assert.equal(
+    runtime.patch.presentModel(`${provider}/gpt-5.6-luna`).displayName,
+    "[官1] gpt-5.6-luna",
+  );
+  assert.equal(
+    runtime.patch.presentModel(`${encodedProvider}/gpt-5.6-luna`).displayName,
+    "[测] gpt-5.6-luna",
+  );
+  assert.equal(
+    runtime.patch.presentModel("codey-official-account-missing/gpt-5.6-sol").displayName,
+    "gpt-5.6-sol",
+  );
+  assert.equal(
+    runtime.patch.presentModel("retired-route/gpt-5.5").displayName,
+    "gpt-5.5",
+  );
+  assert.equal(
+    runtime.patch.presentModel("vendor/custom-model").displayName,
+    "vendor/custom-model",
+  );
+  runtime.patch.dispose();
+});
+
 test("an open model picker hides a route row removed by a hot catalog update", async () => {
   const body = new FakeElementCore("body", { connected: true });
   const menu = body.appendChild(new FakeElementCore("div", {
