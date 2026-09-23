@@ -112,7 +112,6 @@ impl WebSocketResponsesDownstream {
             request_body_budget,
             config_changes,
             idle_registry,
-            subagent_turn_states: Arc::new(Mutex::new(SubagentTurnStateCache::default())),
         }
     }
 
@@ -400,7 +399,6 @@ impl WebSocketResponsesDownstream {
             self.upstream.take();
         }
         normalize_native_responses_context(body, discard_opaque_reasoning);
-        let mut handshake_turn_state = None;
         let mut upstream = if let Some(cached) = self.upstream.take() {
             cached
         } else {
@@ -417,8 +415,7 @@ impl WebSocketResponsesDownstream {
                 ))
                 .await?
             {
-                Ok(connected) => {
-                    handshake_turn_state = connected.turn_state;
+                Ok(socket) => {
                     self.websocket_backoffs
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -430,7 +427,7 @@ impl WebSocketResponsesDownstream {
                         response_ids: VecDeque::new(),
                         config_identity: route.websocket_config,
                         liveness: UpstreamWebSocketLiveness::new(Instant::now()),
-                        socket: connected.socket,
+                        socket,
                     }
                 }
                 Err(error) => {
@@ -484,8 +481,6 @@ impl WebSocketResponsesDownstream {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        // 握手和 metadata 里的票据先挂起，这条线程调用成功后才更新续接票据。
-        let mut pending_turn_state = handshake_turn_state;
         let message_body = body
             .as_object_mut()
             .context("Responses WebSocket 上游请求必须是 JSON 对象")?;
@@ -588,9 +583,6 @@ impl WebSocketResponsesDownstream {
                         };
                     let mut raw_json_text = raw_json_text;
                     for mut event in events {
-                        if let Some(state) = turn_state_from_metadata_event(&event) {
-                            pending_turn_state = Some(state.to_string());
-                        }
                         if responses_event_is_failure(&event) {
                             if let Some(probe) = probe {
                                 let original = raw_json_text
@@ -659,16 +651,6 @@ impl WebSocketResponsesDownstream {
                             probe.mark_first_downstream_content();
                         }
                         if terminal {
-                            if event.get("type").and_then(Value::as_str)
-                                == Some("response.completed")
-                                && let Some(state) = pending_turn_state.as_deref()
-                            {
-                                remember_observed_turn_state(
-                                    &self.subagent_turn_states,
-                                    headers,
-                                    state,
-                                );
-                            }
                             let successful_backoff_key = UpstreamWebSocketBackoffKey::for_route(
                                 route,
                                 upstream_url,
@@ -917,16 +899,11 @@ pub(crate) fn upstream_websocket_request(
     Ok(request)
 }
 
-pub(crate) struct UpstreamWebSocketConnection {
-    pub(crate) socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    pub(crate) turn_state: Option<String>,
-}
-
 pub(crate) async fn connect_upstream_responses_websocket(
     url: &str,
     headers: &HeaderMap,
     probe: Option<&RouteRequestLogProbe>,
-) -> Result<UpstreamWebSocketConnection> {
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let request = upstream_websocket_request(url, headers)?;
     if let Some(probe) = probe {
         probe.set_upstream_request_headers(&super::responses::format_upstream_headers(
@@ -957,8 +934,7 @@ pub(crate) async fn connect_upstream_responses_websocket(
             response.headers(),
         ));
     }
-    let turn_state = turn_state_from_headers(response.headers());
-    Ok(UpstreamWebSocketConnection { socket, turn_state })
+    Ok(socket)
 }
 
 pub(crate) fn upstream_websocket_endpoint_is_unsupported(error: &anyhow::Error) -> bool {
