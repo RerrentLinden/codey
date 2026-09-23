@@ -146,13 +146,13 @@ function ModelPickerDialogComponent({
     return models;
   }, [modelState.officialModelIds, modelState.officialModels]);
   const filteredOfficialModels = useMemo(() => {
-    if (!open) return [];
+    if (!open || !officialOnly) return [];
     const query = customModelInput.trim().toLowerCase();
     if (!query) return officialModelCatalog.map((entry) => entry.model);
     return officialModelCatalog.flatMap((entry) => (
       entry.haystack.includes(query) ? [entry.model] : []
     ));
-  }, [customModelInput, officialModelCatalog, open]);
+  }, [customModelInput, officialModelCatalog, officialOnly, open]);
   const matchingModels = useMemo(
     () => [
       ...filteredOfficialModels.map((model) => model.slug),

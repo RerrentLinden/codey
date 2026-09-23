@@ -95,7 +95,7 @@ function thirdPartyRouteModelState(
   ]);
   return {
     officialModels: [],
-    officialModelIds: catalog.officialModelIds,
+    officialModelIds: [],
     thirdPartyModels: selectedModels,
     thirdPartyModelMetadata: catalog.thirdPartyModelMetadata,
     manualThirdPartyModels:
@@ -559,7 +559,7 @@ export function App({
             session,
             result.providerStatus.provider.official
               ? result.modelState
-              : { ...result.modelState, officialModels: [] },
+              : { ...result.modelState, officialModels: [], officialModelIds: [] },
             "",
             result.providerStatus.provider.official ? null : result.providerStatus.provider.id,
           );
@@ -576,7 +576,7 @@ export function App({
         if (nativeMode) {
           completeModelPickerLoad(
             session,
-            provider?.official ? modelState : { ...modelState, officialModels: [] },
+            provider?.official ? modelState : { ...modelState, officialModels: [], officialModelIds: [] },
             `自动同步失败：${errorText(error)}。请重试以读取当前账号可用模型。`,
             provider?.official ? null : provider?.id ?? null,
           );
@@ -775,7 +775,7 @@ export function App({
           session,
           savedRoute.authMode === "officialAccount"
             ? result.routeModelState
-            : { ...result.routeModelState, officialModels: [] },
+            : { ...result.routeModelState, officialModels: [], officialModelIds: [] },
           "",
           savedRoute.id,
           result.config.profiles.find((profile) => profile.id === savedRoute.id)
