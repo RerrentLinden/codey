@@ -367,7 +367,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "codey"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "codey-codex-extensions"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "anyhow",
  "base64",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-core"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "anyhow",
  "directories",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-data"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "anyhow",
  "base64",
@@ -2090,9 +2090,9 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "9.1.0"
+version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
+checksum = "f95f6259ebd0640685b7cd26d635861f39208df0f89b2b61ff5cf76310fa54f6"
 dependencies = [
  "indexmap",
  "nix",
