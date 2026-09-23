@@ -1388,16 +1388,15 @@ impl CodeyConfig {
         let synchronized_models = self
             .upstream_models_by_provider
             .iter()
-            .filter_map(|(provider_id, models)| {
-                (!models.is_empty()).then(|| {
-                    (
-                        provider_id.clone(),
-                        models
-                            .iter()
-                            .map(|model| model_id::key(model))
-                            .collect::<BTreeSet<_>>(),
-                    )
-                })
+            .filter(|(_, models)| !models.is_empty())
+            .map(|(provider_id, models)| {
+                (
+                    provider_id.clone(),
+                    models
+                        .iter()
+                        .map(|model| model_id::key(model))
+                        .collect::<BTreeSet<_>>(),
+                )
             })
             .collect::<BTreeMap<_, _>>();
         self.selected_models_by_provider
