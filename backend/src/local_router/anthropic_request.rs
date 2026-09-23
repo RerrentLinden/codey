@@ -515,3 +515,98 @@ pub(crate) fn responses_text_format_to_chat_response_format(format: &Value) -> R
         None => anyhow::bail!("text.format 缺少 type"),
     }
 }
+
+const ANTHROPIC_CONTEXT_1M_MARKER: &[u8] = b"[1m]";
+const ANTHROPIC_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+
+/// Claude 客户端用模型名末尾的 `[1m]` 表示百万上下文。Anthropic 不接受这个
+/// 标记，发送前去掉；调用方再补 context-1m beta。没有标记或去掉后为空则不动。
+pub(crate) fn strip_anthropic_context_1m_model_field(body: &mut Value) -> bool {
+    let Some(stripped) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(strip_anthropic_context_1m_model)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    let Some(body) = body.as_object_mut() else {
+        return false;
+    };
+    body.insert("model".to_string(), Value::String(stripped));
+    true
+}
+
+pub(crate) fn strip_anthropic_context_1m_model(model: &str) -> Option<&str> {
+    let trimmed = model.trim_end();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < ANTHROPIC_CONTEXT_1M_MARKER.len()
+        || !bytes[bytes.len() - ANTHROPIC_CONTEXT_1M_MARKER.len()..]
+            .eq_ignore_ascii_case(ANTHROPIC_CONTEXT_1M_MARKER)
+    {
+        return None;
+    }
+    let stripped = trimmed[..trimmed.len() - ANTHROPIC_CONTEXT_1M_MARKER.len()].trim_end();
+    (!stripped.is_empty()).then_some(stripped)
+}
+
+pub(crate) fn ensure_anthropic_context_1m_beta(headers: &mut HeaderMap) {
+    let name = HeaderName::from_static("anthropic-beta");
+    let Some(existing) = headers.get(&name).and_then(|value| value.to_str().ok()) else {
+        headers.insert(name, HeaderValue::from_static(ANTHROPIC_CONTEXT_1M_BETA));
+        return;
+    };
+    if existing
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case(ANTHROPIC_CONTEXT_1M_BETA))
+    {
+        return;
+    }
+    let value = if existing.trim().is_empty() {
+        ANTHROPIC_CONTEXT_1M_BETA.to_string()
+    } else {
+        format!("{existing}, {ANTHROPIC_CONTEXT_1M_BETA}")
+    };
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(name, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_model_strips_only_the_bracket_context_marker() {
+        let mut body = json!({"model": "claude-sonnet-4-5[1m] "});
+        assert!(strip_anthropic_context_1m_model_field(&mut body));
+        assert_eq!(body["model"], "claude-sonnet-4-5");
+        assert!(!strip_anthropic_context_1m_model_field(&mut body));
+        assert!(strip_anthropic_context_1m_model("claude-opus-4-6-1m").is_none());
+        assert!(strip_anthropic_context_1m_model("[1m]").is_none());
+        assert_eq!(
+            strip_anthropic_context_1m_model("claude-fable-5[1M]"),
+            Some("claude-fable-5")
+        );
+    }
+
+    #[test]
+    fn anthropic_context_1m_beta_is_appended_once() {
+        let mut headers = HeaderMap::new();
+        ensure_anthropic_context_1m_beta(&mut headers);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            "context-1m-2025-08-07"
+        );
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        ensure_anthropic_context_1m_beta(&mut headers);
+        ensure_anthropic_context_1m_beta(&mut headers);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            "prompt-caching-2024-07-31, context-1m-2025-08-07"
+        );
+    }
+}

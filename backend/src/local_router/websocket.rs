@@ -399,6 +399,17 @@ impl WebSocketResponsesDownstream {
             self.upstream.take();
         }
         normalize_native_responses_context(body, discard_opaque_reasoning);
+        if route.upstream_url.as_ref().is_ok_and(|url| {
+            should_replay_reasoning_text(
+                route.official_account,
+                ProtocolBridge::NativeResponses,
+                ResponsesRequestKind::Create,
+                is_compaction_request(body, ResponsesRequestKind::Create),
+                url,
+            )
+        }) {
+            restore_reasoning_text_from_summary(body);
+        }
         let mut upstream = if let Some(cached) = self.upstream.take() {
             cached
         } else {

@@ -515,15 +515,11 @@ impl RouterServer {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let binding_keys = request_binding_keys(&request);
-        let bound_route = self
-            .bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .route_for_keys(&binding_keys);
-        let route = match snapshot
-            .target_for_auxiliary_request(route_hint.as_deref(), bound_route.as_deref())
-        {
+        let image_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let route = match snapshot.route_for_image_request(image_model, route_hint.as_deref()) {
             Ok(route) => route,
             Err(error) => {
                 mark_error(404, "route_not_enabled");
@@ -1742,6 +1738,21 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        // Codex Desktop 的工具 schema 会把 `$ref` 和 description/type 写在同一层。
+        // Moonshot、Kimi 的 Chat Completions 拒绝这种写法，收进 allOf 后语义不变。
+        if bridge == ProtocolBridge::ResponsesToChatCompletions
+            && upstream_rejects_ref_sibling_keywords(upstream_url)
+            && wrap_chat_tool_ref_siblings(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        let anthropic_context_1m = bridge == ProtocolBridge::ResponsesToAnthropicMessages
+            && strip_anthropic_context_1m_model_field(&mut upstream_body);
+        if anthropic_context_1m {
+            body_mutated = true;
+            encoded_body = None;
+        }
         let mut headers = match self
             .prepare_upstream_request_headers(&request, &resolved.route)
             .await
@@ -1757,6 +1768,13 @@ impl RouterServer {
         // 请求体的模型名已还原为上游模型名，路由提示头里的模型名必须保持一致；
         // HTTP、WebSocket 握手和压缩请求共用这份头。
         align_routing_hint_model(&mut headers, &resolved.upstream_model);
+        if anthropic_context_1m {
+            if let Some(model) = upstream_body.get("model").and_then(Value::as_str) {
+                let model = model.to_string();
+                align_routing_hint_model(&mut headers, &model);
+            }
+            ensure_anthropic_context_1m_beta(&mut headers);
+        }
         // Commit the new binding only after the request's route compatibility,
         // payload conversion, and credentials have passed local checks. A
         // rejected switch must leave the prior route available for a retry.
@@ -1889,6 +1907,18 @@ impl RouterServer {
                 encoded_body = None;
             }
         }
+        if should_replay_reasoning_text(
+            resolved.route.official_account,
+            bridge,
+            request_kind,
+            compacting,
+            upstream_url,
+        )
+            && restore_reasoning_text_from_summary(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
         let upstream_stream_requested = upstream_body
             .get("stream")
             .and_then(Value::as_bool)
@@ -1911,9 +1941,9 @@ impl RouterServer {
             }
         };
         // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
-        // 回放历史时只保留加密字段。首次仍按原样发送，只有上游明确报出
-        // reasoning 明文缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
-        // 不参与该回退。
+        // 回放历史时只保留加密字段。DeepSeek 官方地址在首次发送前还原已有摘要。
+        // 其它线路仍先按原样发送，只有上游明确报出明文缺失时才回填：有摘要用摘要，
+        // 没有摘要才补占位。官方线路沿用加密推理语义，不参与该回退。
         let reasoning_text_retry_allowed = matches!(
             bridge,
             ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions

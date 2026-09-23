@@ -23,6 +23,66 @@ fn request_log_catalog_exposes_login_status_independently_of_profiles() {
 }
 
 #[test]
+fn image_request_uses_the_model_route_instead_of_a_conversation_binding() {
+    let mut chat = ProviderProfile::new("Chat");
+    chat.id = "chat".into();
+    chat.base_url = "https://chat.example/v1".into();
+    chat.api_key = "sk-chat".into();
+    chat.normalize();
+    let mut images = ProviderProfile::new("Images");
+    images.id = "images".into();
+    images.base_url = "https://images.example/v1".into();
+    images.api_key = "sk-images".into();
+    images.normalize();
+    let chat_id = chat.provider_id().to_string();
+    let images_id = images.provider_id().to_string();
+    let mut config = CodeyConfig {
+        profiles: vec![chat, images],
+        default_model: model_alias(&chat_id, "provider-model"),
+        ..CodeyConfig::default()
+    };
+    config
+        .selected_models_by_provider
+        .insert(chat_id.clone(), vec!["provider-model".into()]);
+    config
+        .selected_models_by_provider
+        .insert(images_id.clone(), vec!["gpt-image-2".into()]);
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert_eq!(
+        snapshot
+            .route_for_image_request("gpt-image-2", None)
+            .unwrap()
+            .provider_id,
+        images_id
+    );
+    assert_eq!(
+        snapshot
+            .route_for_image_request("unknown-image", None)
+            .unwrap()
+            .provider_id,
+        chat_id
+    );
+    assert_eq!(
+        snapshot
+            .route_for_image_request("gpt-image-2", Some(&chat_id))
+            .unwrap()
+            .provider_id,
+        chat_id
+    );
+    config
+        .selected_models_by_provider
+        .get_mut(&chat_id)
+        .unwrap()
+        .push("gpt-image-2".into());
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert!(
+        snapshot
+            .route_for_image_request("gpt-image-2", None)
+            .is_err()
+    );
+}
+
+#[test]
 fn disabled_route_has_no_request_target() {
     let mut route = ProviderProfile::new("Disabled");
     route.id = "disabled".into();
@@ -8686,16 +8746,16 @@ async fn model_switch_from_chat_to_native_expands_synthetic_history_in_order() {
     let sent = upstream_task.await.unwrap();
     assert!(sent.get("previous_response_id").is_none());
     assert_eq!(sent["input"][0], "original task");
-    assert_eq!(sent["input"][1]["role"], "assistant");
-    assert_eq!(sent["input"][1]["content"][0]["text"], "remembered answer");
-    assert_eq!(sent["input"][2], "continue");
-    assert!(
-        sent["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| { item.get("type").and_then(Value::as_str) != Some("reasoning") })
+    assert_eq!(sent["input"][1]["type"], "reasoning");
+    assert!(sent["input"][1].get("encrypted_content").is_none());
+    assert_eq!(sent["input"][1]["content"], json!([]));
+    assert_eq!(
+        sent["input"][1]["summary"][0]["text"],
+        "private bridge reasoning"
     );
+    assert_eq!(sent["input"][2]["role"], "assistant");
+    assert_eq!(sent["input"][2]["content"][0]["text"], "remembered answer");
+    assert_eq!(sent["input"][3], "continue");
     socket.close(None).await.unwrap();
     router.stop().await.unwrap();
 }

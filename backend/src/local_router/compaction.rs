@@ -84,10 +84,54 @@ pub(crate) fn normalize_native_responses_context(
 ) -> bool {
     let mut changed = normalize_encrypted_agent_payloads(body);
     // 同一线路必须原样回传 reasoning，包括第三方 thinking 模式需要的明文内容。
+    // 换线路时只去掉上一供应商的密文，可见摘要改成官方可接受的 summary。
     if discard_opaque_reasoning {
-        changed |= discard_reasoning_history(body);
+        changed |= port_reasoning_history(body);
     }
     changed
+}
+
+/// DeepSeek 官方 Responses 要求回放 `reasoning_text`。其它地址保持原请求，
+/// 等上游明确拒绝后再走同线路补明文。
+pub(crate) fn upstream_replays_reasoning_text(upstream_url: &str) -> bool {
+    let host = reqwest::Url::parse(upstream_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| {
+            upstream_url
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_start_matches("wss://")
+                .trim_start_matches("ws://")
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default()
+                .split('@')
+                .next_back()
+                .unwrap_or_default()
+                .to_string()
+        });
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let host = host.split(':').next().unwrap_or(host.as_str());
+    host == "deepseek.com" || host.ends_with(".deepseek.com")
+}
+
+pub(crate) fn should_replay_reasoning_text(
+    official_account: bool,
+    bridge: ProtocolBridge,
+    request_kind: ResponsesRequestKind,
+    compacting: bool,
+    upstream_url: &str,
+) -> bool {
+    !official_account
+        && !compacting
+        && request_kind == ResponsesRequestKind::Create
+        && matches!(
+            bridge,
+            ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
+        )
+        && upstream_replays_reasoning_text(upstream_url)
 }
 
 // 第三方 thinking 模式只校验 reasoning 明文是否存在，占位文本不影响后续回答。
@@ -95,10 +139,34 @@ pub(crate) const MISSING_REASONING_TEXT_PLACEHOLDER: &str = "(thinking unavailab
 
 /// 部分第三方 thinking 模式（DeepSeek 等）要求把上一轮的 reasoning 明文原样
 /// 回传，而 Codex 回放历史时会省略 reasoning 项的明文 content，只保留
-/// encrypted_content。切换线路时这些密文项会被去掉。这里给缺少明文的
-/// reasoning 项补占位文本；已经没有 reasoning 项的助手回合补回一项。
-/// Chat Completions 则给缺少 `reasoning_content` 的助手消息补上同一段占位。
-/// 已有明文的项保持原始字节不变。
+/// encrypted_content。已有 `summary` 时用摘要原文回填，没有摘要才补占位文本。
+/// 已经没有 reasoning 项的助手回合补回一项占位。Chat Completions 则给缺少
+/// `reasoning_content` 的助手消息补上同一段占位。已有明文的项保持不变。
+/// 首次发往需要回放明文的上游时，只把已有摘要还原进 reasoning 项。
+/// 没有摘要的回合仍留给失败后的占位重试，避免给普通请求补造推理项。
+pub(crate) fn restore_reasoning_text_from_summary(body: &mut Value) -> bool {
+    let Some(input) = body.get_mut("input") else {
+        return false;
+    };
+    match input {
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= restore_reasoning_item_from_summary(item);
+            }
+            changed
+        }
+        item @ Value::Object(_) => restore_reasoning_item_from_summary(item),
+        _ => false,
+    }
+}
+
+fn restore_reasoning_item_from_summary(item: &mut Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && summary_replay_text(item).is_some()
+        && fill_reasoning_item_text(item)
+}
+
 pub(crate) fn fill_missing_reasoning_text(body: &mut Value) -> bool {
     if let Some(input) = body.get_mut("input") {
         return match input {
@@ -121,14 +189,12 @@ fn fill_reasoning_item_text(item: &mut Value) -> bool {
     if item.get("type").and_then(Value::as_str) != Some("reasoning") {
         return false;
     }
+    let replay = reasoning_replay_part(item);
     let Some(object) = item.as_object_mut() else {
         return false;
     };
     if object.get("content").is_none() {
-        object.insert(
-            "content".to_string(),
-            Value::Array(vec![reasoning_text_placeholder()]),
-        );
+        object.insert("content".to_string(), Value::Array(vec![replay]));
         return true;
     }
     let Some(content) = object.get_mut("content") else {
@@ -139,23 +205,31 @@ fn fill_reasoning_item_text(item: &mut Value) -> bool {
             if parts.iter().any(reasoning_part_has_text) {
                 return false;
             }
-            // 空白片段一并清理，只留下占位明文。
+            // 空白片段一并清理，只留下可回放的明文。
             parts.retain(|part| !is_reasoning_text_part(part));
-            parts.push(reasoning_text_placeholder());
+            parts.push(replay);
             true
         }
         Value::Object(_) => {
             if reasoning_part_has_text(content) {
                 return false;
             }
-            *content = reasoning_text_placeholder();
+            *content = replay;
             true
         }
         _ => {
-            *content = Value::Array(vec![reasoning_text_placeholder()]);
+            *content = Value::Array(vec![replay]);
             true
         }
     }
+}
+
+fn reasoning_replay_part(item: &Value) -> Value {
+    json!({
+        "type": "reasoning_text",
+        "text": summary_replay_text(item)
+            .unwrap_or_else(|| MISSING_REASONING_TEXT_PLACEHOLDER.to_string()),
+    })
 }
 
 fn reasoning_text_placeholder() -> Value {
@@ -393,21 +467,143 @@ fn is_codex_encrypted_payload(value: &str) -> bool {
             .is_multiple_of(FERNET_BLOCK_BYTES)
 }
 
-fn discard_reasoning_history(body: &mut Value) -> bool {
+/// 换线路时保留可见推理摘要，去掉上一供应商才能校验的密文和 `reasoning_text`。
+/// 没有任何可见文本的推理项仍然删除。
+fn port_reasoning_history(body: &mut Value) -> bool {
     let Some(input) = body.get_mut("input") else {
         return false;
     };
     match input {
         Value::Array(items) => {
-            let previous_len = items.len();
-            items.retain(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
-            items.len() != previous_len
+            let mut changed = false;
+            items.retain_mut(|item| match port_reasoning_item(item) {
+                ReasoningPort::Keep => true,
+                ReasoningPort::Changed => {
+                    changed = true;
+                    true
+                }
+                ReasoningPort::Drop => {
+                    changed = true;
+                    false
+                }
+            });
+            changed
         }
-        Value::Object(_) if input.get("type").and_then(Value::as_str) == Some("reasoning") => {
-            *input = Value::Array(Vec::new());
-            true
-        }
+        Value::Object(_) => match port_reasoning_item(input) {
+            ReasoningPort::Drop => {
+                *input = Value::Array(Vec::new());
+                true
+            }
+            ReasoningPort::Changed => true,
+            ReasoningPort::Keep => false,
+        },
         _ => false,
+    }
+}
+
+enum ReasoningPort {
+    Keep,
+    Changed,
+    Drop,
+}
+
+fn port_reasoning_item(item: &mut Value) -> ReasoningPort {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return ReasoningPort::Keep;
+    }
+    let content_texts = reasoning_content_texts(item.get("content"));
+    let summary_text = summary_replay_text(item);
+    if summary_text.is_none() && content_texts.is_empty() {
+        return ReasoningPort::Drop;
+    }
+    let had_encrypted = item.get("encrypted_content").is_some();
+    let content_nonempty = item
+        .get("content")
+        .is_some_and(|content| !reasoning_content_is_empty(content));
+    let Some(object) = item.as_object_mut() else {
+        return ReasoningPort::Drop;
+    };
+    let mut changed = false;
+    if had_encrypted {
+        object.remove("encrypted_content");
+        changed = true;
+    }
+    if summary_text.is_none() {
+        object.insert(
+            "summary".to_string(),
+            Value::Array(
+                content_texts
+                    .into_iter()
+                    .map(|text| json!({"type":"summary_text","text":text}))
+                    .collect(),
+            ),
+        );
+        changed = true;
+    }
+    if content_nonempty {
+        object.insert("content".to_string(), Value::Array(Vec::new()));
+        changed = true;
+    }
+    if changed {
+        ReasoningPort::Changed
+    } else {
+        ReasoningPort::Keep
+    }
+}
+
+fn reasoning_content_texts(content: Option<&Value>) -> Vec<String> {
+    match content {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                if !is_reasoning_text_part(part) {
+                    return None;
+                }
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .collect(),
+        Some(part @ Value::Object(_)) if is_reasoning_text_part(part) => part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn reasoning_content_is_empty(content: &Value) -> bool {
+    match content {
+        Value::Array(parts) => parts.is_empty(),
+        Value::Null => true,
+        _ => false,
+    }
+}
+
+fn summary_replay_text(item: &Value) -> Option<String> {
+    let Value::Array(parts) = item.get("summary")? else {
+        return None;
+    };
+    let texts = parts
+        .iter()
+        .filter_map(|part| {
+            let kind = part.get("type").and_then(Value::as_str);
+            if !matches!(kind, Some("summary_text" | "text") | None) {
+                return None;
+            }
+            part.get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
     }
 }
 
@@ -560,17 +756,70 @@ mod tests {
                 assert_eq!(body, original);
 
                 assert!(normalize_native_responses_context(&mut body, true));
+                let portable = json!({
+                    "type":"reasoning",
+                    "id":"rs_provider",
+                    "summary":[{"type":"summary_text","text":"检查工具结果。Next step 🙂"}],
+                    "content":[]
+                });
                 assert_eq!(
                     body["input"],
                     if input.is_array() {
-                        json!([user])
+                        json!([portable, user])
                     } else {
-                        json!([])
+                        portable
                     }
                 );
                 assert!(!normalize_native_responses_context(&mut body, true));
             }
         }
+    }
+
+    #[test]
+    fn route_change_drops_ciphertext_without_visible_reasoning() {
+        let mut body = json!({
+            "input":[
+                {"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"opaque-state"},
+                {"role":"user","content":"continue"}
+            ]
+        });
+        assert!(normalize_native_responses_context(&mut body, true));
+        assert_eq!(body["input"], json!([{"role":"user","content":"continue"}]));
+    }
+
+    #[test]
+    fn reasoning_replay_prefers_summary_text_over_the_placeholder() {
+        let mut body = json!({
+            "input":[{
+                "type":"reasoning",
+                "id":"rs_summary",
+                "summary":[{"type":"summary_text","text":"先看文件，再调用工具"}],
+                "content":[]
+            }]
+        });
+        assert!(fill_missing_reasoning_text(&mut body));
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([{"type":"reasoning_text","text":"先看文件，再调用工具"}])
+        );
+        assert_eq!(
+            body["input"][0]["summary"][0]["text"],
+            "先看文件，再调用工具"
+        );
+    }
+
+    #[test]
+    fn deepseek_hosts_replay_reasoning_text_before_the_first_send() {
+        assert!(upstream_replays_reasoning_text(
+            "https://api.deepseek.com/v1/responses"
+        ));
+        assert!(upstream_replays_reasoning_text("wss://api.deepseek.com/v1"));
+        assert!(!upstream_replays_reasoning_text(
+            "https://relay.example/v1/responses"
+        ));
+        assert!(!upstream_replays_reasoning_text(
+            "https://notdeepseek.com/v1"
+        ));
     }
 
     #[test]
