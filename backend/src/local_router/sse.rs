@@ -215,18 +215,33 @@ pub(crate) fn take_next_sse_frame<'a>(
             cursor.scanned = BOM.len();
         }
     }
-    for index in cursor.scanned..buffer.len() {
-        let length = if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
-            4
-        } else if buffer.get(index..index + 2) == Some(b"\n\n") {
-            2
-        } else {
-            continue;
+    // One SIMD scan for the next newline. `\n\n` and `\r\n\r\n` are the only
+    // frame delimiters, and the latter does not contain the former.
+    let mut index = cursor.scanned;
+    while index < buffer.len() {
+        let Some(relative) = memchr::memchr(b'\n', &buffer[index..]) else {
+            break;
         };
-        let frame = &buffer[cursor.consumed..index];
-        cursor.consumed = index + length;
-        cursor.scanned = cursor.consumed;
-        return Some(frame);
+        let newline = index + relative;
+        if buffer.get(newline + 1) == Some(&b'\n') {
+            let frame = &buffer[cursor.consumed..newline];
+            cursor.consumed = newline + 2;
+            cursor.scanned = cursor.consumed;
+            return Some(frame);
+        }
+        if newline > 0
+            && buffer[newline - 1] == b'\r'
+            && buffer.get(newline + 1..newline + 3) == Some(b"\r\n")
+        {
+            let start = newline - 1;
+            if start >= cursor.consumed {
+                let frame = &buffer[cursor.consumed..start];
+                cursor.consumed = start + 4;
+                cursor.scanned = cursor.consumed;
+                return Some(frame);
+            }
+        }
+        index = newline + 1;
     }
     // Revisit only the suffix that can begin a delimiter split across chunks.
     cursor.scanned = buffer.len().saturating_sub(3).max(cursor.consumed);
@@ -306,5 +321,16 @@ mod tests {
             sse_frame_data(&tail[cursor.consumed..]).unwrap().as_deref(),
             Some("tail")
         );
+    }
+
+    #[test]
+    fn sse_delimiters_keep_the_earlier_frame_boundary() {
+        let input = b"data: one\r\n\r\ndata: two\n\n";
+        let mut cursor = SseCursor::default();
+        let first = take_next_sse_frame(input, &mut cursor).unwrap();
+        assert_eq!(sse_frame_data(first).unwrap().as_deref(), Some("one"));
+        let second = take_next_sse_frame(input, &mut cursor).unwrap();
+        assert_eq!(sse_frame_data(second).unwrap().as_deref(), Some("two"));
+        assert!(take_next_sse_frame(input, &mut cursor).is_none());
     }
 }

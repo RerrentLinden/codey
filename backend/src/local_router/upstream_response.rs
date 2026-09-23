@@ -249,9 +249,10 @@ where
     }
 }
 
-/// Writes one `transfer-encoding: chunked` frame with a single `write_all`.
-/// Emitting the size line, payload and trailing CRLF as three separate writes
-/// produced three small TCP segments for every streamed event.
+/// Writes one chunked frame. The size line, payload and trailing CRLF go out
+/// through a single `writev`, so a streamed event stays one syscall and the
+/// payload is not copied into a second buffer. Separate `write` calls
+/// previously produced three TCP segments per event.
 pub(crate) async fn write_chunked_frame<W>(
     stream: &mut W,
     payload: &[u8],
@@ -260,11 +261,67 @@ pub(crate) async fn write_chunked_frame<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut frame = Vec::with_capacity(payload.len() + 16);
-    frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
-    frame.extend_from_slice(payload);
-    frame.extend_from_slice(b"\r\n");
-    write_all_with_timeout(stream, &frame, operation).await
+    let mut prefix = [0_u8; 18];
+    let prefix_len = encode_chunk_size(&mut prefix, payload.len());
+    let mut bufs = [
+        std::io::IoSlice::new(&prefix[..prefix_len]),
+        std::io::IoSlice::new(payload),
+        std::io::IoSlice::new(b"\r\n"),
+    ];
+    tokio::time::timeout(
+        DOWNSTREAM_WRITE_TIMEOUT,
+        write_vectored_all(stream, &mut bufs),
+    )
+    .await
+    .with_context(|| format!("{operation}超过写入期限"))?
+    .with_context(|| operation)
+    .context(DownstreamClosed)
+}
+
+async fn write_vectored_all<W>(
+    stream: &mut W,
+    bufs: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut bufs = bufs;
+    while bufs.iter().any(|buf| !buf.is_empty()) {
+        let written = stream.write_vectored(bufs).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "写入 chunked 帧时连接已关闭",
+            ));
+        }
+        std::io::IoSlice::advance_slices(&mut bufs, written);
+    }
+    Ok(())
+}
+
+fn encode_chunk_size(prefix: &mut [u8; 18], len: usize) -> usize {
+    let mut hex = [0_u8; 16];
+    let digits = if len == 0 {
+        hex[15] = b'0';
+        1
+    } else {
+        let mut value = len;
+        let mut digits = 0_usize;
+        while value > 0 {
+            let nibble = (value & 0xf) as u8;
+            hex[15 - digits] = match nibble {
+                0..=9 => b'0' + nibble,
+                _ => b'a' + (nibble - 10),
+            };
+            value >>= 4;
+            digits += 1;
+        }
+        digits
+    };
+    prefix[..digits].copy_from_slice(&hex[16 - digits..]);
+    prefix[digits] = b'\r';
+    prefix[digits + 1] = b'\n';
+    digits + 2
 }
 
 pub(crate) async fn write_proxy_response(
@@ -361,3 +418,30 @@ pub(crate) const REQUEST_LOG_USAGE_KEY_BYTES: usize = 64;
 pub(crate) const REQUEST_LOG_METADATA_STRING_BYTES: usize = 256;
 pub(crate) const REQUEST_LOG_USAGE_SCALAR_BYTES: usize = 64;
 pub(crate) const REQUEST_LOG_USAGE_NESTING_DEPTH: usize = 64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_size_uses_lowercase_hex() {
+        for len in [0_usize, 1, 15, 16, 255, 4096, 65535, 1 << 20] {
+            let mut prefix = [0_u8; 18];
+            let size = encode_chunk_size(&mut prefix, len);
+            assert_eq!(&prefix[..size], format!("{len:x}\r\n").as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_frame_keeps_the_single_buffer_bytes() {
+        let payload = b"data: {\"type\":\"response.created\"}\n\n";
+        let mut output = Vec::new();
+        write_chunked_frame(&mut output, payload, "test")
+            .await
+            .unwrap();
+        let mut expected = format!("{:x}\r\n", payload.len()).into_bytes();
+        expected.extend_from_slice(payload);
+        expected.extend_from_slice(b"\r\n");
+        assert_eq!(output, expected);
+    }
+}

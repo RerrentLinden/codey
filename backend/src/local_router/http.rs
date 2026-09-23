@@ -400,7 +400,7 @@ fn shrink_request_body_budget(
 }
 
 pub(crate) fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    memchr::memmem::find(buffer, b"\r\n\r\n")
 }
 
 pub(crate) fn acquire_request_body_budget(
