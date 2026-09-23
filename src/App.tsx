@@ -14,7 +14,7 @@ import {
 } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { rememberOfficialAccounts } from "./officialAccountsRequests";
-import { reconcileConfigDraft } from "./configDraft";
+import { useDraftConfig } from "./useDraftConfig";
 import { ModelPickerDialog } from "./AppDialogs";
 import { SystemSettingsDialog } from "./SystemSettingsDialog";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
@@ -107,22 +107,6 @@ function thirdPartyRouteModelState(
   };
 }
 
-function onlyLocalRouterToggleChanged(current: Config, persisted: Config) {
-  if (current.localRouterEnabled === persisted.localRouterEnabled) return false;
-  const currentKeys = Object.keys(current) as Array<keyof Config>;
-  if (currentKeys.length === Object.keys(persisted).length
-    && currentKeys.every((key) => (
-      key === "localRouterEnabled" || key === "settingsRevision" || Object.is(current[key], persisted[key])
-    ))) {
-    return true;
-  }
-  return JSON.stringify({
-    ...current,
-    localRouterEnabled: persisted.localRouterEnabled,
-    settingsRevision: 0,
-  }) === JSON.stringify({ ...persisted, settingsRevision: 0 });
-}
-
 export function App({
   embedded = false,
   modalContainer,
@@ -132,8 +116,19 @@ export function App({
 }: AppProps) {
   const feedbackGroupQrUrl =
     `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
-  const [config, setConfig] = useState<Config | null>(null);
-  const persistedConfigRef = useRef<Config | null>(null);
+  const {
+    config,
+    setConfig,
+    dirty,
+    setDirty,
+    persistedConfigRef,
+    setPersistedConfig,
+    canSyncCurrentProvider,
+    editConfig,
+    isOnlyNativeRouterToggle,
+    adoptRouteConfig,
+    discardDraft,
+  } = useDraftConfig();
   const { status, setStatus, markRestartInProgress, refreshStatus, refreshStatusForLoad,
     restartStatusError, setRestartStatusError } =
     useRuntimeStatus({
@@ -147,7 +142,6 @@ export function App({
   );
   const [fastContextToolsStatus, setFastContextToolsStatus] =
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
-  const [dirty, setDirty] = useState(false);
   const [usageAnalysisOpen, setUsageAnalysisOpen] = useState(false);
   const settingsScroll = useRef<HTMLDivElement>(null);
   const usageReturn = useRef<{ trigger: HTMLElement; scrollTop: number } | null>(null);
@@ -195,19 +189,6 @@ export function App({
     });
   }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
   const configLoaded = config !== null;
-  const pendingNativeRouterToggle = useMemo(() => Boolean(
-    config &&
-      persistedConfigRef.current &&
-      !config.localRouterEnabled &&
-      onlyLocalRouterToggleChanged(config, persistedConfigRef.current),
-  ), [config]);
-  const canSyncCurrentProvider = !dirty || pendingNativeRouterToggle;
-  const setPersistedConfig = useCallback((next: Config) => {
-    persistedConfigRef.current = next;
-    setConfig(next);
-  }, []);
-  const draftConfigRef = useRef(config);
-  draftConfigRef.current = config;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
       current ? { ...current, subagentOptimization: enabled } : current,
@@ -391,11 +372,6 @@ export function App({
     }
   }
 
-  function editConfig(next: Config) {
-    setConfig(next);
-    setDirty(true);
-  }
-
   function changeAutomaticUpdateChecks(enabled: boolean) {
     if (!config || isBusy) return;
     if (enabled) {
@@ -531,10 +507,7 @@ export function App({
     if (!config || isBusy) return;
     const nativeMode = config?.localRouterEnabled === false;
     const shouldPersistNativeToggle = Boolean(
-      nativeMode &&
-        dirty &&
-        persistedConfigRef.current &&
-        onlyLocalRouterToggleChanged(config, persistedConfigRef.current),
+      nativeMode && dirty && isOnlyNativeRouterToggle(config),
     );
     if (dirty && !shouldPersistNativeToggle) return;
     await runOperation("sync-provider", async () => {
@@ -596,11 +569,8 @@ export function App({
     modelState?: ModelState;
     restartRequired?: boolean;
   }) {
-    const merged = reconcileConfigDraft(persistedConfigRef.current, draftConfigRef.current, result.config);
+    const merged = adoptRouteConfig(result.config);
     if (!merged) return;
-    persistedConfigRef.current = result.config;
-    draftConfigRef.current = merged.config;
-    setConfig(merged.config);
     if (result.providerStatus) setProviderStatus(result.providerStatus);
     if (result.modelState) setModelState(result.modelState);
     if (typeof result.restartRequired === "boolean") {
@@ -955,10 +925,7 @@ export function App({
 
   function closeSettings() {
     if (isBusy) return;
-    if (persistedConfigRef.current) {
-      setConfig(persistedConfigRef.current);
-    }
-    setDirty(false);
+    discardDraft();
     setModelPickerVisible(false);
     setUsageAnalysisOpen(false);
     usageReturn.current = null;

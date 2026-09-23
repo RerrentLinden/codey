@@ -87,6 +87,22 @@ pub(super) struct CachedUpdateCandidate {
     checked_at: Instant,
 }
 
+pub(super) async fn invoke(
+    state: &Arc<AppState>,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    match command {
+        "check_for_updates" => check_for_updates(state).await,
+        "download_update" => download_update(state).await,
+        "update_install_report" => update_install_report(state).await,
+        "install_downloaded_update" => {
+            install_downloaded_update(state, super::string_argument(args, "filePath")?).await
+        }
+        _ => Err(format!("未知 Codey API 命令：{command}")),
+    }
+}
+
 pub async fn check_for_updates(state: &Arc<AppState>) -> Result<Value, String> {
     let candidate = check_for_update_candidate(state).await?;
     serde_json::to_value(candidate.check).map_err(|error| error.to_string())

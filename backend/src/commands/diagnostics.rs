@@ -164,6 +164,22 @@ pub(super) async fn clear_diagnostic_storage(
     }))
 }
 
+pub(super) async fn invoke(
+    state: &Arc<AppState>,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    match command {
+        "clear_diagnostic_storage" => clear_diagnostic_storage(state, args).await,
+        "repair_codex_overlays" => crate::overlay_recovery::repair().await,
+        "repair_codex_config" => super::config_repair::repair_codex_config(state).await,
+        "repair_main_process_injection" => {
+            super::runtime::schedule_main_process_injection_repair(state).await
+        }
+        _ => Err(format!("未知 Codey API 命令：{command}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
