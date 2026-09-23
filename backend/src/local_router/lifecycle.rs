@@ -17,7 +17,7 @@ const HYPER_H1_WRITE_BUFFER_BYTES: usize = 8192 + 4096 * 100;
 pub(super) fn apply_codey_plugin_header_patches(
     headers: &mut HeaderMap,
     patches: Vec<crate::codey_plugins::HeaderPatch>,
-) {
+) -> Result<(), LifecycleError> {
     let parsed = patches
         .into_iter()
         .map(|patch| {
@@ -32,7 +32,15 @@ pub(super) fn apply_codey_plugin_header_patches(
             Some((name, value))
         })
         .collect::<Option<Vec<_>>>();
-    let Some(parsed) = parsed else { return };
+    // 任一补丁无法成为合法 HTTP 头时保持原请求不变。静默跳过会把其他插件
+    // 已经校验过的修改一起丢掉，调用方应终止这次生命周期。
+    let Some(parsed) = parsed else {
+        return Err(LifecycleError {
+            status: 502,
+            code: "plugin_invalid_headers".into(),
+            message: "插件请求生命周期处理失败".into(),
+        });
+    };
     for (name, value) in parsed {
         if let Some(value) = value {
             headers.insert(name, value);
@@ -40,6 +48,7 @@ pub(super) fn apply_codey_plugin_header_patches(
             headers.remove(name);
         }
     }
+    Ok(())
 }
 
 pub(super) fn lifecycle_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -288,7 +297,7 @@ where
         .await??;
         match decision {
             LifecycleDecision::Continue(patches) => {
-                apply_codey_plugin_header_patches(headers, patches)
+                apply_codey_plugin_header_patches(headers, patches)?
             }
             LifecycleDecision::Retry(_) => {
                 return Err(LifecycleError {
@@ -352,7 +361,7 @@ where
                     .into());
                 }
                 drop(result);
-                apply_codey_plugin_header_patches(headers, patches);
+                apply_codey_plugin_header_patches(headers, patches)?;
                 *attempt += 1;
                 if let Some(probe) = downstream.request_log_probe() {
                     probe.mark_fallback("plugin_request_retry");

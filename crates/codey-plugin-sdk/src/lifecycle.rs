@@ -6,6 +6,22 @@ use std::collections::BTreeMap;
 pub const CAPABILITY: &str = "request.lifecycle.v1";
 pub const AUTH_CAPABILITY: &str = "request.lifecycle.auth";
 
+/// 只由宿主在请求生命周期中调用。管理接口必须拒绝这些方法名。
+pub const METHOD_BEFORE_SEND: &str = "request.beforeSend";
+pub const METHOD_AFTER_HEADERS: &str = "request.afterHeaders";
+pub const METHOD_RESUME: &str = "request.resume";
+pub const METHOD_COMPLETED: &str = "request.completed";
+pub const METHOD_FAILED: &str = "request.failed";
+pub const METHOD_CANCELLED: &str = "request.cancelled";
+pub const HOST_METHODS: &[&str] = &[
+    METHOD_BEFORE_SEND,
+    METHOD_AFTER_HEADERS,
+    METHOD_RESUME,
+    METHOD_COMPLETED,
+    METHOD_FAILED,
+    METHOD_CANCELLED,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Stage {
@@ -86,4 +102,24 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HOST_METHODS;
+
+    #[test]
+    fn host_methods_match_the_lifecycle_protocol() {
+        assert_eq!(
+            HOST_METHODS,
+            [
+                "request.beforeSend",
+                "request.afterHeaders",
+                "request.resume",
+                "request.completed",
+                "request.failed",
+                "request.cancelled",
+            ]
+        );
+    }
 }

@@ -1,6 +1,9 @@
 //! 可选的通用请求生命周期。原生回调超时只能停止等待，不能强制终止原生代码。
 use super::{HeaderPatch, Manifest, Native, allowed_header_name, validate_patches};
-use codey_plugin_sdk::lifecycle::{AUTH_CAPABILITY, Action, CAPABILITY};
+use codey_plugin_sdk::lifecycle::{
+    AUTH_CAPABILITY, Action, CAPABILITY, METHOD_AFTER_HEADERS, METHOD_BEFORE_SEND,
+    METHOD_CANCELLED, METHOD_COMPLETED, METHOD_FAILED, METHOD_RESUME,
+};
 pub use codey_plugin_sdk::lifecycle::{Response as LifecycleResponse, Stage as LifecycleStage};
 use serde_json::{Value, json};
 use std::{
@@ -329,9 +332,9 @@ impl LifecycleRequest {
         }
         self.finished = true;
         let method = match outcome {
-            LifecycleOutcome::Completed => "request.completed",
-            LifecycleOutcome::Failed => "request.failed",
-            LifecycleOutcome::Cancelled => "request.cancelled",
+            LifecycleOutcome::Completed => METHOD_COMPLETED,
+            LifecycleOutcome::Failed => METHOD_FAILED,
+            LifecycleOutcome::Cancelled => METHOD_CANCELLED,
         };
         for entry in std::mem::take(&mut self.entries) {
             let metadata = self.metadata.clone();
@@ -461,8 +464,8 @@ async fn dispatch_one(
 ) -> Result<ParsedAction, LifecycleError> {
     let plugin = entry.plugin.clone();
     let mut method = match stage {
-        LifecycleStage::BeforeSend => "request.beforeSend",
-        LifecycleStage::AfterHeaders => "request.afterHeaders",
+        LifecycleStage::BeforeSend => METHOD_BEFORE_SEND,
+        LifecycleStage::AfterHeaders => METHOD_AFTER_HEADERS,
     };
     let mut deadline = None;
     let mut token: Option<String> = None;
@@ -521,7 +524,7 @@ async fn dispatch_one(
                 if Instant::now() >= end {
                     return Err(failure("plugin_wait_timeout"));
                 }
-                method = "request.resume";
+                method = METHOD_RESUME;
             }
             other => return Ok(other),
         }

@@ -16,6 +16,7 @@ test("plugin list validation distinguishes valid empty lists from malformed stat
 
 test("runtime errors remain visible when an upgrade is pending", () => {
   assert.equal(pluginStatusLabel({ enabled: true, restartRequired: true, lastError: "failed" }), "运行异常");
+  assert.equal(pluginStatusLabel({ enabled: false, status: "enabling", lastError: "old" }), "正在启用");
   assert.equal(pluginStatusLabel({ enabled: true, restartRequired: true }), "待重新启用");
   assert.equal(pluginStatusLabel({ enabled: false }), "已停用");
 });

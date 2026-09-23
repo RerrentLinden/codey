@@ -238,7 +238,8 @@ fn codey_plugin_header_patches_preserve_authentication_and_support_removal() {
                 value: None,
             },
         ],
-    );
+    )
+    .unwrap();
     assert_eq!(headers[AUTHORIZATION], "Bearer fixture");
     assert_eq!(headers["x-plugin-demo"], "new");
     assert!(!headers.contains_key("x-remove-demo"));
@@ -253,7 +254,7 @@ fn codey_plugin_invalid_patch_does_not_partially_change_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-plugin-demo", HeaderValue::from_static("original"));
         let original = headers.clone();
-        super::lifecycle::apply_codey_plugin_header_patches(
+        let error = super::lifecycle::apply_codey_plugin_header_patches(
             &mut headers,
             vec![
                 crate::codey_plugins::HeaderPatch {
@@ -265,7 +266,20 @@ fn codey_plugin_invalid_patch_does_not_partially_change_headers() {
                     value: Some(value.into()),
                 },
             ],
-        );
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "plugin_invalid_headers");
         assert_eq!(headers, original);
     }
+    let mut headers = HeaderMap::new();
+    headers.insert("x-plugin-demo", HeaderValue::from_static("original"));
+    super::lifecycle::apply_codey_plugin_header_patches(
+        &mut headers,
+        vec![crate::codey_plugins::HeaderPatch {
+            name: "x-plugin-demo".into(),
+            value: Some("café".into()),
+        }],
+    )
+    .unwrap();
+    assert_eq!(headers["x-plugin-demo"], "café");
 }

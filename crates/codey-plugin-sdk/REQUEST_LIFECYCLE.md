@@ -35,7 +35,7 @@
 | `request.failed` | HTTP 错误、传输失败或插件终止 | 忽略 |
 | `request.cancelled` | 可检测的下游取消或请求任务被丢弃 | 忽略 |
 
-请求扩展只有这一条调度路径。`request.beforeSend` 是事件名，manifest 中的能力名统一为 `request.lifecycle.v1`。
+请求扩展只有这一条调度路径。`request.beforeSend` 是事件名，manifest 中的能力名统一为 `request.lifecycle.v1`。上表方法不能通过 `invoke_codey_plugin` 调用，避免管理请求伪造生命周期事件或占用实例执行权。
 
 控制事件可用 `codey_plugin_sdk::lifecycle::RequestEvent` 解析：
 
@@ -73,7 +73,7 @@
 {"action":"continue","headers":[{"name":"x-example-state","value":"ready"}]}
 ```
 
-发送前可修改声明过的请求头，`value: null` 表示删除；后面的插件能看到已通过校验的修改。响应头阶段的 `continue` 只能返回空头列表，不能修改已发出的请求。
+发送前可修改声明过的请求头，`value: null` 表示删除；后面的插件能看到已通过校验的修改。请求头值不能包含控制字符或 DEL，单项不超过 16384 字节，一次修改合计不超过 32768 字节。无法写入 HTTP 头的修改会拒绝本次动作，不会静默丢弃同一次已经通过校验的其他修改。响应头阶段的 `continue` 只能返回空头列表，不能修改已发出的请求。
 
 ```json
 {"action":"wait","token":"job-7","pollAfterMs":100}
