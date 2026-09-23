@@ -171,6 +171,7 @@ fn restore_reasoning_item_from_summary(item: &mut Value) -> bool {
         && fill_reasoning_item_text(item)
 }
 
+#[cfg(test)]
 pub(crate) fn fill_missing_reasoning_text(body: &mut Value) -> bool {
     fill_missing_reasoning_text_with_chat_summaries(body, &[])
 }
