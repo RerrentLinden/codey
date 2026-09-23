@@ -913,6 +913,7 @@ impl RouterServer {
             Arc::clone(&self.request_body_budget),
             Arc::clone(&self.idle_downstreams),
         );
+        downstream.subagent_turn_states = Arc::clone(&self.subagent_turn_states);
         downstream.native_history = NativeResponsesHistory::with_cache(
             Arc::clone(&self.native_history_cache),
             &context.headers,
@@ -1767,6 +1768,11 @@ impl RouterServer {
                 &resolved.upstream_model,
             );
         }
+        // 子代理入站不带轮次票据，上游会把每次调用当成新轮次。只补这条父线程
+        // 最近一次成功响应的票据。主会话请求保持客户端原样。
+        if subagent_request && resolved.route.official_account {
+            reuse_subagent_turn_state(&self.subagent_turn_states, &mut headers);
+        }
         let mut lifecycle = request_lifecycle(
             &headers,
             &resolved,
@@ -2069,6 +2075,16 @@ impl RouterServer {
         }
         if let Some(probe) = downstream.request_log_probe() {
             probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
+        }
+        if resolved.route.official_account
+            && let Some(response) = upstream_response.as_ref()
+        {
+            observe_upstream_turn_state(
+                &self.subagent_turn_states,
+                &headers,
+                upstream_status,
+                response.headers(),
+            );
         }
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {

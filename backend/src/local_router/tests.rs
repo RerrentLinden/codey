@@ -594,7 +594,8 @@ async fn upstream_websocket_connection_disables_nagle() {
         None,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .socket;
     let MaybeTlsStream::Plain(stream) = socket.get_ref() else {
         panic!("loopback WebSocket must use a plain TCP stream");
     };

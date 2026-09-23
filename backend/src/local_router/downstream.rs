@@ -435,6 +435,7 @@ pub(crate) struct WebSocketResponsesDownstream {
     pub(crate) request_body_budget: Arc<Semaphore>,
     pub(crate) config_changes: tokio::sync::watch::Receiver<u64>,
     pub(crate) idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
+    pub(crate) subagent_turn_states: Arc<Mutex<SubagentTurnStateCache>>,
 }
 
 #[derive(Debug, Default)]

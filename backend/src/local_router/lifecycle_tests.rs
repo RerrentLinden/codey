@@ -104,6 +104,7 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         account_usage_cache: Arc::default(),
         official_auth_cache: Arc::default(),
         request_log: Arc::new(RouteRequestLogController::new()),
+        subagent_turn_states: Arc::new(Mutex::new(SubagentTurnStateCache::default())),
     }
 }
 

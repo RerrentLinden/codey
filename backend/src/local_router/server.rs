@@ -183,6 +183,7 @@ impl LocalRouter {
                 crate::account_usage::OfficialAuthCaches::default(),
             )),
             request_log: Arc::clone(&request_log),
+            subagent_turn_states: Arc::new(Mutex::new(SubagentTurnStateCache::default())),
         };
         let server = Arc::new(server);
         let task = tokio::spawn(async move {
@@ -477,6 +478,7 @@ pub(crate) struct RouterServer {
         Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     pub(crate) official_auth_cache: Arc<Mutex<crate::account_usage::OfficialAuthCaches>>,
     pub(crate) request_log: Arc<RouteRequestLogController>,
+    pub(crate) subagent_turn_states: Arc<Mutex<SubagentTurnStateCache>>,
 }
 
 const MAX_PROXIED_CLIENTS: usize = 8;
