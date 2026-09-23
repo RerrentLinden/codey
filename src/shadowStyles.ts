@@ -9,13 +9,6 @@ function propertyDefaults(sheet: CSSStyleSheet): string {
     .join("\n");
 }
 
-export function shadowStyles(css: string): string {
-  const scoped = css.replace(/:root\b/g, ":host");
-  const sheet = new CSSStyleSheet();
-  sheet.replaceSync(scoped);
-  return `${scoped}\n@layer properties {${propertyDefaults(sheet)}}`;
-}
-
 // 构造一次样式表并直接由 ShadowRoot 采用：与先解析再塞 <style> 相比，
 // 数百 KB 的 CSS 只解析一遍。
 export function shadowStyleSheet(utilityCss: string, ...sheets: string[]): CSSStyleSheet {

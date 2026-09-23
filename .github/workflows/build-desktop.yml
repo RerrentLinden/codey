@@ -319,6 +319,72 @@ jobs:
           path: ${{ steps.package.outputs.installer }}
           if-no-files-found: error
 
+  windows-check:
+    name: Windows checks
+    runs-on: windows-latest
+    # 打包任务只出安装包。标签发布不触发 ci.yml，所以 Windows 测试放在这里，并作为发布前置。
+
+    steps:
+      - name: Checkout Codey
+        uses: actions/checkout@v4
+
+      - name: Keep Windows Defender off the Cargo directories
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $paths = @(
+            (Join-Path $env:GITHUB_WORKSPACE "target"),
+            (Join-Path $env:USERPROFILE ".cargo")
+          )
+          foreach ($path in $paths) {
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+            Add-MpPreference -ExclusionPath $path
+          }
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.5.2"
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release-check
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
+      - name: Rust tests
+        run: cargo test --workspace --locked
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
+
+      - name: Compile native overlay helper and test identity guards
+        shell: powershell
+        run: ./tests/overlay-recovery-native.ps1
+
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
+
   publish:
     name: Attach packages to GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -326,6 +392,7 @@ jobs:
       - macos
       - macos-check
       - windows
+      - windows-check
     runs-on: macos-14
     env:
       CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}

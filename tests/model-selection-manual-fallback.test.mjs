@@ -67,16 +67,19 @@ const readModelCommandSources = async () => {
 };
 
 test("third-party model sync can fall back to manual model support configuration", async () => {
-  const [dialogSource, hookSource, commandSource, modelCommandSource] = await Promise.all([
+  const [dialogSource, hookSource, modelCommandSource] = await Promise.all([
     readFile(new URL("src/AppDialogs.tsx", root), "utf8"),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
-    readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readModelCommandSources(),
   ]);
 
   assert.match(dialogSource, /modelState\.officialModels\.length > 0/);
   assert.match(dialogSource, /本次官方账号登录可用的模型/);
   assert.match(dialogSource, /filteredOfficialModels\.map/);
+  assert.match(
+    dialogSource,
+    /visibleModelOptions\(\s*filteredOfficialModels,\s*visibleOfficialCount,?\s*\)/,
+  );
   assert.match(dialogSource, /placeholder="搜索模型，或输入模型 ID 添加"/);
   assert.match(dialogSource, /当前线路支持 auto-review/);
   assert.match(dialogSource, /<Switch/);
@@ -94,11 +97,11 @@ test("third-party model sync can fall back to manual model support configuration
     hookSource,
     /"save_selected_models",\s*\{\s*officialModels,\s*thirdPartyModels,/,
   );
-  assert.match(commandSource, /argument::<Vec<String>>\(&args, "officialModels"\)/);
-  assert.match(commandSource, /argument::<Vec<String>>\(&args, "thirdPartyModels"\)/);
-  assert.match(commandSource, /optional_argument::<Vec<String>>\(&args, "manualThirdPartyModels"\)/);
-  assert.match(commandSource, /optional_argument::<Vec<String>>\(&args, "deletedThirdPartyModels"\)/);
-  assert.match(commandSource, /optional_argument::<bool>\(&args, "supportsAutoReview"\)/);
+  assert.match(modelCommandSource, /argument::<Vec<String>>\(args, "officialModels"\)/);
+  assert.match(modelCommandSource, /argument::<Vec<String>>\(args, "thirdPartyModels"\)/);
+  assert.match(modelCommandSource, /optional_argument::<Vec<String>>\(args, "manualThirdPartyModels"\)/);
+  assert.match(modelCommandSource, /optional_argument::<Vec<String>>\(args, "deletedThirdPartyModels"\)/);
+  assert.match(modelCommandSource, /optional_argument::<bool>\(args, "supportsAutoReview"\)/);
   assert.match(
     modelCommandSource,
     /已在官方模型列表中，请直接勾选，不可作为其他模型手动添加/,

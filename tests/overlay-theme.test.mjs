@@ -96,6 +96,24 @@ test("system changes apply only when the host has no resolved theme", () => {
   assert.equal(f.observer().targets.size, 0);
 });
 
+test("child updates that keep the same theme roots do not recompute the theme", () => {
+  const f = fixture();
+  f.document.documentElement.scheme = "dark";
+  let reads = 0;
+  const original = f.document.defaultView.getComputedStyle;
+  f.document.defaultView.getComputedStyle = (node) => {
+    reads += 1;
+    return original(node);
+  };
+  f.start();
+  assert.ok(reads > 0);
+  const afterStart = reads;
+  f.mutate(f.document.body, undefined, "childList");
+  f.mutate(f.document.documentElement, undefined, "childList");
+  assert.equal(reads, afterStart);
+  f.expectTheme("dark");
+});
+
 test("reopening refreshes immediately and a replaced host root remains observed", () => {
   const f = fixture();
   const controller = f.start();

@@ -23,6 +23,8 @@ import {
   type RequestLogCatalog,
 } from "./RequestLogDialog";
 
+const REQUEST_LOG_CATALOG_TIMEOUT_MS = 30_000;
+
 type OverlayController = {
   open: () => void;
   close: () => void;
@@ -48,11 +50,28 @@ function RequestLogPage() {
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let cancelled = false;
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (!cancelled && !settled) setError("加载请求日志超时，请刷新页面");
+    }, REQUEST_LOG_CATALOG_TIMEOUT_MS);
     void invoke<{ config: RequestLogCatalog }>("load_codey_config")
-      .then((result) => setCatalog(result.config))
+      .then((result) => {
+        settled = true;
+        if (cancelled) return;
+        setError("");
+        setCatalog(result.config);
+      })
       .catch((nextError: unknown) => {
+        settled = true;
+        if (cancelled) return;
         setError(errorText(nextError));
-      });
+      })
+      .finally(() => window.clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   if (error) return <main className="p-6 text-sm text-[var(--codey-red,#b91c1c)]">{error}</main>;
@@ -91,7 +110,16 @@ function installBrowserBridge() {
       },
       body: JSON.stringify(args),
     });
-    const value = await response.json();
+    let value: { error?: { message?: string } };
+    try {
+      value = await response.json();
+    } catch {
+      throw new Error(
+        response.ok
+          ? "Codey 返回了无法解析的响应"
+          : `Codey 请求失败（${response.status}）`,
+      );
+    }
     if (!response.ok) throw new Error(value?.error?.message || `Codey 请求失败（${response.status}）`);
     return value;
   };

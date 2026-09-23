@@ -74,7 +74,7 @@ test("失效账号的线路随失效标记一起移除", () => {
   assert.match(commands, /stored_accounts_invalid/);
   // 标记失效后立刻重算线路，并且前端能取回最新的配置与模型状态。
   assert.match(commands, /refresh_official_routes_after_invalid_account/);
-  assert.match(commands, /"refresh_official_account_routes" =>/);
+  assert.match(commands, /"refresh_official_account_routes"(?:\s*\|[\s\S]{0,800})?\s*=>/);
   const refreshRoutes = accountCommands.match(
     /async fn refresh_official_route_after_account_change\([\s\S]*?\n\}/,
   )?.[0];

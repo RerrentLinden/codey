@@ -29,7 +29,7 @@ test("frontend and backend API command whitelists stay in sync", () => {
     backend.indexOf("pub async fn load_codey_config"),
   );
   const backendCommands = [
-    ...invokeApi.matchAll(/^\s*"([a-z][a-z0-9_]*)"\s*=>/gm),
+    ...invokeApi.matchAll(/"([a-z][a-z0-9_]*)"\s*(?:\||=>)/g),
   ].map((match) => match[1]);
 
   assert.deepEqual(

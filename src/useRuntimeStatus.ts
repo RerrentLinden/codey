@@ -16,6 +16,10 @@ import { reconcileRuntimeStatus } from "./runtimeStatusSnapshot";
 const INJECTION_STATUS_CHANGED_EVENT = "codey-injection-status-changed";
 export const SETTINGS_OPENED_EVENT = "codey-settings-opened";
 
+function reportStatusRefreshFailure(error: unknown) {
+  console.error("Codey 运行状态刷新失败", error);
+}
+
 type UseRuntimeStatusOptions = {
   active: boolean;
   embedded: boolean;
@@ -164,7 +168,7 @@ export function useRuntimeStatus({
   useEffect(() => {
     const handleInjectionStatusChanged = () => {
       if (!activeRef.current) return;
-      void refreshInjectionStatus().catch(() => {});
+      void refreshInjectionStatus().catch(reportStatusRefreshFailure);
     };
     window.addEventListener(
       INJECTION_STATUS_CHANGED_EVENT,
@@ -181,7 +185,7 @@ export function useRuntimeStatus({
   useEffect(() => {
     const handleSettingsOpened = () => {
       settingsOpenRefreshRequestedRef.current = true;
-      void refreshInjectionStatus().catch(() => {});
+      void refreshInjectionStatus().catch(reportStatusRefreshFailure);
     };
     window.addEventListener(SETTINGS_OPENED_EVENT, handleSettingsOpened);
     return () => {

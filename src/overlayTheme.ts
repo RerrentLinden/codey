@@ -43,20 +43,37 @@ export function installOverlayTheme(containers: HTMLElement[], ownerDocument = d
       container.style.colorScheme = theme;
     }
   };
+  // 主题只存在于文档根、body 和 #root。Codex 会频繁增删这些节点的直接子元素，
+  // 子节点变化本身不改变主题；只有根集合换成新节点时才需要重新计算。
+  let observedRoots: HTMLElement[] = [];
   const observeRoots = () => {
+    const next = themeRoots(ownerDocument);
+    if (
+      next.length === observedRoots.length &&
+      next.every((element, index) => element === observedRoots[index])
+    ) {
+      return false;
+    }
     observer.disconnect();
-    for (const element of themeRoots(ownerDocument)) {
+    observedRoots = next;
+    for (const element of next) {
       observer.observe(element, {
         attributes: true,
         attributeFilter: ["data-theme", "class", "style"],
-        // 只观察根节点，避免会话正文频繁更新触发主题计算。
         childList: true,
       });
     }
+    return true;
   };
   const observer = new view.MutationObserver((records) => {
-    if (records.some((record) => record.type === "childList")) observeRoots();
-    sync();
+    const structureChanged = records.some((record) => record.type === "childList");
+    const attributesChanged = records.some((record) => record.type === "attributes");
+    if (!structureChanged) {
+      if (attributesChanged) sync();
+      return;
+    }
+    const rootsChanged = observeRoots();
+    if (rootsChanged || attributesChanged) sync();
   });
   observeRoots();
   preference.addEventListener("change", sync);

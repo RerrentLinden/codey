@@ -46,7 +46,7 @@ rusqlite = { workspace = true, features = ["hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 semver = "1"
 serde.workspace = true
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 sha2.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { workspace = true, features = ["io-std", "io-util", "net", "signal", "sync"] }

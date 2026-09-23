@@ -7,8 +7,9 @@ import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 const root = new URL("../", import.meta.url);
 
 test("settings modal keeps dismissal and stacking inside the overlay", async () => {
-  const [appSource, shellSource, overlaySource, stylesSource, constants] = await Promise.all([
+  const [appSource, draftSource, shellSource, overlaySource, stylesSource, constants] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/useDraftConfig.ts", root), "utf8"),
     readFile(new URL("src/SettingsModalShell.tsx", root), "utf8"),
     readFile(new URL("src/overlay.tsx", root), "utf8"),
     readFile(new URL("src/styles.css", root), "utf8"),
@@ -17,7 +18,11 @@ test("settings modal keeps dismissal and stacking inside the overlay", async () 
 
   assert.match(
     appSource,
-    /function closeSettings\(\) \{[\s\S]*setConfig\(persistedConfigRef\.current\)[\s\S]*setDirty\(false\)[\s\S]*onClose\?\.\(\)/,
+    /function closeSettings\(\) \{[\s\S]*discardDraft\(\)[\s\S]*onClose\?\.\(\)/,
+  );
+  assert.match(
+    draftSource,
+    /function discardDraft\(\) \{[\s\S]*setConfig\(persistedConfigRef\.current\)[\s\S]*setDirty\(false\)/,
   );
   assert.match(appSource, /function closeSettings\(\) \{\s*if \(isBusy\) return;/);
   assert.match(

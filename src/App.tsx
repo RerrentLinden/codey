@@ -72,6 +72,8 @@ const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
   userConfigured: false,
   detectionFailed: true,
 };
+const CONFIG_LOAD_TIMEOUT_MS = 30_000;
+const PLUGIN_MARKETPLACE_STATUS_TIMEOUT_MS = 15_000;
 
 function localDateCacheKey(date: Date) {
   return [
@@ -143,6 +145,7 @@ export function App({
   const [fastContextToolsStatus, setFastContextToolsStatus] =
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
   const [usageAnalysisOpen, setUsageAnalysisOpen] = useState(false);
+  const loadGenerationRef = useRef(0);
   const settingsScroll = useRef<HTMLDivElement>(null);
   const usageReturn = useRef<{ trigger: HTMLElement; scrollTop: number } | null>(null);
   const handleOpenUsageAnalysis = useCallback((trigger: HTMLElement) => {
@@ -305,10 +308,20 @@ export function App({
 
   useEffect(() => {
     void load();
+    return () => {
+      loadGenerationRef.current += 1;
+    };
   }, []);
 
   async function load() {
+    const generation = ++loadGenerationRef.current;
+    const current = () => generation === loadGenerationRef.current;
     setLoadFailed(false);
+    const timer = window.setTimeout(() => {
+      if (!current()) return;
+      setLoadFailed(true);
+      setNotice({ tone: "error", text: "加载配置超时，请重新检查" });
+    }, CONFIG_LOAD_TIMEOUT_MS);
     try {
       const result = await invoke<{
         config: Config;
@@ -318,12 +331,15 @@ export function App({
         providerStatus?: ProviderStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
       }>("load_codey_config");
+      window.clearTimeout(timer);
+      if (!current()) return;
+      setLoadFailed(false);
       setPersistedConfig(result.config);
       setProviderStatus(result.providerStatus ?? null);
       if (!result.providerStatus) throw new Error("未能读取当前服务配置，请重新检查");
       if (typeof result.officialAccountAvailable === "boolean") {
-        setStatus((current) => ({
-          ...current,
+        setStatus((currentStatus) => ({
+          ...currentStatus,
           officialAccountAvailable: result.officialAccountAvailable,
         }));
       }
@@ -333,8 +349,9 @@ export function App({
       if (result.modelState) setModelState(result.modelState);
       const [next] = await Promise.all([
         refreshStatusForLoad(),
-        refreshPluginMarketplaceStatus(),
+        refreshPluginMarketplaceStatus(current),
       ]);
+      if (!current()) return;
       const startupError = next.startupError || result.startupError;
       if (startupError) {
         setNotice({ tone: "error", text: `自动启动失败：${startupError}` });
@@ -349,16 +366,21 @@ export function App({
         });
       }
     } catch (error) {
+      window.clearTimeout(timer);
+      if (!current()) return;
       setLoadFailed(true);
       setNotice({ tone: "error", text: errorText(error) });
     }
   }
 
-  async function refreshPluginMarketplaceStatus() {
+  async function refreshPluginMarketplaceStatus(isCurrent: () => boolean = () => true) {
     try {
-      const next = await invoke<PluginMarketplaceStatus>(
-        "plugin_marketplace_status",
+      const next = await withTimeout(
+        invoke<PluginMarketplaceStatus>("plugin_marketplace_status"),
+        PLUGIN_MARKETPLACE_STATUS_TIMEOUT_MS,
+        "插件市场状态查询超时",
       );
+      if (!isCurrent()) return next;
       setPluginMarketplaceStatus(next);
       return next;
     } catch (error) {
@@ -367,6 +389,7 @@ export function App({
         needsRepair: true,
         message: errorText(error),
       };
+      if (!isCurrent()) return next;
       setPluginMarketplaceStatus(next);
       return next;
     }

@@ -17,6 +17,7 @@ import type {
   ModelContextConfig,
   ModelReasoningEffort,
   ModelState,
+  OfficialModelState,
 } from "./App.types";
 import { ModelSettingsFields } from "./components/ModelSettingsFields";
 import {
@@ -107,25 +108,28 @@ function ModelPickerDialogComponent({
   const [visibleThirdPartyCount, setVisibleThirdPartyCount] = useState(
     MODEL_PICKER_PAGE_SIZE,
   );
+  const [visibleOfficialCount, setVisibleOfficialCount] = useState(
+    MODEL_PICKER_PAGE_SIZE,
+  );
   useEffect(() => {
     if (!open) return;
     setVisibleThirdPartyCount(MODEL_PICKER_PAGE_SIZE);
+    setVisibleOfficialCount(MODEL_PICKER_PAGE_SIZE);
   }, [open, customModelInput]);
   const filteredThirdPartyModels = useMemo(() => {
     if (!open) return [];
     return filterModelOptions(thirdPartyModelOptions, customModelInput);
   }, [customModelInput, open, thirdPartyModelOptions]);
-  const filteredOfficialModels = useMemo(() => {
-    if (!open) return [];
-    const query = customModelInput.trim().toLowerCase();
+  const officialModelCatalog = useMemo(() => {
     const available = new Map(modelState.officialModels.map((model) => [modelKey(model.slug), model]));
     const ids = modelState.officialModelIds.length > 0
       ? modelState.officialModelIds
       : modelState.officialModels.map((model) => model.slug);
     const seen = new Set<string>();
-    return ids.flatMap((id) => {
+    const models: Array<{ model: OfficialModelState; haystack: string }> = [];
+    for (const id of ids) {
       const key = modelKey(id);
-      if (seen.has(key)) return [];
+      if (seen.has(key)) continue;
       seen.add(key);
       const model = available.get(key) ?? {
         slug: id,
@@ -134,9 +138,21 @@ function ModelPickerDialogComponent({
         supportedReasoningEfforts: [],
         defaultReasoningEffort: "low",
       };
-      return `${model.slug} ${model.displayName}`.toLowerCase().includes(query) ? [model] : [];
-    });
-  }, [customModelInput, modelState.officialModelIds, modelState.officialModels, open]);
+      models.push({
+        model,
+        haystack: `${model.slug} ${model.displayName}`.toLowerCase(),
+      });
+    }
+    return models;
+  }, [modelState.officialModelIds, modelState.officialModels]);
+  const filteredOfficialModels = useMemo(() => {
+    if (!open) return [];
+    const query = customModelInput.trim().toLowerCase();
+    if (!query) return officialModelCatalog.map((entry) => entry.model);
+    return officialModelCatalog.flatMap((entry) => (
+      entry.haystack.includes(query) ? [entry.model] : []
+    ));
+  }, [customModelInput, officialModelCatalog, open]);
   const matchingModels = useMemo(
     () => [
       ...filteredOfficialModels.map((model) => model.slug),
@@ -157,6 +173,10 @@ function ModelPickerDialogComponent({
     : someMatchingSelected
       ? "indeterminate"
       : false;
+  const visibleOfficialModels = visibleModelOptions(
+    filteredOfficialModels,
+    visibleOfficialCount,
+  );
   const visibleThirdPartyModels = visibleModelOptions(
     filteredThirdPartyModels,
     visibleThirdPartyCount,
@@ -290,7 +310,7 @@ function ModelPickerDialogComponent({
                 </div>
                 <Badge variant="info">{filteredOfficialModels.length} 个</Badge>
               </div>
-              {filteredOfficialModels.map((model) => (
+              {visibleOfficialModels.map((model) => (
                 <div className="flex flex-wrap items-center gap-2.5 rounded-md bg-blue-500/[0.025] px-3 py-2 hover:bg-blue-500/[0.07]" key={model.slug}>
                   <Checkbox
                     checked={draftModelSet.has(modelKey(model.slug))}
@@ -307,6 +327,26 @@ function ModelPickerDialogComponent({
                     onChange={(policy) => onUpdateDraftModelContext(model.slug, policy)} />}
                 </div>
               ))}
+              {visibleOfficialModels.length < filteredOfficialModels.length && (
+                <div className="flex justify-center px-2 pb-1 pt-1.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={isBusy}
+                    onClick={() =>
+                      setVisibleOfficialCount((count) =>
+                        nextVisibleModelCount(count, filteredOfficialModels.length)
+                      )}
+                  >
+                    再显示{" "}
+                    {Math.min(
+                      MODEL_PICKER_PAGE_SIZE,
+                      filteredOfficialModels.length - visibleOfficialModels.length,
+                    )}{" "}
+                    个
+                  </Button>
+                </div>
+              )}
             </>
           )}
           {!loading && officialOnly && filteredOfficialModels.length === 0 && (

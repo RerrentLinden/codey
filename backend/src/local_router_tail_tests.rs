@@ -386,9 +386,7 @@ async fn long_response_tail_preserves_events_tools_and_errors() {
         std::fs::write(path, &encoded).unwrap();
     }
     // Baseline from f396fabc, updated for cache_write_tokens added in 9833dde.
-    // 摘要依赖 serde_json 的 map 实现：workspace 构建会因 codey-runtime-data 启用
-    // preserve_order 而用插入序，只构建本 crate 时是字母序。此基线对应 workspace
-    // 运行（CI 的方式），因此单独跑本 crate 会因键顺序不同而失败，属构建范围差异。
+    // codey 直接启用 serde_json preserve_order，单独构建与 workspace 构建使用同一键序。
     // Removing those six usage fields reproduces the original transcript digest.
     // CODEY_TAIL_SNAPSHOT exports them for inspection when this assertion fails.
     use sha2::Digest;
