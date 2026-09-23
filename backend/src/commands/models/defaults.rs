@@ -122,7 +122,12 @@ pub async fn save_official_route_models(
     if let Some(show_usage) = requested_show_account_usage {
         config.show_account_usage_in_header = show_usage;
     }
-    let official_models = model_catalog::default_official_model_slugs();
+    let official_models = config
+        .upstream_models_by_provider
+        .get(&provider_id)
+        .filter(|models| !models.is_empty())
+        .cloned()
+        .unwrap_or_else(model_catalog::default_official_model_slugs);
     // 官方线路不接受上下文预算或思考强度声明变更，保留已有配置。
     let official_by_key = official_models
         .iter()

@@ -1385,12 +1385,38 @@ impl CodeyConfig {
             return;
         }
         let supported_models = official_models_by_key();
+        let synchronized_models = self
+            .upstream_models_by_provider
+            .iter()
+            .filter_map(|(provider_id, models)| {
+                (!models.is_empty()).then(|| {
+                    (
+                        provider_id.clone(),
+                        models
+                            .iter()
+                            .map(|model| model_id::key(model))
+                            .collect::<BTreeSet<_>>(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         self.selected_models_by_provider
             .retain(|provider_id, models| {
                 if !official_provider_ids.contains(provider_id) {
                     return true;
                 }
-                models.retain(|model| supported_models.contains_key(&model_id::key(model)));
+                // A synchronized official account may expose models newer
+                // than Codey's built-in fallback list. The per-route upstream
+                // snapshot is authoritative when present; otherwise retain
+                // the historical fixed-list behavior.
+                let route_models = synchronized_models.get(provider_id);
+                models.retain(|model| {
+                    route_models
+                        .as_ref()
+                        .is_some_and(|known| known.contains(&model_id::key(model)))
+                        || (route_models.is_none()
+                            && supported_models.contains_key(&model_id::key(model)))
+                });
                 !models.is_empty()
             });
     }

@@ -6,7 +6,8 @@ pub(crate) fn provider_route_requires_restart(
     current: &CodeyConfig,
 ) -> bool {
     applied.local_router_enabled != current.local_router_enabled
-        || provider_route_snapshots(applied) != provider_route_snapshots(current)
+        || provider_route_snapshots_for_runtime(applied)
+            != provider_route_snapshots_for_runtime(current)
         || websocket_transport_requires_restart(applied, current)
         || native_web_search_capability_requires_restart(applied, current)
         || remote_compaction_transport_requires_restart(applied, current)
@@ -89,8 +90,8 @@ pub(crate) fn runtime_supports_current_routes_for_hot_reload(
     {
         return false;
     }
-    let applied = official_route_snapshots(applied);
-    official_route_snapshots(current)
+    let applied = official_route_snapshots_for_runtime(applied);
+    official_route_snapshots_for_runtime(current)
         .into_iter()
         .all(|(provider_id, route)| applied.get(&provider_id) == Some(&route))
 }
@@ -133,10 +134,28 @@ pub(crate) fn provider_route_snapshots(
         .collect()
 }
 
-pub(crate) fn official_route_snapshots(
+/// Route identity used to decide whether the running app-server still supports
+/// the saved configuration. Official gateway addresses are consumed directly
+/// by the local router and can change without restarting app-server, while the
+/// remaining route fields still describe launch-scoped transport state.
+pub(crate) fn provider_route_snapshots_for_runtime(
     config: &CodeyConfig,
 ) -> BTreeMap<String, ProviderRouteSnapshot> {
     provider_route_snapshots(config)
+        .into_iter()
+        .map(|(provider_id, mut route)| {
+            if route.official_account {
+                route.base_url.clear();
+            }
+            (provider_id, route)
+        })
+        .collect()
+}
+
+pub(crate) fn official_route_snapshots_for_runtime(
+    config: &CodeyConfig,
+) -> BTreeMap<String, ProviderRouteSnapshot> {
+    provider_route_snapshots_for_runtime(config)
         .into_iter()
         .filter(|(_, route)| route.official_account)
         .collect()
@@ -165,7 +184,16 @@ pub(crate) fn config_with_launch_pinned_transport(
         // 协议决定上面三个能力的实际取值，必须一起固定在启动时的状态。
         profile.upstream_protocol = previous.upstream_protocol.clone();
         if profile.official_account && previous.official_account {
-            profile.base_url = previous.base_url.clone();
+            let launch_scoped_official_change = profile.api_key != previous.api_key
+                || profile.auth_mode != previous.auth_mode
+                || profile.model_request_headers != previous.model_request_headers
+                || profile.upstream_protocol != previous.upstream_protocol
+                || profile.supports_remote_compaction != previous.supports_remote_compaction
+                || profile.supports_websockets != previous.supports_websockets
+                || profile.supports_native_web_search != previous.supports_native_web_search;
+            if launch_scoped_official_change {
+                profile.base_url = previous.base_url.clone();
+            }
             profile.api_key = previous.api_key.clone();
             profile.auth_mode = previous.auth_mode.clone();
             profile.model_request_headers = previous.model_request_headers.clone();

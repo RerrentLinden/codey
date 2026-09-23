@@ -421,10 +421,11 @@ function ModelSectionComponent({
                   : modelState.officialModelIds,
               )
             : modelState.thirdPartyModels
-          : official
-            ? configuredModels.length > 0
-              ? configuredModels
-              : officialCatalog
+            : official
+              ? uniqueModelIds([
+                  ...officialCatalog,
+                  ...configuredModels,
+                ])
             : uniqueModelIds([
                 ...configuredModels,
                 ...(config.declaredOfficialModelsByProvider[providerId] || []),
@@ -505,11 +506,7 @@ function ModelSectionComponent({
     if (official && officialScope === "models") {
       const providerId = routeProviderId(profile);
       const configuredModels = config.selectedModelsByProvider[providerId] || [];
-      setOfficialModelDraft(
-        configuredModels.length > 0
-          ? configuredModels
-          : officialCatalog,
-      );
+      setOfficialModelDraft(uniqueModelIds([...officialCatalog, ...configuredModels]));
     } else {
       setOfficialModelDraft([]);
     }
@@ -810,10 +807,7 @@ function ModelSectionComponent({
                 const officialLoginLabel = officialLoginLabelFor(
                   isOfficial ? accountForRoute(profile) : null,
                 );
-                const syncModels = () => {
-                  if (isOfficial && !routeConfigReadOnly) openRouteDialog(profile, "models");
-                  else onFetchRouteModels(profile);
-                };
+                const syncModels = () => onFetchRouteModels(profile);
                 return (
                   <section
                     className={`provider-model-group${disabled ? " is-disabled" : ""}${dropRouteId === profile.id ? " is-drop-target" : ""}`}

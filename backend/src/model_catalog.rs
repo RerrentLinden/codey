@@ -678,16 +678,31 @@ pub fn selection_state_with_manual_models(
         Err(error) if official_provider => return Err(error),
         Err(_) => Arc::new(Vec::new()),
     };
+    let requested_upstream_keys =
+        upstream_models
+            .filter(|models| !models.is_empty())
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|model| model_id::key(model))
+                    .collect::<HashSet<_>>()
+            });
     let official_model_ids = official_entries
         .iter()
         .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .filter(|slug| {
+            requested_upstream_keys
+                .as_ref()
+                .is_none_or(|keys| keys.contains(&model_id::key(slug)))
+        })
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     let selected_official_keys = selected_models
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
-    let filter_official_selection = official_provider && !selected_official_keys.is_empty();
+    let filter_official_selection = official_provider
+        && (!selected_official_keys.is_empty() || requested_upstream_keys.is_some());
     let provider_models_synced = official_provider || upstream_models.is_some();
     let upstream_models = upstream_models.unwrap_or_default();
     let upstream = upstream_models
@@ -702,8 +717,13 @@ pub fn selection_state_with_manual_models(
                 let default_reasoning_effort =
                     default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
                 let model = official_model_from_value(model)?;
+                let model_key = model_id::key(&model.slug);
                 let supported = !filter_official_selection
-                    || selected_official_keys.contains(&model_id::key(&model.slug));
+                    || requested_upstream_keys
+                        .as_ref()
+                        .is_some_and(|keys| keys.contains(&model_key))
+                    || (requested_upstream_keys.is_none()
+                        && selected_official_keys.contains(&model_key));
                 Some(OfficialModelAvailability {
                     slug: model.slug,
                     display_name: model.display_name,
@@ -992,6 +1012,63 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
         );
     }
 
+    // A Codey-owned CLI snapshot is account-backed and therefore the source
+    // of truth. Keeping the old fixed list below is still useful for first-run
+    // and offline fallback, but it must not hide newly released models that
+    // the signed-in account can actually use. A generic models_cache.json is
+    // intentionally not treated as dynamic input because older Codex builds
+    // can leave retired models in that file.
+    let dynamic_source = paths
+        .iter()
+        .position(|path| path.ends_with(DEBUG_CATALOG_RELATIVE_PATH))
+        .and_then(|index| {
+            fs::read(&paths[index])
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|value| {
+                    value
+                        .get("codey_account_snapshot")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .map(|value| official_models_from_value(&value))
+        });
+    if let Some(source) = dynamic_source
+        .as_deref()
+        .filter(|models| snapshot_has_runtime_models(models))
+    {
+        let mut seen = HashSet::new();
+        let models = source
+            .iter()
+            .filter(|model| {
+                model_instruction_source(model).is_some()
+                    && model
+                        .get("visibility")
+                        .and_then(Value::as_str)
+                        .is_none_or(|visibility| visibility != "hide")
+            })
+            .filter_map(|model| {
+                let slug = model.get("slug").and_then(Value::as_str)?.trim();
+                if slug.is_empty() || !seen.insert(model_id::key(slug)) {
+                    return None;
+                }
+                let mut model = model.clone();
+                let display_name = model
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(slug)
+                    .to_string();
+                normalize_official_model(&mut model, slug, &display_name, seen.len() - 1);
+                Some(model)
+            })
+            .collect::<Vec<_>>();
+        if !models.is_empty() {
+            return Ok(models);
+        }
+    }
+
     OFFICIAL_MODELS
         .iter()
         .enumerate()
@@ -1044,6 +1121,14 @@ fn codex_cli_stamp_for(candidates: &[PathBuf]) -> Option<std::time::SystemTime> 
 /// instruction-bearing source would otherwise suppress the capture.
 #[cfg(not(test))]
 fn runtime_snapshot_is_stale(home: &Path, codex_app_path: &str) -> bool {
+    let snapshot = home.join(DEBUG_CATALOG_RELATIVE_PATH);
+    let snapshot_is_account_backed = read_catalog_value(&snapshot)
+        .and_then(|value| value.get("codey_account_snapshot").cloned())
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !snapshot_is_account_backed {
+        return true;
+    }
     let snapshot_mtime = fs::metadata(home.join(DEBUG_CATALOG_RELATIVE_PATH))
         .and_then(|metadata| metadata.modified())
         .ok();
@@ -1119,11 +1204,68 @@ fn sync_runtime_catalog_snapshot(home: &Path, codex_app_path: &str) -> Result<bo
         release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, stamp);
         return Ok(false);
     };
-    let catalog = serde_json::to_vec_pretty(&json!({ "models": models }))
-        .context("序列化 Codex 内置模型目录快照失败")?;
+    let catalog = serde_json::to_vec_pretty(&json!({
+        "models": models,
+        "codey_account_snapshot": true,
+    }))
+    .context("序列化 Codex 内置模型目录快照失败")?;
     atomic_write(&home.join(DEBUG_CATALOG_RELATIVE_PATH), &catalog)
         .context("写入 Codex 内置模型目录快照失败")?;
     Ok(true)
+}
+
+/// Explicit model synchronization must be allowed to observe account changes
+/// even when the installed Codex binary has not changed since the last launch.
+pub(crate) fn refresh_account_runtime_snapshot(home: &Path, codex_app_path: &str) -> Result<bool> {
+    #[cfg(not(test))]
+    {
+        if let Ok(mut attempted) = RUNTIME_SNAPSHOT_SYNC_ATTEMPTED.lock() {
+            *attempted = None;
+        }
+    }
+    sync_runtime_catalog_snapshot(home, codex_app_path)
+}
+
+/// Merges the account-specific model response into the Codey-owned runtime
+/// catalog. The catalog is shared, while each route keeps its own upstream
+/// model IDs and filters this union when building its selection state.
+pub(crate) fn merge_account_runtime_models(home: &Path, models: &[Value]) -> Result<()> {
+    let path = home.join(DEBUG_CATALOG_RELATIVE_PATH);
+    let mut catalog = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({"models": [], "codey_account_snapshot": true}));
+    let entries = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("Codex 模型目录快照格式无效"))?;
+    let mut positions = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            model
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(|slug| (model_id::key(slug), index))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for model in models.iter().filter(|model| {
+        model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| !slug.trim().is_empty())
+    }) {
+        let key = model_id::key(model["slug"].as_str().unwrap_or_default());
+        if let Some(index) = positions.get(&key).copied() {
+            entries[index] = model.clone();
+        } else {
+            positions.insert(key, entries.len());
+            entries.push(model.clone());
+        }
+    }
+    catalog["codey_account_snapshot"] = Value::Bool(true);
+    let bytes = serde_json::to_vec_pretty(&catalog).context("序列化官方模型目录快照失败")?;
+    atomic_write(&path, &bytes).context("写入官方模型目录快照失败")
 }
 
 /// Unit tests must never invoke the Codex CLI installed on the machine running
@@ -1145,7 +1287,7 @@ fn debug_model_entries(home: &Path, candidates: &[PathBuf]) -> Option<Vec<Value>
                 continue;
             };
             let models = official_models_from_value(&value);
-            if snapshot_covers_official_models(&models) {
+            if snapshot_has_runtime_models(&models) {
                 return Some(models);
             }
         }
@@ -1153,14 +1295,17 @@ fn debug_model_entries(home: &Path, candidates: &[PathBuf]) -> Option<Vec<Value>
     None
 }
 
-/// A snapshot is only worth persisting when it can serve every fixed official
-/// model. A partial render (for example one that lost a model to an upstream
-/// retirement, or a signed-out render missing account models) would otherwise
-/// be frozen on disk and quietly suppress later capture attempts.
-///
-/// Only the instruction source is checked: `normalize_official_model` fills a
-/// missing description from the display name, while nothing can invent the
-/// instructions a model needs to run.
+/// A runtime snapshot is useful even when upstream has added or retired a
+/// model that Codey has not learned about yet. The account-backed directory
+/// only needs at least one complete model entry; the fixed list remains the
+/// fallback for installations that cannot produce a snapshot at all.
+fn snapshot_has_runtime_models(models: &[Value]) -> bool {
+    models
+        .iter()
+        .any(|model| model_instruction_source(model).is_some())
+}
+
+#[cfg(test)]
 fn snapshot_covers_official_models(models: &[Value]) -> bool {
     OFFICIAL_MODELS.iter().all(|(slug, _)| {
         models.iter().any(|model| {
@@ -2261,6 +2406,41 @@ mod tests {
             serde_json::to_vec(&official_cache()).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn account_snapshot_exposes_models_unknown_to_the_fallback_list() {
+        let home = tempfile::tempdir().unwrap();
+        let snapshot = json!({
+            "codey_account_snapshot": true,
+            "models": [
+                {
+                    "slug": "gpt-6-sol",
+                    "display_name": "GPT-6-Sol",
+                    "visibility": "list",
+                    "description": "GPT-6-Sol",
+                    "base_instructions": "account instructions",
+                    "supported_reasoning_levels": [{"effort": "low"}]
+                },
+                {
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6-Luna",
+                    "visibility": "list",
+                    "description": "GPT-6-Luna",
+                    "base_instructions": "account instructions",
+                    "supported_reasoning_levels": [{"effort": "low"}]
+                }
+            ]
+        });
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let state = selection_state(home.path(), true, None, &[], None).unwrap();
+        assert_eq!(state.official_model_ids, ["gpt-6-sol", "gpt-6-luna"]);
     }
 
     fn staged_catalog_refresh(home: &Path, selected: &[String], overrides: CatalogOverrides<'_>) {

@@ -105,7 +105,8 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(app, /if \(shouldPersistNativeToggle\) \{\s*await persist\(config\)/);
   assert.match(app, /if \(nativeMode\) \{\s*openModelPicker\(/);
   assert.match(app, /result\.providerStatus\.provider\.official \? null : result\.providerStatus\.provider\.id/);
-  assert.match(app, /if \(nativeMode \|\| route\.authMode === "officialAccount"\) \{\s*await syncCurrentProvider\(\);\s*return/);
+  assert.match(app, /if \(nativeMode\) \{\s*await syncCurrentProvider\(\);\s*return/);
+  assert.match(app, /savedRoute\.authMode === "officialAccount"\s*\?\s*result\.routeModelState/);
   assert.match(
     sections,
     /disabled=\{\s*routeConfigReadOnly \|\|\s*(?:isOfficial \|\|\s*)?isBusy \|\|\s*dirty \|\|\s*config\.profiles\.length <= 1\s*\}/,

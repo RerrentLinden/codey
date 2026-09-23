@@ -43,7 +43,7 @@ use models::{
 use models::{
     current_model_state_async, current_provider_status_async, current_renderer_model_catalog_async,
     hot_reload_runtime_models, native_web_search_capability_requires_restart,
-    official_route_snapshots, reconcile_subagent_models_for_mode,
+    official_route_snapshots_for_runtime, reconcile_subagent_models_for_mode,
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
@@ -3045,7 +3045,8 @@ pub(super) fn provider_route_restart_required_for_runtime(
     current: &CodeyConfig,
 ) -> bool {
     !runtime_supports_current_routes_for_hot_reload(applied, current)
-        || official_route_snapshots(applied) != official_route_snapshots(current)
+        || official_route_snapshots_for_runtime(applied)
+            != official_route_snapshots_for_runtime(current)
         || websocket_transport_requires_restart(applied, current)
         || native_web_search_capability_requires_restart(applied, current)
 }

@@ -125,7 +125,7 @@ test("official route settings are edited on the route card instead of the accoun
   assert.ok(editButton > 0 && deleteGuard > editButton);
   // 编辑只改线路名、短名称、网关和代理，模型列举交给同步入口。
   assert.match(modelSection, /openRouteDialog\(profile, isOfficial \? "settings" : null\)/);
-  assert.match(modelSection, /openRouteDialog\(profile, "models"\)/);
+  assert.match(modelSection, /const syncModels = \(\) => onFetchRouteModels\(profile\)/);
   assert.match(modelSection, /\{officialDialogScope !== "models" && \(/);
   assert.match(modelSection, /\{officialDialogScope !== "settings" && \(/);
 

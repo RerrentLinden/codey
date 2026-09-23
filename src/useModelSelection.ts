@@ -120,12 +120,24 @@ export function useModelSelection({
   const [draftAutoReviewSupported, setDraftAutoReviewSupported] = useState(false);
 
   const modelEditorState = modelPickerState ?? modelState;
+  const officialRoutePicker = Boolean(
+    modelPickerRouteId &&
+      config?.profiles.some(
+        (profile) =>
+          profile.id === modelPickerRouteId && profile.authMode === "officialAccount",
+      ),
+  );
+  const officialOnly = Boolean(
+    officialRoutePicker || (!modelPickerRouteId && currentProvider?.official),
+  );
   const officialSlugKeys = useMemo(
     () =>
       new Set(
-        modelPickerRouteId ? [] : modelEditorState.officialModelIds.map(modelKey),
+        (!modelPickerRouteId || officialRoutePicker)
+          ? modelEditorState.officialModelIds.map(modelKey)
+          : [],
       ),
-    [modelEditorState.officialModelIds, modelPickerRouteId],
+    [modelEditorState.officialModelIds, modelPickerRouteId, officialRoutePicker],
   );
   const draftModelSet = useMemo(
     () => new Set(draftModels.map(modelKey)),
@@ -145,6 +157,7 @@ export function useModelSelection({
   );
   const thirdPartyModelOptions = useMemo(
     () => {
+      if (officialOnly) return [];
       const seenKeys = new Set<string>();
       return [
         ...modelEditorState.upstreamModels,
@@ -172,6 +185,7 @@ export function useModelSelection({
       modelEditorState.thirdPartyModels,
       modelEditorState.upstreamModels,
       officialSlugKeys,
+      officialOnly,
     ],
   );
   const subagentModelOptions = useMemo(
@@ -265,6 +279,10 @@ export function useModelSelection({
   }, [modelInputError]);
 
   const addCustomModel = useCallback(() => {
+    if (officialOnly) {
+      setModelInputError("官方线路只能勾选当前账号可用的模型");
+      return;
+    }
     const model = customModelInput.trim();
     if (!model) {
       setModelInputError("请输入要添加的模型 ID");
@@ -323,6 +341,7 @@ export function useModelSelection({
     modelEditorState.officialModelIds,
     modelEditorState.upstreamModels,
     modelPickerRouteId,
+    officialOnly,
   ]);
 
   const deleteDraftThirdPartyModel = useCallback((model: string) => {
@@ -377,22 +396,34 @@ export function useModelSelection({
         declaredReasoningEfforts[model] = normalized;
       }
     }
-    const result = await invoke<{
-      config: Config;
-      modelState: ModelState;
-    } & ModelRuntimeUpdate>("save_selected_models", {
-      officialModels,
-      thirdPartyModels,
-      manualThirdPartyModels,
-      deletedThirdPartyModels: deletedModels,
-      supportsAutoReview,
-      modelContexts: Object.fromEntries(Object.entries(draftModelContexts).filter(([model]) =>
-        includesModelId(modelEditorState.officialModelIds, model) || includesModelId(thirdPartyModelOptions, model))),
-      ...(config?.localRouterEnabled === true
-        ? { reasoningEfforts: declaredReasoningEfforts }
-        : {}),
-      ...(modelPickerRouteId == null ? {} : { routeId: modelPickerRouteId }),
-    });
+    const result = officialRoutePicker
+      ? await invoke<{
+          config: Config;
+          modelState: ModelState;
+        } & ModelRuntimeUpdate>("save_official_route_models", {
+          routeId: modelPickerRouteId,
+          models: officialModels,
+        })
+      : await invoke<{
+          config: Config;
+          modelState: ModelState;
+        } & ModelRuntimeUpdate>("save_selected_models", {
+          officialModels,
+          thirdPartyModels,
+          manualThirdPartyModels,
+          deletedThirdPartyModels: deletedModels,
+          supportsAutoReview,
+          ...(!officialOnly
+            ? {
+                modelContexts: Object.fromEntries(Object.entries(draftModelContexts).filter(([model]) =>
+                  includesModelId(modelEditorState.officialModelIds, model) || includesModelId(thirdPartyModelOptions, model))),
+              }
+            : {}),
+          ...(config?.localRouterEnabled === true && !officialOnly
+            ? { reasoningEfforts: declaredReasoningEfforts }
+            : {}),
+          ...(modelPickerRouteId == null ? {} : { routeId: modelPickerRouteId }),
+        });
     setPersistedConfig(result.config);
     setModelState(result.modelState);
     setStatus((current) => ({
@@ -411,12 +442,14 @@ export function useModelSelection({
     setPersistedConfig,
     setStatus,
     modelPickerRouteId,
+    officialRoutePicker,
     config,
     draftReasoningEfforts,
     draftModelContexts,
     reasoningEffortAutoByModel,
     modelEditorState.officialModelIds,
     thirdPartyModelOptions,
+    officialOnly,
   ]);
 
   const saveModelSelection = useCallback(async () => {
@@ -455,6 +488,7 @@ export function useModelSelection({
     subagentModelOptions,
     modelState,
     modelEditorState,
+    officialOnly,
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,

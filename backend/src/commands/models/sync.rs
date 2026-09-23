@@ -70,17 +70,12 @@ pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Valu
     }
     crate::commands::prepare_routes_for_current_launch(state).await?;
     let current_provider = current_codex_provider().await?;
-    let provider_status = if current_provider.official {
-        let config = state.config.read().await;
-        codex_provider::status_from_config(&config)
-    } else {
-        sync_current_third_party_provider_state(state).await?
-    };
-    let config = if current_provider.official {
-        state.config.read().await.clone()
-    } else {
-        sync_provider_models_for_launch(state, true).await
-    };
+    if current_provider.official {
+        let _provider_model_sync_guard = state.provider_model_sync_lock.lock().await;
+        return sync_native_current_provider_models(state, None).await;
+    }
+    let provider_status = sync_current_third_party_provider_state(state).await?;
+    let config = sync_provider_models_for_launch(state, true).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let model_state = current_model_state_async(&config).await?;
     let public_config = redacted_config(&config);
@@ -134,9 +129,6 @@ pub(crate) async fn sync_native_current_provider_models(
     expected_route: Option<(String, u64)>,
 ) -> Result<Value, String> {
     let previous = state.config.read().await.clone();
-    if previous.local_router_enabled {
-        return Err("本地路由已启用，请使用线路模型同步".to_string());
-    }
     if let Some((_, expected_revision)) = expected_route.as_ref() {
         ensure_route_revision(&previous, *expected_revision)?;
     }
@@ -147,7 +139,38 @@ pub(crate) async fn sync_native_current_provider_models(
     {
         return Err("只能同步当前 Codex 线路的模型".to_string());
     }
-    let visible_fetched_models = if let Some(fetch_profile) = context.fetch_profile.clone() {
+    let official_account_models = if context.provider.official {
+        previous
+            .profiles
+            .iter()
+            .find(|profile| profile.official_account && profile.enabled)
+            .cloned()
+            .map(|profile| async move { fetch_official_route_models(state, &profile).await })
+    } else {
+        None
+    };
+    let official_account_models = match official_account_models {
+        Some(fetch) => Some(fetch.await?),
+        None => None,
+    };
+    if let Some(entries) = official_account_models.as_deref() {
+        model_catalog::merge_account_runtime_models(codex_home(), entries)
+            .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
+    }
+    let visible_fetched_models = if let Some(entries) = official_account_models.as_ref() {
+        regular_route_models(
+            entries
+                .iter()
+                .filter_map(|model| {
+                    model
+                        .get("slug")
+                        .or_else(|| model.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect(),
+        )
+    } else if let Some(fetch_profile) = context.fetch_profile.clone() {
         fetch_profile.validate()?;
         let fetched_models = fetch_provider_models(fetch_profile)
             .await
@@ -163,9 +186,6 @@ pub(crate) async fn sync_native_current_provider_models(
     }
     let _config_write_guard = state.config_write_lock.lock().await;
     let latest = state.config.read().await.clone();
-    if latest.local_router_enabled {
-        return Err("同步模型期间本地路由已启用，请重试".to_string());
-    }
     if latest.settings_revision != previous.settings_revision {
         return Err("Codey 设置在同步模型期间已更新，请重新载入后再操作".to_string());
     }
@@ -173,7 +193,16 @@ pub(crate) async fn sync_native_current_provider_models(
         ensure_route_revision(&latest, *expected_revision)?;
     }
 
+    if context.provider.official && official_account_models.is_none() {
+        let _ =
+            model_catalog::refresh_account_runtime_snapshot(codex_home(), &latest.codex_app_path);
+    }
+
     let mut next = latest.clone();
+    if context.provider.official && !visible_fetched_models.is_empty() {
+        next.upstream_models_by_provider
+            .insert(context.provider.id.clone(), visible_fetched_models.clone());
+    }
     if !context.provider.official {
         let mut cached_models = visible_fetched_models.clone();
         if let Some(manual_models) = next
@@ -194,7 +223,24 @@ pub(crate) async fn sync_native_current_provider_models(
             .insert(context.provider.id.clone(), cached_models.clone());
         next.retain_model_contexts(&context.provider.id, &cached_models);
     }
-    let model_state = native_model_state_for_provider(&next, &context.provider, codex_home())?;
+    let mut model_state = native_model_state_for_provider(&next, &context.provider, codex_home())?;
+    if context.provider.official {
+        // Persist the account-backed catalog on the route so configuration
+        // normalization can recognize newly released official model IDs.
+        let account_models = model_state.official_model_ids.clone();
+        if !account_models.is_empty() {
+            next.upstream_models_by_provider
+                .insert(context.provider.id.clone(), account_models.clone());
+            let fallback_models = model_catalog::default_official_model_slugs();
+            let selected = next.selected_models_by_provider.get(&context.provider.id);
+            if selected.is_none_or(|models| models == &fallback_models) {
+                next.selected_models_by_provider
+                    .insert(context.provider.id.clone(), account_models);
+            }
+            next = next.normalize();
+            model_state = native_model_state_for_provider(&next, &context.provider, codex_home())?;
+        }
+    }
     let visible_models = if context.provider.official {
         let supported = model_state
             .official_models

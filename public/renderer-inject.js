@@ -41,6 +41,7 @@
     "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]",
   ].join(", ");
   const headerSelector = "header, nav";
+  const subagentHeaderSelector = ".h-12.shrink-0.border-b";
   const bootstrapProbeSelector = `${headerSelector}, ${sidebarSelector}`;
   const settingsIcon = `
     <svg viewBox="0 0 350 350" aria-hidden="true" focusable="false">
@@ -1177,9 +1178,115 @@
     window.setTimeout(run, 1_000);
   };
 
+  const subagentHeaders = new Map();
+  const subagentConversationId = (header) => {
+    const fiberKey = Object.keys(header).find((key) => key.startsWith("__reactFiber$"));
+    if (!fiberKey) return null;
+    let seed = null;
+    for (let fiber = header[fiberKey], depth = 0; fiber && depth < 16; fiber = fiber.return, depth += 1) {
+      const props = fiber.memoizedProps;
+      if (props?.backAriaLabel === "返回子代理列表" && typeof props.onBack === "function") {
+        seed = typeof props.seed === "string" ? props.seed : null;
+      }
+      if (seed && props?.conversationId === seed) return seed;
+    }
+    return null;
+  };
+  const subagentModelChip = (header) => [...header.querySelectorAll("span")].find((element) => {
+    const className = typeof element.className === "string" ? element.className : "";
+    return className.includes("max-w-1/2")
+      && className.includes("min-w-0")
+      && className.includes("truncate")
+      && className.includes("text-xs")
+      && className.includes("text-tertiary")
+      && className.includes("select-none")
+      && element.textContent?.includes(" · ");
+  });
+  const applySubagentModelChip = (header, binding, thread) => {
+    const model = typeof thread?.model === "string" && thread.model.trim() || "";
+    if (!model) return false;
+    const presentation = window.__codeyModelWhitelistPatch?.presentModel?.(model, thread);
+    const displayName = presentation?.displayName || model.split("/").at(-1) || model;
+    const effort = typeof thread?.reasoningEffort === "string" && thread.reasoningEffort.trim() || "";
+    const chip = subagentModelChip(header);
+    if (!chip) return false;
+    const text = effort ? `${displayName} · ${effort}` : displayName;
+    if (chip.textContent !== text) chip.textContent = text;
+    binding.thread = thread;
+    return true;
+  };
+  const syncSubagentHeaders = () => {
+    for (const [header, binding] of subagentHeaders) {
+      if (header.isConnected && subagentConversationId(header) === binding.id) continue;
+      subagentHeaders.delete(header);
+    }
+    for (const header of document.querySelectorAll(subagentHeaderSelector)) {
+      const id = subagentConversationId(header);
+      if (!id) continue;
+      let binding = subagentHeaders.get(header);
+      if (!binding) {
+        binding = { id };
+        subagentHeaders.set(header, binding);
+      }
+      if (binding.thread && applySubagentModelChip(header, binding, binding.thread)) continue;
+      if (binding.pending || Date.now() - (binding.updatedAt || 0) < 1000) continue;
+      binding.pending = true;
+      void loadSessionTools()
+        .then(() => window.__codeyLoadCodexSessionController?.())
+        .then((controller) => controller?.manager?.readThread?.(id, { includeTurns: false }))
+        .then((result) => {
+          if (subagentHeaders.get(header) !== binding || !header.isConnected) return;
+          const thread = result?.thread || result;
+          applySubagentModelChip(header, binding, thread);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (subagentHeaders.get(header) !== binding) return;
+          binding.pending = false;
+          binding.updatedAt = Date.now();
+        });
+    }
+  };
+  window.__codeySyncSubagentHeaders = syncSubagentHeaders;
+
+  window.__codeySubagentHeaderCleanup?.();
+  let subagentHeaderTimer = 0;
+  const onSubagentHeaderMutations = (mutations) => {
+    if (!mutations.some((mutation) => {
+      const target = mutation.target instanceof HTMLElement ? mutation.target : mutation.target?.parentElement;
+      return target?.closest?.(subagentHeaderSelector)
+        || [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some((node) =>
+          node instanceof HTMLElement && (node.matches?.(subagentHeaderSelector) || node.querySelector?.(subagentHeaderSelector)));
+    })) return;
+    window.clearTimeout(subagentHeaderTimer);
+    subagentHeaderTimer = window.setTimeout(syncSubagentHeaders, 60);
+  };
+  const subagentMutationOptions = { childList: true, subtree: true };
+  let unsubscribeSubagentHeaders = window.__codeyMutationDispatcher?.subscribe?.(
+    onSubagentHeaderMutations,
+    subagentMutationOptions,
+  );
+  if (!unsubscribeSubagentHeaders) {
+    const observer = new MutationObserver(onSubagentHeaderMutations);
+    observer.observe(document.documentElement, subagentMutationOptions);
+    unsubscribeSubagentHeaders = () => observer.disconnect();
+  }
+  const onSubagentHeaderClick = () => {
+    window.clearTimeout(subagentHeaderTimer);
+    window.__codeySyncSubagentHeaders?.();
+  };
+  document.addEventListener?.("click", onSubagentHeaderClick, true);
+  window.__codeySubagentHeaderCleanup = () => {
+    unsubscribeSubagentHeaders?.();
+    document.removeEventListener?.("click", onSubagentHeaderClick, true);
+    window.clearTimeout(subagentHeaderTimer);
+    subagentHeaders.clear();
+  };
+
   const scan = (root = document) => {
     mountButton();
     syncAccountUsageMount();
+    syncSubagentHeaders();
   };
 
   const scheduleScan = (root = document) => {

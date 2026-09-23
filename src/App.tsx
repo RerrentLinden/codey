@@ -266,6 +266,7 @@ export function App({
     subagentModelOptions,
     modelState,
     modelEditorState,
+    officialOnly,
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,
@@ -733,7 +734,7 @@ export function App({
   async function fetchRouteModels(route: Profile) {
     if (!config) return;
     const nativeMode = !config.localRouterEnabled;
-    if (nativeMode || route.authMode === "officialAccount") {
+    if (nativeMode) {
       await syncCurrentProvider();
       return;
     }
@@ -756,16 +757,22 @@ export function App({
         });
         applyRouteResult(result);
         openModelPicker(
-          { ...result.routeModelState, officialModels: [] },
+          savedRoute.authMode === "officialAccount"
+            ? result.routeModelState
+            : { ...result.routeModelState, officialModels: [] },
           "",
           savedRoute.id,
           result.config.profiles.find((profile) => profile.id === savedRoute.id)
             ?.supportsAutoReview === true,
         );
       } catch (error) {
-        const warning = `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
+        const warning = savedRoute.authMode === "officialAccount"
+          ? `自动同步失败：${errorText(error)}。请重试以读取当前账号可用模型。`
+          : `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
         openModelPicker(
-          thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
+          savedRoute.authMode === "officialAccount"
+            ? modelState
+            : thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
           warning,
           savedRoute.id,
           savedRoute.supportsAutoReview === true,
@@ -1573,6 +1580,7 @@ export function App({
       <ModelPickerDialog
         open={modelPickerVisible}
         routeConfigReadOnly={config?.localRouterEnabled === false}
+        officialOnly={officialOnly}
         isBusy={isBusy}
         busy={busy}
         container={popupContainer}

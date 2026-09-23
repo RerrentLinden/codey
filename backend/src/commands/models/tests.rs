@@ -1346,6 +1346,43 @@ fn provider_route_restart_detection_catches_route_connection_changes() {
 }
 
 #[test]
+fn official_gateway_changes_hot_reload_without_restarting_runtime() {
+    let mut official = crate::config::ProviderProfile::new("Official");
+    official.id = "official-route".into();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.official_account = true;
+    official.official_account_id = Some("account-1".into());
+    official.base_url = "https://gateway-a.example/v1".into();
+    official.normalize();
+    let applied = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    };
+
+    let mut changed = applied.clone();
+    changed.profiles[0].base_url = "https://gateway-b.example/v1".into();
+    changed.profiles[0].normalize();
+
+    assert!(!provider_route_requires_restart(&applied, &changed));
+    assert!(runtime_supports_current_routes_for_hot_reload(
+        &applied, &changed
+    ));
+    let delivered = config_with_launch_pinned_transport(&applied, &changed);
+    assert_eq!(
+        delivered.profiles[0].normalized_base_url(),
+        "https://gateway-b.example/v1"
+    );
+
+    changed.profiles[0].base_url.clear();
+    changed.profiles[0].normalize();
+    assert!(!provider_route_requires_restart(&applied, &changed));
+    let delivered = config_with_launch_pinned_transport(&applied, &changed);
+    assert!(delivered.profiles[0].normalized_base_url().is_empty());
+}
+
+#[test]
 fn built_in_router_hot_reloads_added_and_removed_third_party_routes() {
     let mut route_a = crate::config::ProviderProfile::new("Route A");
     route_a.id = "route-a".into();

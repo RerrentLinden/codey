@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "58";
+  const patchVersion = "57";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -91,7 +91,6 @@
   let groupedMenuTimer = 0;
   let groupedMenuObserver = null;
   const groupedMenuTextObservers = new Map();
-  let modelDisplayTextTimer = 0;
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
@@ -623,8 +622,9 @@
   };
 
   const modelPresentationFromCatalog = (sourceCatalog, modelName, current = null) => {
-    const metadata = sourceCatalog.modelMetadata[modelName];
-    const route = sourceCatalog.routeMetadata[modelName];
+    const canonicalModelName = sourceCatalog.modelNamesByKey?.get(modelKey(modelName)) || modelName;
+    const metadata = sourceCatalog.modelMetadata[canonicalModelName];
+    const route = sourceCatalog.routeMetadata[canonicalModelName];
     const metadataDisplayName = metadataText(metadata, "display_name");
     const displayParts = displayNameParts(metadataDisplayName);
     const routeName = metadataText(metadata, "route_name")
@@ -636,18 +636,18 @@
     const modelLabel = metadataText(metadata, "model_display_name")
       || sourceModel
       || displayParts.modelName
-      || modelFallbackName(modelName);
+      || modelFallbackName(canonicalModelName);
     const currentDisplayName = cleanText(current?.displayName);
     const displayName = metadataDisplayName
       || (routeName && modelLabel ? `${routeName} / ${modelLabel}` : "")
       || currentDisplayName
-      || modelName;
+      || canonicalModelName;
     return {
       routeName,
       modelName: modelLabel,
       displayName,
       providerId: cleanText(route?.providerId) || metadataText(metadata, "provider_id"),
-      sourceModel: sourceModel || modelName,
+      sourceModel: sourceModel || canonicalModelName,
     };
   };
 
@@ -1117,41 +1117,6 @@
     return false;
   };
 
-  const replaceNativeModelDisplayText = () => {
-    modelDisplayTextTimer = 0;
-    if (disposed || !catalog.loaded || typeof document.createTreeWalker !== "function") return;
-    const entries = catalog.models
-      .map((modelName) => ({
-        modelName,
-        displayName: cleanText(modelPresentation(modelName).displayName),
-      }))
-      .filter(({ modelName, displayName }) => displayName && displayName !== cleanText(modelName))
-      .sort((left, right) => cleanText(right.modelName).length - cleanText(left.modelName).length);
-    if (!entries.length || !document.body) return;
-    const walker = document.createTreeWalker(document.body, 4);
-    const textNodes = [];
-    let node = walker.nextNode();
-    while (node) {
-      const parent = node.parentElement;
-      if (parent && !parent.closest?.("script,style,textarea,input")) textNodes.push(node);
-      node = walker.nextNode();
-    }
-    for (const textNode of textNodes) {
-      const text = textNode.nodeValue || "";
-      const trimmed = cleanText(text);
-      if (!trimmed) continue;
-      const entry = entries.find(({ modelName }) => cleanText(modelName) === trimmed);
-      if (!entry) continue;
-      const start = text.indexOf(trimmed);
-      textNode.nodeValue = `${text.slice(0, start)}${entry.displayName}${text.slice(start + trimmed.length)}`;
-    }
-  };
-
-  const scheduleNativeModelDisplayText = () => {
-    if (disposed || modelDisplayTextTimer || !catalog.loaded) return;
-    modelDisplayTextTimer = window.setTimeout(replaceNativeModelDisplayText, 0);
-  };
-
   const createRouteHeading = (routeName) => {
     if (typeof document.createElement !== "function") return null;
     const heading = document.createElement("div");
@@ -1405,7 +1370,6 @@
       }
     }
     if (discoveredMenus.length) syncGroupedMenuTextObservers(discoveredMenus);
-    scheduleNativeModelDisplayText();
     for (const container of [...groupedMenuTextObservers.keys()]) {
       if (container.isConnected === false) stopGroupedMenuTextObserver(container);
     }
@@ -1744,7 +1708,7 @@
       reactContainers: firstPass.reactContainers + secondPass.reactContainers,
     });
     scheduleGroupedModelMenuEnhancement();
-    scheduleNativeModelDisplayText();
+    window.__codeySyncSubagentHeaders?.();
     return true;
   };
 
@@ -1839,6 +1803,7 @@
     const nextCatalog = normalizedCatalog(value);
     if (!nextCatalog) return false;
     if (sameCatalog(catalog, nextCatalog)) {
+      window.__codeySyncSubagentHeaders?.();
       scheduleRefresh(1000);
       return Promise.resolve(true);
     }
@@ -1847,6 +1812,7 @@
     catalogRevision += 1;
     catalog = nextCatalog;
     return deliverModelCatalog().then((delivered) => {
+      window.__codeySyncSubagentHeaders?.();
       scheduleRefresh();
       return delivered;
     });
@@ -2841,6 +2807,7 @@
     isBlockedOutgoingMessage: (detail) => Boolean(blockedProviderRequest(detail)),
     notifyBlockedOutgoingMessage: showBlockedProviderNotice,
     enhanceModelMenus: enhanceGroupedModelMenus,
+    presentModel: (modelName, current) => modelPresentation(modelName, current),
     delivery: () => ({ ...deliveryState }),
     snapshot: () => ({
       loaded: catalog.loaded,

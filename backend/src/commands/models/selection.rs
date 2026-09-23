@@ -226,6 +226,13 @@ pub(crate) async fn save_native_selected_models(
     if context.provider.official && requested_model_reasoning_efforts.is_some() {
         return Err("官方线路不支持声明思考强度".to_string());
     }
+    if context.provider.official
+        && requested_model_contexts
+            .as_ref()
+            .is_some_and(|contexts| !contexts.is_empty())
+    {
+        return Err("官方线路不支持配置模型上下文参数".to_string());
+    }
     if let Some(route_id) = requested_route_id
         .as_deref()
         .map(str::trim)
@@ -257,7 +264,11 @@ pub(crate) async fn save_native_selected_models(
         &requested_deleted_third_party_models,
     )?;
     let available = if context.provider.official {
-        model_catalog::default_official_model_slugs()
+        next.upstream_models_by_provider
+            .get(&context.provider.id)
+            .filter(|models| !models.is_empty())
+            .cloned()
+            .unwrap_or_else(model_catalog::default_official_model_slugs)
     } else {
         next.upstream_models_by_provider
             .get(&context.provider.id)
@@ -319,7 +330,12 @@ pub(crate) fn config_with_native_selected_models(
         {
             return Err("官方线路不支持添加第三方模型".to_string());
         }
-        let official_models = model_catalog::default_official_model_slugs();
+        let official_models = next
+            .upstream_models_by_provider
+            .get(&provider_id)
+            .filter(|models| !models.is_empty())
+            .cloned()
+            .unwrap_or_else(model_catalog::default_official_model_slugs);
         let (selected_models, third_party_models) =
             validate_manual_model_selection(&official_models, requested_official_models, &[])?;
         if selected_models.is_empty() {
@@ -334,7 +350,6 @@ pub(crate) fn config_with_native_selected_models(
             .remove(&provider_id);
         next.declared_official_models_by_provider
             .remove(&provider_id);
-        next.upstream_models_by_provider.remove(&provider_id);
         return Ok(next.normalize());
     }
 

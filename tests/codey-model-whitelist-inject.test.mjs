@@ -685,7 +685,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "58");
+  assert.equal(patch.version, "57");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -3019,6 +3019,11 @@ test("model picker menu groups models under route headings without changing mode
       },
     ],
   }, [statsigClient()], { documentBody: body });
+
+  assert.equal(
+    runtime.patch.presentModel("gpt-5.6-sol").displayName,
+    "[官] gpt-5.6-sol",
+  );
 
   runtime.patch.enhanceModelMenus();
 

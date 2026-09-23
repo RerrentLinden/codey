@@ -146,6 +146,98 @@ pub(crate) fn config_after_route_deletion(
     Ok(config)
 }
 
+pub(crate) async fn fetch_official_route_models(
+    state: &Arc<AppState>,
+    profile: &ProviderProfile,
+) -> Result<Vec<Value>, String> {
+    let account_id = profile
+        .official_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "官方账号线路缺少账号标识".to_string())?;
+    let record =
+        super::super::official_accounts::refresh_official_account_tokens(state, account_id).await?;
+    let access_token = record
+        .auth
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "官方账号登录信息缺少访问令牌".to_string())?;
+    let configured_base_url = record
+        .base_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::codex_provider::official_route_base_url(profile));
+    let base_url = configured_base_url.trim().trim_end_matches('/');
+    let endpoint = format!("{base_url}/models?client_version=0.154.0");
+    let client = if profile.upstream_proxy.trim().is_empty() {
+        state.http_client.clone()
+    } else {
+        reqwest::Client::builder()
+            .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .proxy(
+                reqwest::Proxy::all(profile.upstream_proxy.trim())
+                    .map_err(|error| format!("官方线路的上游代理地址无效：{error}"))?,
+            )
+            .build()
+            .map_err(|error| format!("创建官方模型请求客户端失败：{error}"))?
+    };
+    let mut request = client
+        .get(endpoint)
+        .timeout(std::time::Duration::from_secs(20))
+        .header("accept", "application/json")
+        .header("user-agent", "codex_cli_rs")
+        .bearer_auth(access_token);
+    if let Some(chatgpt_account_id) = record.account_id.as_deref() {
+        request = request.header("chatgpt-account-id", chatgpt_account_id);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("请求官方模型列表失败：{error}"))?;
+    let status = response.status();
+    let body =
+        crate::http_response::read_bounded_body(response, 4 * 1024 * 1024, "官方模型列表响应")
+            .await
+            .map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("官方模型列表接口返回 {status}"));
+    }
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("官方模型列表响应格式无效：{error}"))?;
+    let models = ["models", "data", "items"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| {
+            model
+                .get("slug")
+                .or_else(|| model.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        })
+        .map(|mut model| {
+            if model.get("slug").and_then(Value::as_str).is_none()
+                && let Some(id) = model.get("id").cloned()
+            {
+                model["slug"] = id;
+            }
+            model
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("官方模型列表为空".to_string());
+    }
+    Ok(models)
+}
+
 pub async fn fetch_route_models(
     state: &Arc<AppState>,
     route_id: String,
@@ -171,14 +263,33 @@ pub async fn fetch_route_models(
     if !profile.enabled {
         return Err("线路已禁用，不能同步模型".to_string());
     }
-    if profile.official_account {
-        return Err("官方账号线路使用官方模型目录，无需同步第三方模型".to_string());
-    }
     profile.validate()?;
     let provider_id = profile.provider_id().to_string();
-    let fetched_models = fetch_provider_models(profile)
-        .await
-        .map_err(|error| error.to_string())?;
+    let fetched_account_entries = if profile.official_account {
+        Some(fetch_official_route_models(state, &profile).await?)
+    } else {
+        None
+    };
+    if let Some(entries) = fetched_account_entries.as_deref() {
+        model_catalog::merge_account_runtime_models(codex_home(), entries)
+            .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
+    }
+    let fetched_models = if let Some(entries) = fetched_account_entries.as_ref() {
+        entries
+            .iter()
+            .filter_map(|model| {
+                model
+                    .get("slug")
+                    .or_else(|| model.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        fetch_provider_models(profile.clone())
+            .await
+            .map_err(|error| error.to_string())?
+    };
     let visible_fetched_models = regular_route_models(fetched_models.clone());
     timings.mark("fetchModelsMs");
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -194,12 +305,20 @@ pub async fn fetch_route_models(
     if latest_profile.provider_id() != provider_id {
         return Err("同步模型期间线路接入配置已变化，请重试".to_string());
     }
-    latest = config_with_provider_model_sync(
-        &latest,
-        &provider_id,
-        fetched_models.clone(),
-        codex_home(),
-    );
+    latest = if profile.official_account {
+        let mut next = latest;
+        next.upstream_models_by_provider
+            .insert(provider_id.clone(), fetched_models.clone());
+        let fallback_models = model_catalog::default_official_model_slugs();
+        let selected = next.selected_models_by_provider.get(&provider_id);
+        if selected.is_none_or(|models| models == &fallback_models) {
+            next.selected_models_by_provider
+                .insert(provider_id.clone(), fetched_models.clone());
+        }
+        next.normalize()
+    } else {
+        config_with_provider_model_sync(&latest, &provider_id, fetched_models.clone(), codex_home())
+    };
     latest.settings_revision = latest.settings_revision.saturating_add(1);
     let RefreshedModelState {
         refresh: catalog_refresh,

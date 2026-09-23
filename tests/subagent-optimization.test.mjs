@@ -11,7 +11,6 @@ test("subagent settings expose the five supported role controls", async () => {
     readFile(new URL("src/subagentModels.ts", root), "utf8"),
     readFile(new URL("src/components/ModelCombobox.tsx", root), "utf8"),
   ]);
-  const modelWhitelistSource = await readFile(new URL("public/model-whitelist-inject.js", root), "utf8");
 
   assert.match(featurePolicySource, /checked=\{config\.subagentOptimization\}/);
   assert.match(
@@ -63,7 +62,4 @@ test("subagent settings expose the five supported role controls", async () => {
   assert.match(comboboxSource, /<ListBox\.Section/);
   assert.match(comboboxSource, /没有匹配的模型或线路/);
   assert.match(comboboxSource, /items=\{groups\}/);
-  assert.match(modelWhitelistSource, /replaceNativeModelDisplayText/);
-  assert.match(modelWhitelistSource, /modelPresentation\(modelName\)\.displayName/);
-  assert.match(modelWhitelistSource, /scheduleNativeModelDisplayText/);
 });
