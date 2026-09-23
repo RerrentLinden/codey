@@ -2476,6 +2476,168 @@ async fn chat_route_retries_reasoning_content_missing_with_a_placeholder() {
 }
 
 #[tokio::test]
+async fn chat_route_retries_reasoning_content_missing_with_the_saved_summary() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body);
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "the reasoning content from the previous turn must be passed back in thinking mode",
+                                "type": "invalid_request_error",
+                                "code": "reasoning_content_missing",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id": "chatcmpl-summary",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先看文件"}],
+                    "content": []
+                },
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]},
+                {"role": "user", "content": "继续"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "第二轮"}]}
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts[0]["messages"][0]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert!(
+        attempts[0]["messages"][2]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert_eq!(attempts[1]["messages"][0]["reasoning_content"], "先看文件");
+    assert_eq!(attempts[1]["messages"][0]["content"], "已完成");
+    assert_eq!(
+        attempts[1]["messages"][2]["reasoning_content"],
+        "(thinking unavailable)"
+    );
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn deepseek_chat_route_sends_the_reasoning_summary_on_the_first_attempt() {
+    let proxy = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        write_json_response(
+            &mut stream,
+            200,
+            &json!({
+                "id": "chatcmpl-deepseek",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        (request.path, body)
+    });
+    let (mut config, provider_id, model) = router_config("http://api.deepseek.com/v1".into());
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].upstream_proxy = format!("http://{proxy_address}");
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先看文件"}],
+                    "content": []
+                },
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]},
+                {"role": "user", "content": "继续"}
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let (path, body) = proxy_task.await.unwrap();
+    assert_eq!(path, "http://api.deepseek.com/v1/chat/completions");
+    assert_eq!(body["messages"][0]["reasoning_content"], "先看文件");
+    assert_eq!(body["messages"][0]["content"], "已完成");
+    assert!(body["messages"][1].get("reasoning_content").is_none());
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn stopping_router_aborts_connections_that_outlive_the_drain_deadline() {
     let router = LocalRouter::start(&CodeyConfig::default()).await.unwrap();
     let endpoint = router.endpoint();

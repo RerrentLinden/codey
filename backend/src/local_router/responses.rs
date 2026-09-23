@@ -1671,6 +1671,22 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        let replay_reasoning_summary = should_replay_reasoning_text(
+            resolved.route.official_account,
+            bridge,
+            request_kind,
+            compacting,
+            upstream_url,
+        );
+        // Chat 转换只保留 reasoning_text，summary 会在转换时消失。DeepSeek
+        // 要在首次发送时带上摘要，所以先写回明文。这里不丢弃 encoded_body：
+        // 非原生线路只拿它判断是否把转换放到阻塞线程，正文以转换结果为准。
+        if bridge == ProtocolBridge::ResponsesToChatCompletions
+            && replay_reasoning_summary
+            && restore_reasoning_text_from_summary(&mut body)
+        {
+            body_mutated = true;
+        }
         let mut tool_bridge = ResponsesToolBridge::default();
         let offload_conversion = bridge != ProtocolBridge::NativeResponses
             && encoded_body
@@ -1706,11 +1722,13 @@ impl RouterServer {
             let converted = bridge.convert_responses_body(&body);
             (body, converted)
         };
+        let mut chat_reasoning_summaries = Vec::new();
         let mut upstream_body = match converted {
             Ok(converted) => {
                 if let Some(converted) = converted {
                     drop(body);
                     tool_bridge = converted.tool_bridge;
+                    chat_reasoning_summaries = converted.chat_reasoning_summaries;
                     converted.body
                 } else {
                     body
@@ -1824,6 +1842,15 @@ impl RouterServer {
             status: None,
             error: None,
         };
+        // 重试只留下还没写进首次请求的摘要。没有摘要时不保留这份列表。
+        let chat_reasoning_summaries = (matches!(
+            bridge,
+            ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
+        ) && request_kind == ResponsesRequestKind::Create
+            && !compacting
+            && !resolved.route.official_account
+            && chat_reasoning_summaries.iter().any(Option::is_some))
+        .then_some(chat_reasoning_summaries);
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -1909,13 +1936,10 @@ impl RouterServer {
                 encoded_body = None;
             }
         }
-        if should_replay_reasoning_text(
-            resolved.route.official_account,
-            bridge,
-            request_kind,
-            compacting,
-            upstream_url,
-        )
+        // 原生请求可能刚被 WebSocket 回退展开，摘要要在这份最终正文上还原。
+        // Chat 已在转换前还原；转换后的 messages 里没有 summary，再扫一次没有结果。
+        if bridge == ProtocolBridge::NativeResponses
+            && replay_reasoning_summary
             && restore_reasoning_text_from_summary(&mut upstream_body)
         {
             body_mutated = true;
@@ -1974,7 +1998,8 @@ impl RouterServer {
         // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
         // 回放历史时只保留加密字段。DeepSeek 官方地址在首次发送前还原已有摘要。
         // 其它线路仍先按原样发送，只有上游明确报出明文缺失时才回填：有摘要用摘要，
-        // 没有摘要才补占位。官方线路沿用加密推理语义，不参与该回退。
+        // 没有摘要才补占位。Chat 重试使用转换时留下的摘要文本，不保留第二份正文。
+        // 官方线路沿用加密推理语义，不参与该回退。
         let reasoning_text_retry_allowed = matches!(
             bridge,
             ProtocolBridge::NativeResponses | ProtocolBridge::ResponsesToChatCompletions
@@ -2123,7 +2148,11 @@ impl RouterServer {
                 {
                     let mut retryable_body = serde_json::from_slice::<Value>(encoded)
                         .context("解析 reasoning 回退请求失败")?;
-                    fill_missing_reasoning_text(&mut retryable_body).then_some(retryable_body)
+                    fill_missing_reasoning_text_with_chat_summaries(
+                        &mut retryable_body,
+                        chat_reasoning_summaries.as_deref().unwrap_or(&[]),
+                    )
+                    .then_some(retryable_body)
                 }
                 _ => None,
             };

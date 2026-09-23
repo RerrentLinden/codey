@@ -474,6 +474,10 @@ pub(crate) fn has_version_suffix(segment: &str) -> bool {
 pub(crate) struct ConvertedResponsesRequest {
     pub(crate) body: Value,
     pub(crate) tool_bridge: ResponsesToolBridge,
+    /// 与转换后仍缺少 `reasoning_content` 的 assistant 消息一一对应。
+    /// `Some` 是该回合可回放的摘要，`None` 表示重试时只能补占位。
+    /// 只保留这段文本，不保留第二份请求正文。
+    pub(crate) chat_reasoning_summaries: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default)]

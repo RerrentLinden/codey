@@ -4,21 +4,80 @@ pub(crate) fn append_chat_messages_from_responses_input(
     input: Option<&Value>,
     messages: &mut Vec<Value>,
     tool_bridge: &mut ResponsesToolBridge,
-) -> Result<()> {
+) -> Result<Vec<Option<String>>> {
     let Some(input) = input else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut replay = ChatReasoningReplay::default();
     match input {
-        Value::String(text) => push_chat_text_message(messages, "user", text),
+        Value::String(text) => {
+            let start = messages.len();
+            push_chat_text_message(messages, "user", text)?;
+            replay.observe(None, messages, start);
+            Ok(replay.missing)
+        }
         Value::Array(items) => {
             for item in items {
+                let start = messages.len();
                 append_chat_message_item(item, messages, tool_bridge)?;
+                replay.observe(Some(item), messages, start);
             }
             move_tool_images_after_tool_results(messages);
-            Ok(())
+            Ok(replay.missing)
         }
-        Value::Object(_) => append_chat_message_item(input, messages, tool_bridge),
+        Value::Object(_) => {
+            let start = messages.len();
+            append_chat_message_item(input, messages, tool_bridge)?;
+            replay.observe(Some(input), messages, start);
+            Ok(replay.missing)
+        }
         _ => anyhow::bail!("input 必须是字符串、对象或数组"),
+    }
+}
+
+/// 记录转换时被丢掉的摘要，供失败重试写回对应的助手消息。
+/// 首次发送的 messages 保持原样。
+#[derive(Default)]
+struct ChatReasoningReplay {
+    pending: Option<String>,
+    missing: Vec<Option<String>>,
+}
+
+impl ChatReasoningReplay {
+    fn observe(&mut self, item: Option<&Value>, messages: &[Value], start: usize) {
+        if let Some(item) = item
+            && item.get("type").and_then(Value::as_str) == Some("reasoning")
+        {
+            if reasoning_item_has_text(item) {
+                // 已有明文会进入 reasoning_content，未挂上的摘要不能串到后一回合。
+                self.pending = None;
+            } else if let Some(summary) = summary_replay_text(item) {
+                match &mut self.pending {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&summary);
+                    }
+                    None => self.pending = Some(summary),
+                }
+            }
+        }
+        for message in &messages[start..] {
+            match message.get("role").and_then(Value::as_str) {
+                Some("assistant") => {
+                    if message
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        self.pending = None;
+                        continue;
+                    }
+                    self.missing.push(self.pending.take());
+                }
+                Some("user" | "system") => self.pending = None,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -82,7 +141,8 @@ pub(crate) fn append_chat_message_item(
             ),
             Some("message") => append_responses_message_object(object, messages, tool_bridge),
             Some("reasoning") => {
-                // Only raw reasoning is replayable; summaries and encrypted provider state are not.
+                // 只回放 content 里的 reasoning_text。summary 和供应商密文不在这里展开，
+                // 否则所有 Chat 上游都会收到摘要。需要摘要的上游须在转换前写回明文。
                 if let Some(parts) = object.get("content").and_then(Value::as_array) {
                     let mut reasoning = String::new();
                     let mut present = false;

@@ -37,7 +37,7 @@ pub(crate) fn responses_to_chat_completions_request(
         .as_ref()
         .map(|tools| responses_tools_to_chat_tools_with_bridge(tools, &mut tool_bridge))
         .transpose()?;
-    append_chat_messages_from_responses_input(
+    let chat_reasoning_summaries = append_chat_messages_from_responses_input(
         normalized_input.as_ref(),
         &mut messages,
         &mut tool_bridge,
@@ -158,6 +158,7 @@ pub(crate) fn responses_to_chat_completions_request(
     Ok(ConvertedResponsesRequest {
         body: Value::Object(chat),
         tool_bridge,
+        chat_reasoning_summaries,
     })
 }
 

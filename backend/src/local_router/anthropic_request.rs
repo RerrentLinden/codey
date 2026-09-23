@@ -14,6 +14,7 @@ pub(crate) fn responses_to_anthropic_messages_request(
     let ConvertedResponsesRequest {
         body: chat,
         tool_bridge,
+        chat_reasoning_summaries: _,
     } = responses_to_chat_completions_request(body)?;
     let mut chat = match chat {
         Value::Object(chat) => chat,
@@ -145,6 +146,7 @@ pub(crate) fn responses_to_anthropic_messages_request(
     Ok(ConvertedResponsesRequest {
         body: Value::Object(anthropic),
         tool_bridge,
+        chat_reasoning_summaries: Vec::new(),
     })
 }
 

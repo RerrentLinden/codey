@@ -141,9 +141,11 @@ pub(crate) const MISSING_REASONING_TEXT_PLACEHOLDER: &str = "(thinking unavailab
 /// 回传，而 Codex 回放历史时会省略 reasoning 项的明文 content，只保留
 /// encrypted_content。已有 `summary` 时用摘要原文回填，没有摘要才补占位文本。
 /// 已经没有 reasoning 项的助手回合补回一项占位。Chat Completions 则给缺少
-/// `reasoning_content` 的助手消息补上同一段占位。已有明文的项保持不变。
+/// `reasoning_content` 的助手消息补上转换时留下的摘要，没有摘要才用占位。
+/// 已有明文的项保持不变。
 /// 首次发往需要回放明文的上游时，只把已有摘要还原进 reasoning 项。
 /// 没有摘要的回合仍留给失败后的占位重试，避免给普通请求补造推理项。
+/// Chat Completions 转换会丢掉 `summary`，因此 DeepSeek 必须在转换前调用。
 pub(crate) fn restore_reasoning_text_from_summary(body: &mut Value) -> bool {
     let Some(input) = body.get_mut("input") else {
         return false;
@@ -162,12 +164,23 @@ pub(crate) fn restore_reasoning_text_from_summary(body: &mut Value) -> bool {
 }
 
 fn restore_reasoning_item_from_summary(item: &mut Value) -> bool {
+    // 已有明文时摘要不必再拼一遍；没有摘要的项留给失败后的占位重试。
     item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && !reasoning_item_has_text(item)
         && summary_replay_text(item).is_some()
         && fill_reasoning_item_text(item)
 }
 
 pub(crate) fn fill_missing_reasoning_text(body: &mut Value) -> bool {
+    fill_missing_reasoning_text_with_chat_summaries(body, &[])
+}
+
+/// `chat_summaries` 与转换后仍缺少明文的 assistant 消息对齐。
+/// 空切片表示这些消息都补占位。原生 `input` 仍从各自的 summary 回填，忽略该参数。
+pub(crate) fn fill_missing_reasoning_text_with_chat_summaries(
+    body: &mut Value,
+    chat_summaries: &[Option<String>],
+) -> bool {
     if let Some(input) = body.get_mut("input") {
         return match input {
             Value::Array(items) => {
@@ -182,11 +195,13 @@ pub(crate) fn fill_missing_reasoning_text(body: &mut Value) -> bool {
             _ => false,
         };
     }
-    fill_missing_chat_reasoning_content(body)
+    fill_missing_chat_reasoning_content(body, chat_summaries)
 }
 
 fn fill_reasoning_item_text(item: &mut Value) -> bool {
-    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning")
+        || reasoning_item_has_text(item)
+    {
         return false;
     }
     let replay = reasoning_replay_part(item);
@@ -202,18 +217,12 @@ fn fill_reasoning_item_text(item: &mut Value) -> bool {
     };
     match content {
         Value::Array(parts) => {
-            if parts.iter().any(reasoning_part_has_text) {
-                return false;
-            }
             // 空白片段一并清理，只留下可回放的明文。
             parts.retain(|part| !is_reasoning_text_part(part));
             parts.push(replay);
             true
         }
         Value::Object(_) => {
-            if reasoning_part_has_text(content) {
-                return false;
-            }
             *content = replay;
             true
         }
@@ -295,7 +304,7 @@ fn is_assistant_side_item(item: &Value) -> bool {
     }
 }
 
-fn reasoning_item_has_text(item: &Value) -> bool {
+pub(crate) fn reasoning_item_has_text(item: &Value) -> bool {
     if item.get("type").and_then(Value::as_str) != Some("reasoning") {
         return false;
     }
@@ -306,11 +315,12 @@ fn reasoning_item_has_text(item: &Value) -> bool {
     }
 }
 
-fn fill_missing_chat_reasoning_content(body: &mut Value) -> bool {
+fn fill_missing_chat_reasoning_content(body: &mut Value, summaries: &[Option<String>]) -> bool {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return false;
     };
     let mut changed = false;
+    let mut summary_index = 0;
     for message in messages {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -322,13 +332,21 @@ fn fill_missing_chat_reasoning_content(body: &mut Value) -> bool {
         {
             continue;
         }
+        let text = if summaries.is_empty() {
+            MISSING_REASONING_TEXT_PLACEHOLDER.to_string()
+        } else {
+            let text = summaries
+                .get(summary_index)
+                .and_then(|summary| summary.clone())
+                .filter(|summary| !summary.trim().is_empty())
+                .unwrap_or_else(|| MISSING_REASONING_TEXT_PLACEHOLDER.to_string());
+            summary_index += 1;
+            text
+        };
         let Some(object) = message.as_object_mut() else {
             continue;
         };
-        object.insert(
-            "reasoning_content".to_string(),
-            Value::String(MISSING_REASONING_TEXT_PLACEHOLDER.to_string()),
-        );
+        object.insert("reasoning_content".to_string(), Value::String(text));
         changed = true;
     }
     changed
@@ -584,7 +602,7 @@ fn reasoning_content_is_empty(content: &Value) -> bool {
     }
 }
 
-fn summary_replay_text(item: &Value) -> Option<String> {
+pub(crate) fn summary_replay_text(item: &Value) -> Option<String> {
     let Value::Array(parts) = item.get("summary")? else {
         return None;
     };
@@ -819,6 +837,135 @@ mod tests {
         ));
         assert!(!upstream_replays_reasoning_text(
             "https://notdeepseek.com/v1"
+        ));
+        assert!(should_replay_reasoning_text(
+            false,
+            ProtocolBridge::ResponsesToChatCompletions,
+            ResponsesRequestKind::Create,
+            false,
+            "https://api.deepseek.com/v1/chat/completions",
+        ));
+        assert!(!should_replay_reasoning_text(
+            false,
+            ProtocolBridge::ResponsesToChatCompletions,
+            ResponsesRequestKind::Create,
+            false,
+            "https://api.moonshot.cn/v1/chat/completions",
+        ));
+    }
+
+    #[test]
+    fn chat_conversion_keeps_reasoning_summary_only_after_it_is_restored() {
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_summary",
+                    "summary": [
+                        {"type": "summary_text", "text": "先看文件"},
+                        {"type": "summary_text", "text": "再调用工具"}
+                    ],
+                    "content": []
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "完成"}]
+                },
+                {"role": "user", "content": "继续"}
+            ]
+        });
+        let converted = ProtocolBridge::ResponsesToChatCompletions
+            .convert_responses_body(&body)
+            .unwrap()
+            .unwrap();
+        assert!(
+            converted.body["messages"][0]
+                .get("reasoning_content")
+                .is_none()
+        );
+        assert_eq!(converted.body["messages"][0]["content"], "完成");
+        assert_eq!(
+            converted.chat_reasoning_summaries,
+            vec![Some("先看文件\n再调用工具".to_string())]
+        );
+
+        let mut restored = body;
+        assert!(restore_reasoning_text_from_summary(&mut restored));
+        let converted = ProtocolBridge::ResponsesToChatCompletions
+            .convert_responses_body(&restored)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            converted.body["messages"][0]["reasoning_content"],
+            "先看文件\n再调用工具"
+        );
+        assert_eq!(converted.body["messages"][0]["content"], "完成");
+        assert!(converted.chat_reasoning_summaries.is_empty());
+        assert!(!restore_reasoning_text_from_summary(&mut restored));
+    }
+
+    #[test]
+    fn chat_retry_uses_saved_summaries_and_does_not_leak_across_turns() {
+        let converted = ProtocolBridge::ResponsesToChatCompletions
+            .convert_responses_body(&json!({
+                "model": "provider-model",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "先看文件"}],
+                        "content": []
+                    },
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "再核对"}],
+                        "content": [{"type": "reasoning_text", "text": "完整推理"}]
+                    },
+                    {"type": "message", "role": "assistant", "content": "第一轮"},
+                    {"role": "user", "content": "继续"},
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "上一回合的摘要"}],
+                        "content": []
+                    },
+                    {"role": "user", "content": "换个问题"},
+                    {"type": "message", "role": "assistant", "content": "第二轮"},
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "调用工具"}],
+                        "content": []
+                    },
+                    {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"}
+                ]
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            converted.body["messages"][0]["reasoning_content"],
+            "完整推理"
+        );
+        assert_eq!(
+            converted.chat_reasoning_summaries,
+            vec![None, Some("调用工具".to_string())]
+        );
+        let mut retry = converted.body.clone();
+        assert!(fill_missing_reasoning_text_with_chat_summaries(
+            &mut retry,
+            &converted.chat_reasoning_summaries,
+        ));
+        assert_eq!(retry["messages"][0]["reasoning_content"], "完整推理");
+        assert_eq!(retry["messages"][1]["role"], "user");
+        assert_eq!(retry["messages"][3]["content"], "第二轮");
+        assert_eq!(
+            retry["messages"][3]["reasoning_content"],
+            "(thinking unavailable)"
+        );
+        assert_eq!(retry["messages"][4]["reasoning_content"], "调用工具");
+        assert_eq!(retry["messages"][4]["tool_calls"][0]["id"], "call-1");
+        assert!(!fill_missing_reasoning_text_with_chat_summaries(
+            &mut retry,
+            &converted.chat_reasoning_summaries,
         ));
     }
 
