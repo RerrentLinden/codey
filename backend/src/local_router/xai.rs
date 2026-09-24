@@ -273,12 +273,11 @@ fn flatten_namespaces(body: &mut Value) -> Result<(bool, HashMap<String, XaiTool
     let mut top_level = HashSet::new();
     for tool in tools {
         let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
-        if tool_type == "function" || tool_type == "custom" {
-            if let Some(name) = tool.get("name").and_then(Value::as_str).map(str::trim)
-                && !name.is_empty()
-            {
-                top_level.insert(name.to_string());
-            }
+        if (tool_type == "function" || tool_type == "custom")
+            && let Some(name) = tool.get("name").and_then(Value::as_str).map(str::trim)
+            && !name.is_empty()
+        {
+            top_level.insert(name.to_string());
         }
     }
     let mut owners = HashMap::new();
@@ -1132,8 +1131,13 @@ mod tests {
         );
         let mut rewriter = XaiSseRewriter::new(&prepared.response);
         let split = frame.len() / 2;
-        assert!(rewriter.push(frame[..split].as_bytes()).unwrap().is_empty());
-        let output = rewriter.push(frame[split..].as_bytes()).unwrap();
+        assert!(
+            rewriter
+                .push(&frame.as_bytes()[..split])
+                .unwrap()
+                .is_empty()
+        );
+        let output = rewriter.push(&frame.as_bytes()[split..]).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("event: response.output_item.done"), "{text}");
         assert!(text.contains("\"name\":\"lookup\""), "{text}");

@@ -1094,7 +1094,7 @@ pub async fn official_account_from_manual_input(
     input: &str,
 ) -> Result<OfficialAccountRecord> {
     match parse_manual_official_credential(input)? {
-        ManualOfficialCredential::Record(record) => Ok(record),
+        ManualOfficialCredential::Record(record) => Ok(*record),
         ManualOfficialCredential::RefreshToken(token) => {
             exchange_refresh_token(client, &token).await
         }
@@ -1102,7 +1102,7 @@ pub async fn official_account_from_manual_input(
 }
 
 enum ManualOfficialCredential {
-    Record(OfficialAccountRecord),
+    Record(Box<OfficialAccountRecord>),
     RefreshToken(String),
 }
 
@@ -1225,12 +1225,13 @@ fn credential_from_oauth_json(value: &Value) -> Result<ManualOfficialCredential>
     apply_declared_identity(&mut record, email, plan);
     // 仍在有效期内、又没有刷新时间的登录文档，按刚刚导入处理。
     // 否则接下来的额度查询会立刻轮换 Refresh Token，使来源登录失效。
-    if record.last_refresh().is_none() && record.has_live_access_token() {
-        if let Some(object) = record.auth.as_object_mut() {
-            object.insert("last_refresh".to_string(), json!(rfc3339_now()));
-        }
+    if record.last_refresh().is_none()
+        && record.has_live_access_token()
+        && let Some(object) = record.auth.as_object_mut()
+    {
+        object.insert("last_refresh".to_string(), json!(rfc3339_now()));
     }
-    Ok(ManualOfficialCredential::Record(record))
+    Ok(ManualOfficialCredential::Record(Box::new(record)))
 }
 
 fn oauth_json_source(value: &Value) -> Result<&Value> {
@@ -2504,7 +2505,7 @@ mod tests {
 
     fn manual_record(input: &str) -> OfficialAccountRecord {
         match parse_manual_official_credential(input).unwrap() {
-            ManualOfficialCredential::Record(record) => record,
+            ManualOfficialCredential::Record(record) => *record,
             ManualOfficialCredential::RefreshToken(_) => panic!("应直接保存登录文档"),
         }
     }
